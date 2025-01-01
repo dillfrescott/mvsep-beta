@@ -23,14 +23,11 @@ class NeuralOperatorModel(nn.Module):
 
     def forward(self, x):
         x = self.operator(x)
-        # Ensure outputs are real-valued
-        inst_mag = x[:, 0, :, :].real
-        vocal_mag = x[:, 1, :, :].real
-        return inst_mag, vocal_mag
+        return x[:, 0, :, :], x[:, 1, :, :]
 
-def loss_fn(pred_inst_mag, pred_vocal_mag, target_inst_mag, target_vocal_mag):
-    inst_loss = torch.mean(torch.abs(pred_inst_mag - target_inst_mag.real))
-    vocal_loss = torch.mean(torch.abs(pred_vocal_mag - target_vocal_mag.real))
+def loss_fn(pred_inst, pred_vocal, target_inst, target_vocal):
+    inst_loss = torch.mean(torch.abs(pred_inst - target_inst))
+    vocal_loss = torch.mean(torch.abs(pred_vocal - target_vocal))
     return inst_loss + vocal_loss
 
 # Custom Dataset class
@@ -175,54 +172,59 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
               chunk_size=88200, overlap=44100, device='cpu', n_fft=4096, hop_length=1024):
+    # Load the model checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.eval()
     model.to(device)
 
+    # Load the input audio
     input_audio, sr = torchaudio.load(input_wav_path)
     if input_audio.shape[0] != 2:
         raise ValueError("Input audio must have 2 channels.")
     input_audio = input_audio.to(device)
 
+    # Initialize output tensors
     total_length = input_audio.shape[1]
-    num_chunks = (total_length - overlap) // (chunk_size - overlap)
     instrumentals = torch.zeros_like(input_audio)
     vocals = torch.zeros_like(input_audio)
 
+    # Cross-fade window for smooth blending of chunks
     cross_fade_length = overlap // 2
     window = torch.hann_window(n_fft).to(device)
 
+    # Process the audio in chunks
+    num_chunks = (total_length - overlap) // (chunk_size - overlap)
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
+            # Extract the current chunk
             chunk = input_audio[:, i:i + chunk_size]
 
+            # Compute the STFT of the chunk
             chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
 
-            chunk_mag = chunk_mag.unsqueeze(0)
+            # Add batch dimension and move to device
+            chunk_mag = chunk_mag.unsqueeze(0).to(device)
 
+            # Perform inference
             with torch.no_grad():
                 pred_inst_mag, pred_vocal_mag = model(chunk_mag)
 
+            # Remove batch dimension
             pred_inst_mag = pred_inst_mag.squeeze(0)
             pred_vocal_mag = pred_vocal_mag.squeeze(0)
 
-            # Subtract the predicted vocal magnitude from the mixture magnitude
-            inst_spec_mag = chunk_mag - pred_vocal_mag
-            inst_spec_mag = torch.clamp(inst_spec_mag, min=0.0)
+            # Combine predicted magnitude with original phase
+            pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
+            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
 
-            inst_spec = inst_spec_mag * torch.exp(1j * chunk_phase)
+            # Reconstruct the waveforms from the predicted complex spectrograms
+            inst_chunk = torch.istft(pred_inst_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
+            vocal_chunk = torch.istft(pred_vocal_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
 
-            # Ensure inst_spec has the correct shape for istft
-            inst_spec = inst_spec.squeeze(0)
-
-            inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
-
-            # Compute vocals by subtracting the instrumental from the original input
-            vocal_chunk = chunk - inst_chunk
-
+            # Apply cross-fading for smooth blending
             if i == 0:
                 # For the first chunk, don't apply cross-fading
                 instrumentals[:, i:i + chunk_size] = inst_chunk
@@ -240,14 +242,17 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                 vocals[:, i:i + cross_fade_length] *= fade_out
                 vocals[:, i:i + cross_fade_length] += vocal_chunk[:, :cross_fade_length]
 
+            # Fill the non-overlapping part of the chunk
             instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
             vocals[:, i + cross_fade_length:i + chunk_size] = vocal_chunk[:, cross_fade_length:]
 
             pbar.update(1)
 
+    # Clamp the outputs to avoid clipping
     instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
     vocals = torch.clamp(vocals, -1.0, 1.0)
 
+    # Save the separated audio
     torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
     torchaudio.save(output_vocal_path, vocals.cpu(), sr)
 
