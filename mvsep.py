@@ -104,8 +104,13 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     loss_log = []
 
     if checkpoint_path:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        
+        # Filter out unexpected keys
+        model_state_dict = checkpoint['model_state_dict']
+        model_state_dict = {k: v for k, v in model_state_dict.items() if k in model.state_dict()}
+        model.load_state_dict(model_state_dict, strict=False)
+        
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         step = checkpoint['step']
         avg_loss = checkpoint['avg_loss']
