@@ -329,7 +329,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train a model for instrumental separation')
     parser.add_argument('--train', action='store_true', help='Train the model')
     parser.add_argument('--infer', action='store_true', help='Inference mode')
-    parser.add_argument('--data_dir', type=str, default='train1', help='Path to training dataset')
+    parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
     parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
