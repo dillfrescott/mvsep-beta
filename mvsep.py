@@ -10,8 +10,22 @@ from tqdm import tqdm
 import numpy as np
 from neuralop.models import FNO, TFNO
 
+class SpatialAttention(nn.Module):
+    def __init__(self, in_channels):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=7, padding=3)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # Compute attention weights
+        att = self.conv(x)
+        att = self.sigmoid(att)
+        # Apply attention weights
+        out = x * att
+        return out
+
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=64, n_modes=(16, 16), factorization=None, rank=0.05):
+    def __init__(self, in_channels=2, out_channels=4, hidden_channels=64, n_modes=(16, 16), factorization=None, rank=0.05):
         super(NeuralOperatorModel, self).__init__()
         if factorization is None:
             self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
@@ -20,15 +34,31 @@ class NeuralOperatorModel(nn.Module):
             self.operator = TFNO(n_modes=n_modes, hidden_channels=hidden_channels,
                                  in_channels=in_channels, out_channels=out_channels,
                                  factorization=factorization, rank=rank)
+        
+        # Add spatial attention layer
+        self.spatial_attention = SpatialAttention(in_channels=in_channels)
 
     def forward(self, x):
+        # Apply spatial attention
+        x = self.spatial_attention(x)
+        # Pass through the neural operator
         x = self.operator(x)
-        return x[:, 0, :, :], x[:, 1, :, :]
+        # Split the output into magnitude and phase
+        pred_inst_mag, pred_vocal_mag, pred_inst_phase, pred_vocal_phase = torch.split(x, 1, dim=1)
+        return pred_inst_mag, pred_vocal_mag, pred_inst_phase, pred_vocal_phase
 
-def loss_fn(pred_inst, pred_vocal, target_inst, target_vocal):
-    inst_loss = torch.mean(torch.abs(pred_inst - target_inst))
-    vocal_loss = torch.mean(torch.abs(pred_vocal - target_vocal))
-    return inst_loss + vocal_loss
+def loss_fn(pred_inst_mag, pred_vocal_mag, pred_inst_phase, pred_vocal_phase, target_inst_mag, target_vocal_mag, target_inst_phase, target_vocal_phase):
+    # Magnitude loss
+    inst_mag_loss = torch.mean(torch.abs(pred_inst_mag - target_inst_mag))
+    vocal_mag_loss = torch.mean(torch.abs(pred_vocal_mag - target_vocal_mag))
+    
+    # Phase loss (circular loss)
+    inst_phase_loss = torch.mean(torch.abs(torch.sin((pred_inst_phase - target_inst_phase) / 2)))
+    vocal_phase_loss = torch.mean(torch.abs(torch.sin((pred_vocal_phase - target_vocal_phase) / 2)))
+    
+    # Total loss
+    total_loss = inst_mag_loss + vocal_mag_loss + inst_phase_loss + vocal_phase_loss
+    return total_loss
 
 # Custom Dataset class
 class MUSDBDataset(Dataset):
@@ -67,24 +97,33 @@ class MUSDBDataset(Dataset):
         instrumental_spec = torch.stft(instrumental, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
         vocal_spec = torch.stft(vocal, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
 
-        # Convert to magnitude spectrograms
-        mixture_spec = torch.abs(mixture_spec)
-        instrumental_spec = torch.abs(instrumental_spec)
-        vocal_spec = torch.abs(vocal_spec)
+        # Convert to magnitude and phase spectrograms
+        mixture_mag = torch.abs(mixture_spec)
+        mixture_phase = torch.angle(mixture_spec)
+        instrumental_mag = torch.abs(instrumental_spec)
+        instrumental_phase = torch.angle(instrumental_spec)
+        vocal_mag = torch.abs(vocal_spec)
+        vocal_phase = torch.angle(vocal_spec)
 
         # Optionally segment the signals
         if self.segment and self.segment_length:
-            if mixture_spec.shape[2] >= self.segment_length // self.hop_length:
-                start = torch.randint(0, mixture_spec.shape[2] - self.segment_length // self.hop_length, (1,))
-                mixture_spec = mixture_spec[:, :, start:start + self.segment_length // self.hop_length]
-                instrumental_spec = instrumental_spec[:, :, start:start + self.segment_length // self.hop_length]
-                vocal_spec = vocal_spec[:, :, start:start + self.segment_length // self.hop_length]
+            if mixture_mag.shape[2] >= self.segment_length // self.hop_length:
+                start = torch.randint(0, mixture_mag.shape[2] - self.segment_length // self.hop_length, (1,))
+                mixture_mag = mixture_mag[:, :, start:start + self.segment_length // self.hop_length]
+                mixture_phase = mixture_phase[:, :, start:start + self.segment_length // self.hop_length]
+                instrumental_mag = instrumental_mag[:, :, start:start + self.segment_length // self.hop_length]
+                instrumental_phase = instrumental_phase[:, :, start:start + self.segment_length // self.hop_length]
+                vocal_mag = vocal_mag[:, :, start:start + self.segment_length // self.hop_length]
+                vocal_phase = vocal_phase[:, :, start:start + self.segment_length // self.hop_length]
             else:
-                mixture_spec = F.pad(mixture_spec, (0, self.segment_length // self.hop_length - mixture_spec.shape[2]))
-                instrumental_spec = F.pad(instrumental_spec, (0, self.segment_length // self.hop_length - instrumental_spec.shape[2]))
-                vocal_spec = F.pad(vocal_spec, (0, self.segment_length // self.hop_length - vocal_spec.shape[2]))
+                mixture_mag = F.pad(mixture_mag, (0, self.segment_length // self.hop_length - mixture_mag.shape[2]))
+                mixture_phase = F.pad(mixture_phase, (0, self.segment_length // self.hop_length - mixture_phase.shape[2]))
+                instrumental_mag = F.pad(instrumental_mag, (0, self.segment_length // self.hop_length - instrumental_mag.shape[2]))
+                instrumental_phase = F.pad(instrumental_phase, (0, self.segment_length // self.hop_length - instrumental_phase.shape[2]))
+                vocal_mag = F.pad(vocal_mag, (0, self.segment_length // self.hop_length - vocal_mag.shape[2]))
+                vocal_phase = F.pad(vocal_phase, (0, self.segment_length // self.hop_length - vocal_phase.shape[2]))
 
-        return mixture_spec, instrumental_spec, vocal_spec, mixture, instrumental, vocal
+        return mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase, mixture, instrumental, vocal
 
 def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
     """
@@ -118,18 +157,19 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
     model.train()
     for epoch in range(epochs):
-        for mixture_spec, instrumental_spec, vocal_spec, _, _, _ in dataloader:
-            mixture_spec = mixture_spec.to(device)
-            instrumental_spec = instrumental_spec.to(device)
-            vocal_spec = vocal_spec.to(device)
-
-            target_inst_mag = instrumental_spec
-            target_vocal_mag = vocal_spec
+        for mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase, _, _, _ in dataloader:
+            mixture_mag = mixture_mag.to(device)
+            mixture_phase = mixture_phase.to(device)
+            instrumental_mag = instrumental_mag.to(device)
+            instrumental_phase = instrumental_phase.to(device)
+            vocal_mag = vocal_mag.to(device)
+            vocal_phase = vocal_phase.to(device)
 
             optimizer.zero_grad()
 
-            pred_inst_mag, pred_vocal_mag = model(mixture_spec)
-            loss = loss_fn(pred_inst_mag, pred_vocal_mag, target_inst_mag, target_vocal_mag)
+            pred_inst_mag, pred_vocal_mag, pred_inst_phase, pred_vocal_phase = model(mixture_mag)
+            loss = loss_fn(pred_inst_mag, pred_vocal_mag, pred_inst_phase, pred_vocal_phase,
+                           instrumental_mag, vocal_mag, instrumental_phase, vocal_phase)
 
             loss.backward()
 
@@ -210,15 +250,17 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
 
             # Perform inference
             with torch.no_grad():
-                pred_inst_mag, pred_vocal_mag = model(chunk_mag)
+                pred_inst_mag, pred_vocal_mag, pred_inst_phase, pred_vocal_phase = model(chunk_mag)
 
             # Remove batch dimension
             pred_inst_mag = pred_inst_mag.squeeze(0)
             pred_vocal_mag = pred_vocal_mag.squeeze(0)
+            pred_inst_phase = pred_inst_phase.squeeze(0)
+            pred_vocal_phase = pred_vocal_phase.squeeze(0)
 
-            # Combine predicted magnitude with original phase
-            pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
-            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
+            # Combine predicted magnitude with predicted phase
+            pred_inst_spec = pred_inst_mag * torch.exp(1j * pred_inst_phase)
+            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * pred_vocal_phase)
 
             # Reconstruct the waveforms from the predicted complex spectrograms
             inst_chunk = torch.istft(pred_inst_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
@@ -279,7 +321,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=256, n_modes=(16, 16),
+    model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=256, n_modes=(16, 16),
                                 factorization=args.factorization, rank=args.rank)
     optimizer = torch.optim.Adam(model.parameters())
 
@@ -295,7 +337,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=256, n_modes=(16, 16),
+        model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=256, n_modes=(16, 16),
                                     factorization=args.factorization, rank=args.rank)
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
