@@ -62,8 +62,9 @@ def loss_fn(pred_inst_mag, pred_vocal_mag, pred_inst_phase, pred_vocal_phase, ta
 
 # Custom Dataset class
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, sample_rate=44100, segment_length=264600, n_fft=4096, hop_length=1024, segment=True):
+    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=264600, n_fft=4096, hop_length=1024, segment=True):
         self.root_dir = root_dir
+        self.preprocess_dir = preprocess_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
         self.n_fft = n_fft
@@ -72,11 +73,21 @@ class MUSDBDataset(Dataset):
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
         self.window = torch.hann_window(n_fft)
 
-    def __len__(self):
-        return len(self.tracks)
+        # Preprocess data if preprocess_dir is provided
+        if self.preprocess_dir:
+            self.preprocess_data()
 
-    def __getitem__(self, idx):
-        track_path = self.tracks[idx]
+    def preprocess_data(self):
+        os.makedirs(self.preprocess_dir, exist_ok=True)
+        for idx, track_path in enumerate(tqdm(self.tracks, desc="Preprocessing data")):
+            preprocess_path = os.path.join(self.preprocess_dir, f'track_{idx}.npz')
+            if not os.path.exists(preprocess_path):
+                mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase, _, _, _ = self._process_track(track_path)
+                np.savez(preprocess_path, mixture_mag=mixture_mag, mixture_phase=mixture_phase,
+                         instrumental_mag=instrumental_mag, instrumental_phase=instrumental_phase,
+                         vocal_mag=vocal_mag, vocal_phase=vocal_phase)
+
+    def _process_track(self, track_path):
         instrumental, _ = torchaudio.load(os.path.join(track_path, 'other.wav'))
         vocal, _ = torchaudio.load(os.path.join(track_path, 'vocals.wav'))
 
@@ -123,7 +134,25 @@ class MUSDBDataset(Dataset):
                 vocal_mag = F.pad(vocal_mag, (0, self.segment_length // self.hop_length - vocal_mag.shape[2]))
                 vocal_phase = F.pad(vocal_phase, (0, self.segment_length // self.hop_length - vocal_phase.shape[2]))
 
-        return mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase, mixture, instrumental, vocal
+        return mixture_mag.numpy(), mixture_phase.numpy(), instrumental_mag.numpy(), instrumental_phase.numpy(), vocal_mag.numpy(), vocal_phase.numpy(), mixture.numpy(), instrumental.numpy(), vocal.numpy()
+
+    def __len__(self):
+        return len(self.tracks)
+
+    def __getitem__(self, idx):
+        if self.preprocess_dir:
+            preprocess_path = os.path.join(self.preprocess_dir, f'track_{idx}.npz')
+            data = np.load(preprocess_path)
+            mixture_mag = torch.from_numpy(data['mixture_mag'])
+            mixture_phase = torch.from_numpy(data['mixture_phase'])
+            instrumental_mag = torch.from_numpy(data['instrumental_mag'])
+            instrumental_phase = torch.from_numpy(data['instrumental_phase'])
+            vocal_mag = torch.from_numpy(data['vocal_mag'])
+            vocal_phase = torch.from_numpy(data['vocal_phase'])
+            return mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase
+        else:
+            track_path = self.tracks[idx]
+            return self._process_track(track_path)
 
 def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
     """
@@ -157,7 +186,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
     model.train()
     for epoch in range(epochs):
-        for mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase, _, _, _ in dataloader:
+        for mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase in dataloader:
             mixture_mag = mixture_mag.to(device)
             mixture_phase = mixture_phase.to(device)
             instrumental_mag = instrumental_mag.to(device)
@@ -173,15 +202,9 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
             loss.backward()
 
-            # Compute gradient norm
-            grad_norm = 0.0
-            for param in model.parameters():
-                if param.grad is not None:
-                    grad_norm += torch.norm(param.grad).item() ** 2
-            grad_norm = grad_norm ** 0.5
-
             # Adjust learning rate based on gradient norm
-            adjust_learning_rate(optimizer, grad_norm, base_lr=args.learning_rate, scale=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            adjust_learning_rate(optimizer, grad_norm, base_lr=args.learning_rate)
 
             optimizer.step()
             scheduler.step()
@@ -306,15 +329,16 @@ def main():
     parser = argparse.ArgumentParser(description='Train a model for instrumental separation')
     parser.add_argument('--train', action='store_true', help='Train the model')
     parser.add_argument('--infer', action='store_true', help='Inference mode')
-    parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
+    parser.add_argument('--data_dir', type=str, default='train1', help='Path to training dataset')
+    parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
+    parser.add_argument('--checkpoint_steps', type=int, default=100, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=264600, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=352800, help='Segment length for training')
     parser.add_argument('--num_layers', type=int, default=5, help='Number of layers in the CNN model')
     parser.add_argument('--n_fft', type=int, default=4096, help='Number of FFT bins for STFT')
     parser.add_argument('--hop_length', type=int, default=1024, help='Hop length for STFT')
@@ -325,13 +349,16 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=256, n_modes=(16, 16),
+    model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(16, 16),
                                 factorization=args.factorization, rank=args.rank)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
-        train_dataset = MUSDBDataset(root_dir=args.data_dir, segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length, segment=True)
-        train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=False)
+        # Create the dataset with preprocessing if preprocess_dir is provided
+        train_dataset = MUSDBDataset(root_dir=args.data_dir, preprocess_dir=args.preprocess_dir,
+                                     segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length, segment=True)
+        train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              num_workers=16, pin_memory=False, persistent_workers=True)
 
         total_steps = args.epochs * len(train_dataloader)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
@@ -341,7 +368,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=256, n_modes=(16, 16),
+        model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(16, 16),
                                     factorization=args.factorization, rank=args.rank)
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
