@@ -258,7 +258,11 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             pred_inst_phase = pred_inst_phase.squeeze(0)
             pred_vocal_phase = pred_vocal_phase.squeeze(0)
 
-            # Combine predicted magnitude with predicted phase
+            # Use the mixture phase as a baseline and refine it with the predicted phase
+            pred_inst_phase = chunk_phase + pred_inst_phase  # Add predicted phase shift
+            pred_vocal_phase = chunk_phase + pred_vocal_phase
+
+            # Combine predicted magnitude with refined phase
             pred_inst_spec = pred_inst_mag * torch.exp(1j * pred_inst_phase)
             pred_vocal_spec = pred_vocal_mag * torch.exp(1j * pred_vocal_phase)
 
