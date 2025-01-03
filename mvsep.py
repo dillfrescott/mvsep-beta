@@ -10,20 +10,6 @@ from tqdm import tqdm
 import numpy as np
 from neuralop.models import FNO, TFNO
 
-class SpatialAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(SpatialAttention, self).__init__()
-        self.conv = nn.Conv2d(in_channels, 1, kernel_size=7, padding=3)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        # Compute attention weights
-        att = self.conv(x)
-        att = self.sigmoid(att)
-        # Apply attention weights
-        out = x * att
-        return out
-
 class NeuralOperatorModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=4, hidden_channels=64, n_modes=(16, 16), factorization=None, rank=0.05):
         super(NeuralOperatorModel, self).__init__()
@@ -34,13 +20,8 @@ class NeuralOperatorModel(nn.Module):
             self.operator = TFNO(n_modes=n_modes, hidden_channels=hidden_channels,
                                  in_channels=in_channels, out_channels=out_channels,
                                  factorization=factorization, rank=rank)
-        
-        # Add spatial attention layer
-        self.spatial_attention = SpatialAttention(in_channels=in_channels)
 
     def forward(self, x):
-        # Apply spatial attention
-        x = self.spatial_attention(x)
         # Pass through the neural operator
         x = self.operator(x)
         # Split the output into magnitude and phase
@@ -348,7 +329,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(72, 72),
+    model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(48, 48),
                                 factorization=args.factorization, rank=args.rank)
     optimizer = torch.optim.Adam(model.parameters())
 
@@ -367,7 +348,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(72, 72),
+        model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(48, 48),
                                     factorization=args.factorization, rank=args.rank)
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
