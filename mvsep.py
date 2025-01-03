@@ -338,7 +338,7 @@ def main():
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=352800, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
     parser.add_argument('--num_layers', type=int, default=5, help='Number of layers in the CNN model')
     parser.add_argument('--n_fft', type=int, default=4096, help='Number of FFT bins for STFT')
     parser.add_argument('--hop_length', type=int, default=1024, help='Hop length for STFT')
@@ -349,7 +349,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(16, 16),
+    model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(24, 24),
                                 factorization=args.factorization, rank=args.rank)
     optimizer = torch.optim.Adam(model.parameters())
 
@@ -368,7 +368,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(16, 16),
+        model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(24, 24),
                                     factorization=args.factorization, rank=args.rank)
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
