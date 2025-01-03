@@ -348,7 +348,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(64, 64),
+    model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(72, 72),
                                 factorization=args.factorization, rank=args.rank)
     optimizer = torch.optim.Adam(model.parameters())
 
@@ -367,7 +367,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(64, 64),
+        model = NeuralOperatorModel(in_channels=2, out_channels=4, hidden_channels=128, n_modes=(72, 72),
                                     factorization=args.factorization, rank=args.rank)
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
