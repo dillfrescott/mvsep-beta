@@ -10,9 +10,45 @@ from tqdm import tqdm
 import numpy as np
 from neuralop.models import FNO, TFNO
 
+class SpatialAttention(nn.Module):
+    def __init__(self, in_channels):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=7, padding=3)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        att = self.conv(x)
+        att = self.sigmoid(att)
+        return x * att
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        # Ensure reduction_ratio does not exceed in_channels
+        reduction_ratio = min(reduction_ratio, in_channels)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction_ratio),
+            nn.ReLU(),
+            nn.Linear(in_channels // reduction_ratio, in_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
 class NeuralOperatorModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, hidden_channels=64, n_modes=(16, 16), factorization=None, rank=0.05):
         super(NeuralOperatorModel, self).__init__()
+        
+        # Attention mechanisms
+        self.spatial_attention = SpatialAttention(in_channels)
+        self.channel_attention = ChannelAttention(in_channels)
+        
+        # Neural operator (FNO or TFNO)
         if factorization is None:
             self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
                                 in_channels=in_channels, out_channels=out_channels)
@@ -22,9 +58,16 @@ class NeuralOperatorModel(nn.Module):
                                  factorization=factorization, rank=rank)
 
     def forward(self, x):
-        # Predict the vocal mask
-        vocal_mask = self.operator(x)
-        return vocal_mask
+        # Apply spatial attention
+        x = self.spatial_attention(x)
+        
+        # Apply channel attention
+        x = self.channel_attention(x)
+        
+        # Apply the neural operator
+        x = self.operator(x)
+        
+        return x
 
 def compute_vocal_mask(vocal_mag, instrumental_mag, eps=1e-8):
     # Compute the ideal ratio mask (IRM)
@@ -152,7 +195,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
         loss_log = checkpoint['loss_log']
         print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
 
-    progress_bar = tqdm(total=epochs * len(dataloader))
+    progress_bar = tqdm(total=epochs * len(dataloader), dynamic_ncols=True)
 
     model.train()
     for epoch in range(epochs):
@@ -167,16 +210,31 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             loss = loss_fn(pred_vocal_mask, vocal_mask)
 
             loss.backward()
+            
+            # Clip gradients to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Calculate gradient norm
+            grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in model.parameters()]), 2)
+            
+            # Adjust learning rate based on gradient norm
+            adjust_learning_rate(optimizer, grad_norm, args.learning_rate)
+            
             optimizer.step()
             scheduler.step()
 
             avg_loss = (avg_loss * step + loss.item()) / (step + 1)
             loss_log.append(loss.item())
             step += 1
-            progress_bar.update(1)
 
-            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f}"
-            progress_bar.set_description(desc)
+            # Fetch the current learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+
+            # Update the progress bar description
+            progress_bar.set_description(
+                f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
+            )
+            progress_bar.update(1)  # Increment the progress bar
 
             if step % checkpoint_steps == 0:
                 torch.save({
