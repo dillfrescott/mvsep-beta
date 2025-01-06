@@ -24,20 +24,30 @@ class RotaryPositionEmbedding(nn.Module):
         # Generate position indices
         position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)  # (1, seq_len, 1)
 
-        # Compute the angles for rotation
+        # Compute the angles for rotation in both directions
         div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32, device=x.device) * -(math.log(10000.0) / dim))
-        angles = position * div_term  # (1, seq_len, dim // 2)
+        angles_positive = position * div_term  # (1, seq_len, dim // 2)
+        angles_negative = -angles_positive  # (1, seq_len, dim // 2)
 
-        # Create sin and cos embeddings
-        sin_emb = torch.sin(angles)
-        cos_emb = torch.cos(angles)
+        # Create sin and cos embeddings for both directions
+        sin_emb_positive = torch.sin(angles_positive)
+        cos_emb_positive = torch.cos(angles_positive)
+        sin_emb_negative = torch.sin(angles_negative)
+        cos_emb_negative = torch.cos(angles_negative)
 
-        # Apply rotation to the input
-        x_rotated = torch.zeros_like(x)
-        x_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb - x[:, :, 1::2] * sin_emb
-        x_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb + x[:, :, 0::2] * sin_emb
+        # Apply rotation to the input for both directions
+        x_rotated_positive = torch.zeros_like(x)
+        x_rotated_negative = torch.zeros_like(x)
 
-        return x_rotated
+        # Rotate in the positive direction
+        x_rotated_positive[:, :, 0::2] = x[:, :, 0::2] * cos_emb_positive - x[:, :, 1::2] * sin_emb_positive
+        x_rotated_positive[:, :, 1::2] = x[:, :, 1::2] * cos_emb_positive + x[:, :, 0::2] * sin_emb_positive
+
+        # Rotate in the negative direction
+        x_rotated_negative[:, :, 0::2] = x[:, :, 0::2] * cos_emb_negative - x[:, :, 1::2] * sin_emb_negative
+        x_rotated_negative[:, :, 1::2] = x[:, :, 1::2] * cos_emb_negative + x[:, :, 0::2] * sin_emb_negative
+
+        return x_rotated_positive, x_rotated_negative
 
 class NeuralOperatorModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48), factorization=None, rank=0.05):
@@ -48,17 +58,25 @@ class NeuralOperatorModel(nn.Module):
             self.operator = TFNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=out_channels, factorization=factorization, rank=rank)
 
         self.rope = RotaryPositionEmbedding(dim=in_channels)
-        self.projection = nn.Linear(in_channels, hidden_channels)
+        self.projection_positive = nn.Linear(in_channels, hidden_channels)
+        self.projection_negative = nn.Linear(in_channels, hidden_channels)
 
     def forward(self, x):
         batch_size, channels, height, width = x.size()
         x = x.permute(0, 2, 3, 1)
         x = x.reshape(batch_size, height * width, -1)
-        x = self.rope(x, seq_len=height * width)
-        x = x.reshape(batch_size, height, width, -1)
-        x = self.projection(x)
-        x = x.permute(0, 3, 1, 2)
-        x = self.operator(x)
+
+        x_rotated_positive, x_rotated_negative = self.rope(x, seq_len=height * width)
+
+        x_positive = self.projection_positive(x_rotated_positive)
+        x_negative = self.projection_negative(x_rotated_negative)
+
+        x_combined = x_positive + x_negative
+
+        x_combined = x_combined.reshape(batch_size, height, width, -1)
+        x_combined = x_combined.permute(0, 3, 1, 2)
+
+        x = self.operator(x_combined)
         pred_inst_mag, pred_vocal_mag = torch.split(x, 1, dim=1)
         return pred_inst_mag, pred_vocal_mag
 
