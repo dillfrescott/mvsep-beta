@@ -9,22 +9,56 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import numpy as np
 from neuralop.models import FNO, TFNO
+import math
+
+class RotaryPositionEmbedding(nn.Module):
+    def __init__(self, dim):
+        super(RotaryPositionEmbedding, self).__init__()
+        self.dim = dim
+
+    def forward(self, x, seq_len=None):
+        batch_size, seq_len, dim = x.size()
+        if dim != self.dim:
+            raise ValueError(f"Input dimension {dim} does not match RoPE dimension {self.dim}")
+
+        # Generate position indices
+        position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)  # (1, seq_len, 1)
+
+        # Compute the angles for rotation
+        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32, device=x.device) * -(math.log(10000.0) / dim))
+        angles = position * div_term  # (1, seq_len, dim // 2)
+
+        # Create sin and cos embeddings
+        sin_emb = torch.sin(angles)
+        cos_emb = torch.cos(angles)
+
+        # Apply rotation to the input
+        x_rotated = torch.zeros_like(x)
+        x_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb - x[:, :, 1::2] * sin_emb
+        x_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb + x[:, :, 0::2] * sin_emb
+
+        return x_rotated
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=64, n_modes=(16, 16), factorization=None, rank=0.05):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48), factorization=None, rank=0.05):
         super(NeuralOperatorModel, self).__init__()
         if factorization is None:
-            self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
-                                in_channels=in_channels, out_channels=out_channels)
+            self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=out_channels)
         else:
-            self.operator = TFNO(n_modes=n_modes, hidden_channels=hidden_channels,
-                                 in_channels=in_channels, out_channels=out_channels,
-                                 factorization=factorization, rank=rank)
+            self.operator = TFNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=out_channels, factorization=factorization, rank=rank)
+
+        self.rope = RotaryPositionEmbedding(dim=in_channels)
+        self.projection = nn.Linear(in_channels, hidden_channels)
 
     def forward(self, x):
-        # Pass through the neural operator
+        batch_size, channels, height, width = x.size()
+        x = x.permute(0, 2, 3, 1)
+        x = x.reshape(batch_size, height * width, -1)
+        x = self.rope(x, seq_len=height * width)
+        x = x.reshape(batch_size, height, width, -1)
+        x = self.projection(x)
+        x = x.permute(0, 3, 1, 2)
         x = self.operator(x)
-        # Split the output into magnitude
         pred_inst_mag, pred_vocal_mag = torch.split(x, 1, dim=1)
         return pred_inst_mag, pred_vocal_mag
 
