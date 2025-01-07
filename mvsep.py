@@ -22,11 +22,11 @@ class RotaryPositionEmbedding(nn.Module):
             raise ValueError(f"Input dimension {dim} does not match RoPE dimension {self.dim}")
 
         # Generate position indices
-        position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)  # (1, seq_len, 1)
+        position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)
 
         # Compute the angles for rotation
         div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32, device=x.device) * -(math.log(10000.0) / dim))
-        angles = position * div_term  # (1, seq_len, dim // 2)
+        angles = position * div_term
 
         # Create sin and cos embeddings
         sin_emb = torch.sin(angles)
@@ -58,7 +58,7 @@ class NeuralOperatorModel(nn.Module):
         self.projection = nn.Sequential(
             nn.Linear(in_channels, projected_channels),  # Project to higher dimensions
             nn.ReLU(),  # Add non-linearity
-            nn.Linear(projected_channels, projected_channels)  # Optional: Further transformation
+            nn.Linear(projected_channels, projected_channels)
         )
 
         # Define the neural operator
@@ -74,16 +74,16 @@ class NeuralOperatorModel(nn.Module):
         batch_size, channels, height, width = x.size()
 
         # Reshape and apply Rotary Position Embedding
-        x = x.permute(0, 2, 3, 1)  # (batch, height, width, channels)
-        x = x.reshape(batch_size, height * width, -1)  # (batch, height * width, channels)
-        x = self.rope(x, seq_len=height * width)  # Apply RoPE
-        x = x.reshape(batch_size, height, width, -1)  # (batch, height, width, channels)
+        x = x.permute(0, 2, 3, 1)
+        x = x.reshape(batch_size, height * width, -1)
+        x = self.rope(x, seq_len=height * width)
+        x = x.reshape(batch_size, height, width, -1)
 
         # Project into higher-dimensional space
-        x = self.projection(x)  # (batch, height, width, projected_channels)
+        x = self.projection(x)
 
         # Reshape for the neural operator
-        x = x.permute(0, 3, 1, 2)  # (batch, projected_channels, height, width)
+        x = x.permute(0, 3, 1, 2)
 
         # Apply the neural operator
         x = self.operator(x)
@@ -94,7 +94,7 @@ class NeuralOperatorModel(nn.Module):
 
 def loss_fn(pred_inst_mag, pred_vocal_mag, target_inst_mag, target_vocal_mag, mixture_phase, window, n_fft, hop_length):
     # Ensure the input tensors have the correct shape
-    pred_inst_mag = pred_inst_mag.squeeze(0)  # Remove batch dimension if batch size is 1
+    pred_inst_mag = pred_inst_mag.squeeze(0)
     pred_vocal_mag = pred_vocal_mag.squeeze(0)
     target_inst_mag = target_inst_mag.squeeze(0)
     target_vocal_mag = target_vocal_mag.squeeze(0)
