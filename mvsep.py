@@ -1,5 +1,6 @@
 import os
 import argparse
+import glob
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,6 +11,9 @@ from tqdm import tqdm
 import numpy as np
 from neuralop.models import FNO, TFNO
 import math
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, message="Attempting to update metadata for a module with metadata already in self.state_dict()")
 
 class RotaryPositionEmbedding(nn.Module):
     def __init__(self, dim):
@@ -52,22 +56,31 @@ class HigherDimensionalProjection(nn.Module):
         return x
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, projected_channels=512, n_modes=(48, 48), factorization=None, rank=0.05):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, projected_channels=512, n_modes=(48, 48), factorization=None, rank=0.05, num_sub_bands=8):
         super(NeuralOperatorModel, self).__init__()
-        # Define the higher-dimensional projection
-        self.projection = nn.Sequential(
-            nn.Linear(in_channels, projected_channels),  # Project to higher dimensions
-            nn.ReLU(),  # Add non-linearity
-            nn.Linear(projected_channels, projected_channels)
-        )
+        self.num_sub_bands = num_sub_bands
+        self.sub_band_projection = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_channels, projected_channels),
+                nn.ReLU(),
+                nn.Linear(projected_channels, projected_channels)
+            ) for _ in range(num_sub_bands)
+        ])
 
-        # Define the neural operator
         if factorization is None:
-            self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels)
+            self.operators = nn.ModuleList([
+                FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels)
+                for _ in range(num_sub_bands)
+            ])
         else:
-            self.operator = TFNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels, factorization=factorization, rank=rank)
+            self.operators = nn.ModuleList([
+                TFNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels, factorization=factorization, rank=rank)
+                for _ in range(num_sub_bands)
+            ])
 
-        # Rotary Position Embedding
+        # Add a final layer to adjust the output dimensions
+        self.final_adjustment = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+
         self.rope = RotaryPositionEmbedding(dim=in_channels)
 
     def forward(self, x):
@@ -79,14 +92,23 @@ class NeuralOperatorModel(nn.Module):
         x = self.rope(x, seq_len=height * width)
         x = x.reshape(batch_size, height, width, -1)
 
-        # Project into higher-dimensional space
-        x = self.projection(x)
+        # Split the spectrogram into sub-bands
+        sub_band_width = width // self.num_sub_bands
+        sub_bands = [x[:, :, i * sub_band_width:(i + 1) * sub_band_width, :] for i in range(self.num_sub_bands)]
 
-        # Reshape for the neural operator
-        x = x.permute(0, 3, 1, 2)
+        # Process each sub-band separately
+        processed_sub_bands = []
+        for i, sub_band in enumerate(sub_bands):
+            projected_sub_band = self.sub_band_projection[i](sub_band)
+            projected_sub_band = projected_sub_band.permute(0, 3, 1, 2)
+            processed_sub_band = self.operators[i](projected_sub_band)
+            processed_sub_bands.append(processed_sub_band)
 
-        # Apply the neural operator
-        x = self.operator(x)
+        # Combine the processed sub-bands
+        x = torch.cat(processed_sub_bands, dim=3)
+
+        # Adjust the output dimensions to match the input
+        x = self.final_adjustment(x)
 
         # Split the output into instrumental and vocal magnitudes
         pred_inst_mag, pred_vocal_mag = torch.split(x, 1, dim=1)
@@ -242,6 +264,9 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     avg_loss = 0.0
     loss_log = []
 
+    # List to keep track of the latest checkpoints
+    latest_checkpoints = []
+
     if checkpoint_path:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -292,13 +317,23 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
             # Save checkpoint periodically
             if step % checkpoint_steps == 0:
+                checkpoint_filename = f"checkpoint_step_{step}.pt"
                 torch.save({
                     'step': step,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
                     'loss_log': loss_log
-                }, f"checkpoint_step_{step}.pt")
+                }, checkpoint_filename)
+
+                # Add the new checkpoint to the list
+                latest_checkpoints.append(checkpoint_filename)
+
+                # If there are more than 2 checkpoints, delete the oldest one
+                if len(latest_checkpoints) > 2:
+                    oldest_checkpoint = latest_checkpoints.pop(0)
+                    if os.path.exists(oldest_checkpoint):
+                        os.remove(oldest_checkpoint)
 
     # Save final loss log
     torch.save({'loss_log': loss_log}, 'loss_log.pt')
@@ -338,6 +373,15 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
 
             pred_inst_mag = pred_inst_mag.squeeze(0)
             pred_vocal_mag = pred_vocal_mag.squeeze(0)
+
+            # Pad pred_inst_mag and pred_vocal_mag to match chunk_phase size
+            if pred_inst_mag.size(2) < chunk_phase.size(2):
+                pad_size = chunk_phase.size(2) - pred_inst_mag.size(2)
+                pred_inst_mag = F.pad(pred_inst_mag, (0, pad_size))
+                pred_vocal_mag = F.pad(pred_vocal_mag, (0, pad_size))
+            elif pred_inst_mag.size(2) > chunk_phase.size(2):
+                pad_size = pred_inst_mag.size(2) - chunk_phase.size(2)
+                chunk_phase = F.pad(chunk_phase, (0, pad_size))
 
             pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
             pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
@@ -397,8 +441,8 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48),
-                                factorization=args.factorization, rank=args.rank)
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48),
+                                factorization=args.factorization, rank=args.rank, num_sub_bands=8)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
@@ -417,8 +461,8 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48),
-                                    factorization=args.factorization, rank=args.rank)
+        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48),
+                                    factorization=args.factorization, rank=args.rank, num_sub_bands=8)
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
