@@ -10,6 +10,8 @@ from tqdm import tqdm
 import numpy as np
 from neuralop.models import FNO, TFNO
 import math
+import warnings
+warnings.filterwarnings("ignore", message="Attempting to update metadata for a module with metadata already in self.state_dict()")
 
 class RotaryPositionEmbedding(nn.Module):
     def __init__(self, dim):
@@ -52,41 +54,59 @@ class HigherDimensionalProjection(nn.Module):
         return x
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, projected_channels=512, n_modes=(48, 48), factorization=None, rank=0.05):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, projected_channels=512, n_modes=(48, 48), factorization=None, rank=0.05, num_sub_bands=6):
         super(NeuralOperatorModel, self).__init__()
-        # Define the higher-dimensional projection
+        self.num_sub_bands = num_sub_bands
         self.projection = nn.Sequential(
-            nn.Linear(in_channels, projected_channels),  # Project to higher dimensions
-            nn.ReLU(),  # Add non-linearity
+            nn.Linear(in_channels, projected_channels),
+            nn.ReLU(),
             nn.Linear(projected_channels, projected_channels)
         )
-
-        # Define the neural operator
-        if factorization is None:
-            self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels)
-        else:
-            self.operator = TFNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels, factorization=factorization, rank=rank)
-
-        # Rotary Position Embedding
-        self.rope = RotaryPositionEmbedding(dim=in_channels)
+        self.sub_band_models = nn.ModuleList([
+            FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels) if factorization is None else TFNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels, factorization=factorization, rank=rank)
+            for _ in range(num_sub_bands)
+        ])
+        self.rope = RotaryPositionEmbedding(dim=projected_channels)
 
     def forward(self, x):
         batch_size, channels, height, width = x.size()
 
-        # Reshape and apply Rotary Position Embedding
-        x = x.permute(0, 2, 3, 1)
-        x = x.reshape(batch_size, height * width, -1)
-        x = self.rope(x, seq_len=height * width)
-        x = x.reshape(batch_size, height, width, -1)
+        # Pad the input spectrogram if necessary
+        pad_width = (self.num_sub_bands - (width % self.num_sub_bands)) % self.num_sub_bands
+        if pad_width > 0:
+            x = F.pad(x, (0, pad_width))  # Pad along the width dimension
 
         # Project into higher-dimensional space
+        x = x.permute(0, 2, 3, 1)  # [batch, height, width, channels]
+        x = x.reshape(batch_size, height * (width + pad_width), -1)
         x = self.projection(x)
+        x = x.reshape(batch_size, height, width + pad_width, -1)
+        x = x.permute(0, 3, 1, 2)  # [batch, projected_channels, height, width + pad_width]
 
-        # Reshape for the neural operator
-        x = x.permute(0, 3, 1, 2)
+        # Split the spectrogram into sub-bands
+        sub_band_width = (width + pad_width) // self.num_sub_bands
+        sub_bands = [x[:, :, :, i * sub_band_width:(i + 1) * sub_band_width] for i in range(self.num_sub_bands)]
 
-        # Apply the neural operator
-        x = self.operator(x)
+        # Process each sub-band independently
+        processed_sub_bands = []
+        for i, sub_band in enumerate(sub_bands):
+            # Apply rotary position embedding
+            sub_band = sub_band.permute(0, 2, 3, 1)  # [batch, height, sub_band_width, projected_channels]
+            sub_band = sub_band.reshape(batch_size, height * sub_band_width, -1)
+            sub_band = self.rope(sub_band, seq_len=height * sub_band_width)
+            sub_band = sub_band.reshape(batch_size, height, sub_band_width, -1)
+            sub_band = sub_band.permute(0, 3, 1, 2)  # [batch, projected_channels, height, sub_band_width]
+
+            # Apply the neural operator
+            sub_band = self.sub_band_models[i](sub_band)
+            processed_sub_bands.append(sub_band)
+
+        # Combine the processed sub-bands
+        x = torch.cat(processed_sub_bands, dim=3)  # [batch, out_channels, height, width + pad_width]
+
+        # Remove padding if it was added
+        if pad_width > 0:
+            x = x[:, :, :, :width]  # Remove padding along the width dimension
 
         # Split the output into instrumental and vocal magnitudes
         pred_inst_mag, pred_vocal_mag = torch.split(x, 1, dim=1)
@@ -99,6 +119,13 @@ def loss_fn(pred_inst_mag, pred_vocal_mag, target_inst_mag, target_vocal_mag, mi
     target_inst_mag = target_inst_mag.squeeze(0)
     target_vocal_mag = target_vocal_mag.squeeze(0)
     mixture_phase = mixture_phase.squeeze(0)
+
+    # Ensure dimensions match
+    if pred_inst_mag.shape[2] != mixture_phase.shape[2]:
+        min_width = min(pred_inst_mag.shape[2], mixture_phase.shape[2])
+        pred_inst_mag = pred_inst_mag[:, :, :min_width]
+        pred_vocal_mag = pred_vocal_mag[:, :, :min_width]
+        mixture_phase = mixture_phase[:, :, :min_width]
 
     # Reconstruct time-domain signals using the ground truth phase
     pred_inst_spec = pred_inst_mag * torch.exp(1j * mixture_phase)
@@ -397,8 +424,8 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48),
-                                factorization=args.factorization, rank=args.rank)
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=32, n_modes=(48, 48), 
+                    factorization=args.factorization, rank=args.rank, num_sub_bands=8)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
@@ -417,8 +444,8 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48),
-                                    factorization=args.factorization, rank=args.rank)
+        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=32, n_modes=(48, 48), 
+                        factorization=args.factorization, rank=args.rank, num_sub_bands=8)
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
