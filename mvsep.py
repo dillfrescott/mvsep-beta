@@ -122,6 +122,16 @@ def loss_fn(pred_inst_mag, pred_vocal_mag, target_inst_mag, target_vocal_mag, mi
     target_vocal_mag = target_vocal_mag.squeeze(0)
     mixture_phase = mixture_phase.squeeze(0)
 
+    # Pad or crop pred_inst_mag and pred_vocal_mag to match mixture_phase size
+    if pred_inst_mag.size(2) < mixture_phase.size(2):
+        pad_size = mixture_phase.size(2) - pred_inst_mag.size(2)
+        pred_inst_mag = F.pad(pred_inst_mag, (0, pad_size))
+        pred_vocal_mag = F.pad(pred_vocal_mag, (0, pad_size))
+    elif pred_inst_mag.size(2) > mixture_phase.size(2):
+        crop_size = pred_inst_mag.size(2) - mixture_phase.size(2)
+        pred_inst_mag = pred_inst_mag[:, :, :-crop_size]
+        pred_vocal_mag = pred_vocal_mag[:, :, :-crop_size]
+
     # Reconstruct time-domain signals using the ground truth phase
     pred_inst_spec = pred_inst_mag * torch.exp(1j * mixture_phase)
     pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)
@@ -423,7 +433,7 @@ def main():
     parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
+    parser.add_argument('--checkpoint_steps', type=int, default=1000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
@@ -441,8 +451,8 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48),
-                                factorization=args.factorization, rank=args.rank, num_sub_bands=8)
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(24, 24),
+                                factorization=args.factorization, rank=args.rank, num_sub_bands=32)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
@@ -461,8 +471,8 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48),
-                                    factorization=args.factorization, rank=args.rank, num_sub_bands=8)
+        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(24, 24),
+                                    factorization=args.factorization, rank=args.rank, num_sub_bands=32)
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
