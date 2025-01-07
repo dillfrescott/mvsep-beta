@@ -10,6 +10,7 @@ from tqdm import tqdm
 import numpy as np
 from neuralop.models import FNO, TFNO
 import math
+import glob
 
 class RotaryPositionEmbedding(nn.Module):
     def __init__(self, dim):
@@ -242,6 +243,9 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     avg_loss = 0.0
     loss_log = []
 
+    # List to keep track of checkpoint files
+    checkpoint_files = []
+
     if checkpoint_path:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -292,13 +296,23 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
             # Save checkpoint periodically
             if step % checkpoint_steps == 0:
+                checkpoint_filename = f"checkpoint_step_{step}.pt"
                 torch.save({
                     'step': step,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
                     'loss_log': loss_log
-                }, f"checkpoint_step_{step}.pt")
+                }, checkpoint_filename)
+
+                # Add the new checkpoint to the list
+                checkpoint_files.append(checkpoint_filename)
+
+                # Remove the oldest checkpoint if there are more than 3
+                if len(checkpoint_files) > 3:
+                    oldest_checkpoint = checkpoint_files.pop(0)
+                    if os.path.exists(oldest_checkpoint):
+                        os.remove(oldest_checkpoint)
 
     # Save final loss log
     torch.save({'loss_log': loss_log}, 'loss_log.pt')
