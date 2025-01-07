@@ -340,7 +340,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                 latest_checkpoints.append(checkpoint_filename)
 
                 # If there are more than 2 checkpoints, delete the oldest one
-                if len(latest_checkpoints) > 2:
+                if len(latest_checkpoints) > 3:
                     oldest_checkpoint = latest_checkpoints.pop(0)
                     if os.path.exists(oldest_checkpoint):
                         os.remove(oldest_checkpoint)
@@ -433,7 +433,7 @@ def main():
     parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--checkpoint_steps', type=int, default=1000, help='Save checkpoint every X steps')
+    parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
