@@ -12,34 +12,6 @@ from neuralop.models import FNO, TFNO
 import math
 import glob
 
-class RotaryPositionEmbedding(nn.Module):
-    def __init__(self, dim):
-        super(RotaryPositionEmbedding, self).__init__()
-        self.dim = dim
-
-    def forward(self, x, seq_len=None):
-        batch_size, seq_len, dim = x.size()
-        if dim != self.dim:
-            raise ValueError(f"Input dimension {dim} does not match RoPE dimension {self.dim}")
-
-        # Generate position indices
-        position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)
-
-        # Compute the angles for rotation
-        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32, device=x.device) * -(math.log(10000.0) / dim))
-        angles = position * div_term
-
-        # Create sin and cos embeddings
-        sin_emb = torch.sin(angles)
-        cos_emb = torch.cos(angles)
-
-        # Apply rotation to the input
-        x_rotated = torch.zeros_like(x)
-        x_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb - x[:, :, 1::2] * sin_emb
-        x_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb + x[:, :, 0::2] * sin_emb
-
-        return x_rotated
-
 class HigherDimensionalProjection(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(HigherDimensionalProjection, self).__init__()
@@ -53,7 +25,7 @@ class HigherDimensionalProjection(nn.Module):
         return x
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, projected_channels=512, n_modes=(48, 48), factorization=None, rank=0.05):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, projected_channels=512, n_modes=(48, 48)):
         super(NeuralOperatorModel, self).__init__()
         # Define the higher-dimensional projection
         self.projection = nn.Sequential(
@@ -62,29 +34,19 @@ class NeuralOperatorModel(nn.Module):
             nn.Linear(projected_channels, projected_channels)
         )
 
-        # Define the neural operator
-        if factorization is None:
-            self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels)
-        else:
-            self.operator = TFNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels, factorization=factorization, rank=rank)
-
-        # Rotary Position Embedding
-        self.rope = RotaryPositionEmbedding(dim=in_channels)
+        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels)
 
     def forward(self, x):
         batch_size, channels, height, width = x.size()
 
-        # Reshape and apply Rotary Position Embedding
-        x = x.permute(0, 2, 3, 1)
-        x = x.reshape(batch_size, height * width, -1)
-        x = self.rope(x, seq_len=height * width)
-        x = x.reshape(batch_size, height, width, -1)
+        # Reshape for the projection
+        x = x.permute(0, 2, 3, 1)  # (batch_size, height, width, channels)
 
         # Project into higher-dimensional space
         x = self.projection(x)
 
         # Reshape for the neural operator
-        x = x.permute(0, 3, 1, 2)
+        x = x.permute(0, 3, 1, 2)  # (batch_size, projected_channels, height, width)
 
         # Apply the neural operator
         x = self.operator(x)
@@ -401,8 +363,6 @@ def main():
     parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
     parser.add_argument('--n_fft', type=int, default=4096, help='Number of FFT bins for STFT')
     parser.add_argument('--hop_length', type=int, default=1024, help='Hop length for STFT')
-    parser.add_argument('--factorization', type=str, default=None, help='Factorization type for TFNO (e.g., "tucker")')
-    parser.add_argument('--rank', type=float, default=0.05, help='Rank for TFNO factorization')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
@@ -411,8 +371,7 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48),
-                                factorization=args.factorization, rank=args.rank)
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48))
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
@@ -431,8 +390,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48),
-                                    factorization=args.factorization, rank=args.rank)
+        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48))
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
