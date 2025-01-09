@@ -12,6 +12,34 @@ from neuralop.models import FNO, TFNO
 import math
 import glob
 
+class RotaryPositionEmbedding(nn.Module):
+    def __init__(self, dim):
+        super(RotaryPositionEmbedding, self).__init__()
+        self.dim = dim
+
+    def forward(self, x, seq_len=None):
+        batch_size, seq_len, dim = x.size()
+        if dim != self.dim:
+            raise ValueError(f"Input dimension {dim} does not match RoPE dimension {self.dim}")
+
+        # Generate position indices
+        position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)
+
+        # Compute the angles for rotation
+        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32, device=x.device) * -(math.log(10000.0) / dim))
+        angles = position * div_term
+
+        # Create sin and cos embeddings
+        sin_emb = torch.sin(angles)
+        cos_emb = torch.cos(angles)
+
+        # Apply rotation to the input
+        x_rotated = torch.zeros_like(x)
+        x_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb - x[:, :, 1::2] * sin_emb
+        x_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb + x[:, :, 0::2] * sin_emb
+
+        return x_rotated
+
 class HigherDimensionalProjection(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(HigherDimensionalProjection, self).__init__()
@@ -34,19 +62,26 @@ class NeuralOperatorModel(nn.Module):
             nn.Linear(projected_channels, projected_channels)
         )
 
+        # Define the neural operator
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels)
+
+        # Rotary Position Embedding
+        self.rope = RotaryPositionEmbedding(dim=in_channels)
 
     def forward(self, x):
         batch_size, channels, height, width = x.size()
 
-        # Reshape for the projection
-        x = x.permute(0, 2, 3, 1)  # (batch_size, height, width, channels)
+        # Reshape and apply Rotary Position Embedding
+        x = x.permute(0, 2, 3, 1)
+        x = x.reshape(batch_size, height * width, -1)
+        x = self.rope(x, seq_len=height * width)
+        x = x.reshape(batch_size, height, width, -1)
 
         # Project into higher-dimensional space
         x = self.projection(x)
 
         # Reshape for the neural operator
-        x = x.permute(0, 3, 1, 2)  # (batch_size, projected_channels, height, width)
+        x = x.permute(0, 3, 1, 2)
 
         # Apply the neural operator
         x = self.operator(x)
