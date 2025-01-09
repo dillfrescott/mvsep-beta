@@ -29,16 +29,25 @@ class RotaryPositionEmbedding(nn.Module):
         div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32, device=x.device) * -(math.log(10000.0) / dim))
         angles = position * div_term
 
-        # Create sin and cos embeddings
-        sin_emb = torch.sin(angles)
-        cos_emb = torch.cos(angles)
+        # Create sin and cos embeddings for positive rotation
+        sin_emb_pos = torch.sin(angles)
+        cos_emb_pos = torch.cos(angles)
 
-        # Apply rotation to the input
-        x_rotated = torch.zeros_like(x)
-        x_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb - x[:, :, 1::2] * sin_emb
-        x_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb + x[:, :, 0::2] * sin_emb
+        # Create sin and cos embeddings for negative rotation
+        sin_emb_neg = torch.sin(-angles)
+        cos_emb_neg = torch.cos(-angles)
 
-        return x_rotated
+        # Apply positive rotation to all dimensions
+        x_pos_rotated = torch.zeros_like(x)
+        x_pos_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb_pos - x[:, :, 1::2] * sin_emb_pos
+        x_pos_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb_pos + x[:, :, 0::2] * sin_emb_pos
+
+        # Apply negative rotation to all dimensions
+        x_neg_rotated = torch.zeros_like(x)
+        x_neg_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb_neg - x[:, :, 1::2] * sin_emb_neg
+        x_neg_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb_neg + x[:, :, 0::2] * sin_emb_neg
+
+        return x_pos_rotated, x_neg_rotated
 
 class HigherDimensionalProjection(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -57,37 +66,45 @@ class NeuralOperatorModel(nn.Module):
         super(NeuralOperatorModel, self).__init__()
         # Define the higher-dimensional projection
         self.projection = nn.Sequential(
-            nn.Linear(in_channels, projected_channels),  # Project to higher dimensions
-            nn.ReLU(),  # Add non-linearity
+            nn.Linear(in_channels * 2, projected_channels),
+            nn.ReLU(),
             nn.Linear(projected_channels, projected_channels)
         )
 
         # Define the neural operator
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=projected_channels, out_channels=out_channels)
 
-        # Rotary Position Embedding
+        # Rotary Position Embedding (positive and negative)
         self.rope = RotaryPositionEmbedding(dim=in_channels)
 
     def forward(self, x):
         batch_size, channels, height, width = x.size()
 
         # Reshape and apply Rotary Position Embedding
-        x = x.permute(0, 2, 3, 1)
-        x = x.reshape(batch_size, height * width, -1)
-        x = self.rope(x, seq_len=height * width)
-        x = x.reshape(batch_size, height, width, -1)
+        x = x.permute(0, 2, 3, 1)  # (batch_size, height, width, channels)
+        x = x.reshape(batch_size, height * width, -1)  # (batch_size, height * width, channels)
+
+        # Apply RoPE (positive and negative rotations)
+        x_pos_rotated, x_neg_rotated = self.rope(x, seq_len=height * width)
+
+        # Concatenate positive and negative rotations
+        x_rotated = torch.cat([x_pos_rotated, x_neg_rotated], dim=-1)  # (batch_size, height * width, channels * 2)
+
+        # Reshape for the projection layer
+        x_rotated = x_rotated.reshape(batch_size, -1, x_rotated.size(-1))  # (batch_size, height * width, channels * 2)
 
         # Project into higher-dimensional space
-        x = self.projection(x)
+        x_rotated = self.projection(x_rotated)  # (batch_size, height * width, projected_channels)
 
-        # Reshape for the neural operator
-        x = x.permute(0, 3, 1, 2)
+        # Reshape back for the neural operator
+        x_rotated = x_rotated.reshape(batch_size, height, width, -1)  # (batch_size, height, width, projected_channels)
+        x_rotated = x_rotated.permute(0, 3, 1, 2)  # (batch_size, projected_channels, height, width)
 
         # Apply the neural operator
-        x = self.operator(x)
+        x_rotated = self.operator(x_rotated)
 
         # Split the output into instrumental and vocal magnitudes
-        pred_inst_mag, pred_vocal_mag = torch.split(x, 1, dim=1)
+        pred_inst_mag, pred_vocal_mag = torch.split(x_rotated, 1, dim=1)
         return pred_inst_mag, pred_vocal_mag
 
 def loss_fn(pred_inst_mag, pred_vocal_mag, target_inst_mag, target_vocal_mag, mixture_phase, window, n_fft, hop_length):
