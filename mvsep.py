@@ -103,7 +103,7 @@ class MultiScaleAttention(nn.Module):
         return output
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48), num_bands=4):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48), num_bands=128):
         super(NeuralOperatorModel, self).__init__()
         self.num_bands = num_bands
 
