@@ -13,45 +13,17 @@ import math
 import glob
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=1, hidden_channels=64, n_modes=(48, 48)):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48)):
         super(NeuralOperatorModel, self).__init__()
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=in_channels, out_channels=out_channels)
-        # Adjust the BatchNorm2d layer to match the output channels of the FNO layer
-        self.bn = nn.BatchNorm2d(out_channels)  # Use out_channels instead of hidden_channels
 
     def forward(self, x):
         x = self.operator(x)
-        x = self.bn(x)
         return x
 
-def loss_fn(pred_vocal_mag, target_vocal_mag, mixture_phase, window, n_fft, hop_length):
-    # Ensure the input tensors have the correct shape
-    pred_vocal_mag = pred_vocal_mag.squeeze(0)
-    target_vocal_mag = target_vocal_mag.squeeze(0)
-    mixture_phase = mixture_phase.squeeze(0)
-
-    # Reconstruct time-domain signals using the ground truth phase
-    pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)
-
-    # Process each channel separately
-    pred_vocal_audio = []
-    target_vocal_audio = []
-
-    for channel in range(pred_vocal_spec.shape[0]):  # Iterate over channels
-        # Reconstruct audio for each channel
-        pred_vocal_audio_ch = torch.istft(pred_vocal_spec[channel], n_fft=n_fft, hop_length=hop_length, window=window)
-        target_vocal_audio_ch = torch.istft(target_vocal_mag[channel] * torch.exp(1j * mixture_phase[channel]), n_fft=n_fft, hop_length=hop_length, window=window)
-
-        pred_vocal_audio.append(pred_vocal_audio_ch)
-        target_vocal_audio.append(target_vocal_audio_ch)
-
-    # Stack the channels back together
-    pred_vocal_audio = torch.stack(pred_vocal_audio, dim=0)
-    target_vocal_audio = torch.stack(target_vocal_audio, dim=0)
-
-    # Compute loss in the time domain
-    vocal_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
-
+def loss_fn(pred_vocal_mag, target_vocal_mag):
+    # Directly compute the L1 loss between the predicted and target magnitude spectrograms
+    vocal_loss = F.l1_loss(pred_vocal_mag, target_vocal_mag)
     return vocal_loss
 
 # Custom Dataset class
@@ -188,7 +160,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             pred_vocal_mag = model(mixture_mag)
 
             # Compute loss (only for vocals)
-            loss = loss_fn(pred_vocal_mag, vocal_mag, mixture_phase, window, args.n_fft, args.hop_length)
+            loss = loss_fn(pred_vocal_mag, vocal_mag)  # Only pass the required arguments
 
             # Backward pass
             loss.backward()
@@ -302,7 +274,7 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=1, hidden_channels=64, n_modes=(48, 48))
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48))
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
@@ -319,7 +291,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=1, hidden_channels=64, n_modes=(48, 48))
+        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48))
         inference(model, args.checkpoint_path, args.input_wav, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
