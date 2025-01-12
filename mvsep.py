@@ -12,144 +12,13 @@ from neuralop.models import FNO, TFNO
 import math
 import glob
 
-class RotaryPositionEmbedding(nn.Module):
-    def __init__(self, dim, num_bands=None):
-        super(RotaryPositionEmbedding, self).__init__()
-        self.dim = dim
-        self.num_bands = num_bands
-
-        # Precompute the inverse frequency (div_term) for RoPE
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq)
-
-    def forward(self, x, band_indices=None):
-        batch_size, seq_len, dim = x.size()
-        if dim != self.dim:
-            raise ValueError(f"Input dimension {dim} does not match RoPE dimension {self.dim}")
-
-        # Generate position indices
-        position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)
-
-        # If band_indices are provided, adjust positions for each band
-        if band_indices is not None:
-            position = position + band_indices.unsqueeze(-1) * seq_len  # Offset positions by band index
-
-        # Compute the angles for rotation
-        angles = position * self.inv_freq  # (batch, seq_len, dim // 2)
-
-        # Create sin and cos embeddings
-        sin_emb = torch.sin(angles)  # (batch, seq_len, dim // 2)
-        cos_emb = torch.cos(angles)  # (batch, seq_len, dim // 2)
-
-        # Interleave sin and cos embeddings to match the input dimension
-        sin_emb = sin_emb.repeat_interleave(2, dim=-1)  # (batch, seq_len, dim)
-        cos_emb = cos_emb.repeat_interleave(2, dim=-1)  # (batch, seq_len, dim)
-
-        # Apply RoPE to the input
-        x_rotated = x * cos_emb + self._rotate_half(x) * sin_emb
-        return x_rotated
-
-    def _rotate_half(self, x):
-        """Rotates the second half of the input tensor."""
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-
-class MultiScaleAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, scales=[1, 1.5, 2]):
-        super(MultiScaleAttention, self).__init__()
-        self.scales = scales
-        self.conv_layers = nn.ModuleList([
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-            for _ in scales
-        ])
-        self.attention = nn.Sequential(
-            nn.Conv2d(out_channels * len(scales), out_channels * len(scales), kernel_size=1),
-            nn.Sigmoid()
-        )
-        self.final_conv = nn.Conv2d(out_channels * len(scales), out_channels, kernel_size=3, padding=1)
-
-        # Residual connection: 1x1 convolution to match dimensions if in_channels != out_channels
-        self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
-
-    def forward(self, x):
-        # Save the input for the residual connection
-        residual = x
-
-        # Extract features at multiple scales
-        features = []
-        for i, conv in enumerate(self.conv_layers):
-            # Apply convolution with a small kernel and stride=1
-            feat = conv(x)
-            if self.scales[i] != 1:
-                # Resize the feature map to match the original resolution
-                feat = F.interpolate(feat, size=x.shape[2:], mode='bilinear', align_corners=False)
-            features.append(feat)
-
-        # Concatenate features from all scales
-        features = torch.cat(features, dim=1)
-
-        # Apply attention to focus on fine-grained details
-        attention_map = self.attention(features)
-        attended_features = features * attention_map
-
-        # Final convolution to produce the output
-        output = self.final_conv(attended_features)
-
-        # Add residual connection
-        if self.residual_conv is not None:
-            residual = self.residual_conv(residual)
-        output = output + residual  # Add the residual to the output
-
-        return output
-
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48), num_bands=128):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48)):
         super(NeuralOperatorModel, self).__init__()
-        self.num_bands = num_bands
-
-        # Projection layer to match the input dimension to hidden_channels
-        self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
-
-        # Rotary Position Embedding for frequency and bands
-        self.rope = RotaryPositionEmbedding(dim=hidden_channels, num_bands=num_bands)
-
-        # Multi-scale attention with residual connections
-        self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales=[1, 1.5, 2])
-
-        # Fourier Neural Operator (FNO) for global feature extraction
-        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=out_channels)
+        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=in_channels, out_channels=out_channels)
 
     def forward(self, x):
-        # Project input to hidden_channels dimension
-        x = self.projection(x)  # (batch, hidden_channels, height, width)
-
-        # Split the input into frequency bands
-        bands = torch.chunk(x, self.num_bands, dim=2)  # Split along the frequency axis
-        band_outputs = []
-
-        for i, band in enumerate(bands):
-            # Reshape band for RoPE: (batch, channels, height, width) -> (batch, height * width, channels)
-            batch_size, channels, height, width = band.size()
-            band_reshaped = band.view(batch_size, channels, -1).permute(0, 2, 1)  # (batch, height * width, channels)
-
-            # Apply Rotary Position Embedding with band-specific indices
-            band_indices = torch.full((batch_size, height * width), i, dtype=torch.float32, device=x.device)
-            band_rotated = self.rope(band_reshaped, band_indices)  # (batch, height * width, channels)
-
-            # Reshape back to original shape: (batch, height * width, channels) -> (batch, channels, height, width)
-            band_rotated = band_rotated.permute(0, 2, 1).view(batch_size, channels, height, width)
-
-            # Apply multi-scale attention to the band
-            band_output = self.attention(band_rotated)
-            band_outputs.append(band_output)
-
-        # Concatenate the outputs from all bands
-        combined = torch.cat(band_outputs, dim=2)  # (batch, channels, height * num_bands, width)
-
-        # Pass through the Fourier Neural Operator
-        x = self.operator(combined)
-
-        # Split the output into instrumental and vocal magnitudes
+        x = self.operator(x)
         pred_inst_mag, pred_vocal_mag = torch.split(x, 1, dim=1)
         return pred_inst_mag, pred_vocal_mag
 
@@ -469,7 +338,7 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48), num_bands=128)
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48))
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
@@ -488,7 +357,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48), num_bands=128)
+        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48))
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
