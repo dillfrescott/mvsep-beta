@@ -14,23 +14,26 @@ import glob
 
 # Vocals only
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=64, n_modes=(48, 48)):
+    def __init__(self, in_channels=2, hidden_channels=64, n_modes=(48, 48), out_channels=2):
         super(NeuralOperatorModel, self).__init__()
-        # Output only 1 channel for vocals
-        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=in_channels, out_channels=1)
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.n_modes = n_modes
+        self.out_channels = out_channels
+        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=in_channels, out_channels=out_channels)
 
     def forward(self, x):
         x = self.operator(x)
-        pred_vocal_mag = x  # Only predict vocals
+        pred_vocal_mag = x  # Predict stereo vocals
         return pred_vocal_mag
 
 def loss_fn(pred_vocal_mag, target_vocal_mag, mixture_phase, window, n_fft, hop_length):
     # Ensure the input tensors have the correct shape
-    pred_vocal_mag = pred_vocal_mag.squeeze(0)
+    pred_vocal_mag = pred_vocal_mag.squeeze(0)  # Remove batch dimension if present
     target_vocal_mag = target_vocal_mag.squeeze(0)
     mixture_phase = mixture_phase.squeeze(0)
 
-    # Reconstruct time-domain signals using the ground truth phase
+    # Reconstruct time-domain signals using the ground truth phase for both channels
     pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)
     target_vocal_spec = target_vocal_mag * torch.exp(1j * mixture_phase)
 
@@ -38,7 +41,7 @@ def loss_fn(pred_vocal_mag, target_vocal_mag, mixture_phase, window, n_fft, hop_
     pred_vocal_audio = torch.istft(pred_vocal_spec, n_fft=n_fft, hop_length=hop_length, window=window)
     target_vocal_audio = torch.istft(target_vocal_spec, n_fft=n_fft, hop_length=hop_length, window=window)
 
-    # Compute loss in the time domain
+    # Compute loss in the time domain for both channels
     vocal_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
     return vocal_loss
 
@@ -241,7 +244,7 @@ def inference(model, checkpoint_path, input_wav_path, output_vocal_path,
             chunk_mag = chunk_mag.unsqueeze(0).to(device)
 
             with torch.no_grad():
-                pred_vocal_mag = model(chunk_mag)  # Model now only outputs vocals
+                pred_vocal_mag = model(chunk_mag)  # Model now outputs stereo vocals
 
             pred_vocal_mag = pred_vocal_mag.squeeze(0)
             pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
@@ -287,7 +290,7 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, hidden_channels=64, n_modes=(48, 48))
+    model = NeuralOperatorModel(in_channels=2, hidden_channels=64, n_modes=(48, 48), out_channels=2)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
