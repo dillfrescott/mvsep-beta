@@ -14,14 +14,17 @@ import glob
 
 # Instrumental only
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=64, n_modes=(48, 48)):
+    def __init__(self, in_channels=2, hidden_channels=64, n_modes=(48, 48), out_channels=2):
         super(NeuralOperatorModel, self).__init__()
-        # Output only 1 channel for instrumentals
-        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=in_channels, out_channels=1)
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.n_modes = n_modes
+        self.out_channels = out_channels
+        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=in_channels, out_channels=out_channels)
 
     def forward(self, x):
         x = self.operator(x)
-        pred_inst_mag = x  # Only predict instrumentals
+        pred_inst_mag = x
         return pred_inst_mag
 
 def loss_fn(pred_inst_mag, target_inst_mag, mixture_phase, window, n_fft, hop_length):
@@ -287,7 +290,7 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, hidden_channels=64, n_modes=(48, 48))
+    model = NeuralOperatorModel(in_channels=2, hidden_channels=64, n_modes=(48, 48), out_channels=2)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
