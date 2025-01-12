@@ -13,7 +13,7 @@ import math
 import glob
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(48, 48)):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48)):
         super(NeuralOperatorModel, self).__init__()
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=in_channels, out_channels=out_channels)
 
