@@ -12,16 +12,6 @@ from neuralop.models import FNO, TFNO
 import math
 import glob
 
-class SpatialAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(SpatialAttention, self).__init__()
-        self.conv = nn.Conv2d(in_channels, 1, kernel_size=7, padding=3)
-        self.sigmoid = nn.Sigmoid()
-    def forward(self, x):
-        att = self.conv(x)
-        att = self.sigmoid(att)
-        return x * att
-
 class MultiScaleAttention(nn.Module):
     def __init__(self, in_channels, out_channels, scales = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5]):
         super(MultiScaleAttention, self).__init__()
@@ -78,10 +68,7 @@ class NeuralOperatorModel(nn.Module):
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
         # Multi-scale attention with residual connections
-        self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales=[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5])
-
-        # Spatial Attention module
-        self.spatial_attention = SpatialAttention(hidden_channels)
+        self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5])
 
         # Fourier Neural Operator (FNO) for global feature extraction
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=out_channels)
@@ -92,9 +79,6 @@ class NeuralOperatorModel(nn.Module):
 
         # Apply multi-scale attention to the input
         x = self.attention(x)
-
-        # Apply spatial attention
-        x = self.spatial_attention(x)
 
         # Pass through the Fourier Neural Operator
         x = self.operator(x)
