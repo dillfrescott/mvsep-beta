@@ -109,6 +109,9 @@ class NeuralOperatorModel(nn.Module):
         # Projection layer to match the input dimension to hidden_channels
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
+        # Rotary Position Embedding (RoPE)
+        self.rope = RotaryPositionEmbedding(dim=hidden_channels)
+
         # Multi-scale attention with residual connections
         self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales=[1, 1.5, 2])
 
@@ -119,7 +122,19 @@ class NeuralOperatorModel(nn.Module):
         # Project input to hidden_channels dimension
         x = self.projection(x)  # (batch, hidden_channels, height, width)
 
-        # Apply multi-scale attention to the input
+        # Reshape for RoPE
+        batch, channels, height, width = x.shape
+        x = x.permute(0, 2, 3, 1)  # (batch, height, width, channels)
+        x = x.reshape(batch, height * width, channels)  # (batch, seq_len, channels)
+
+        # Apply RoPE (before attention)
+        x = self.rope(x)  # (batch, seq_len, channels)
+
+        # Reshape back to original dimensions
+        x = x.reshape(batch, height, width, channels)  # (batch, height, width, channels)
+        x = x.permute(0, 3, 1, 2)  # (batch, channels, height, width)
+
+        # Apply multi-scale attention
         x = self.attention(x)
 
         # Pass through the Fourier Neural Operator
