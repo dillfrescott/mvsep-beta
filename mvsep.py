@@ -12,48 +12,6 @@ from neuralop.models import FNO, TFNO
 import math
 import glob
 
-class RotaryPositionEmbedding(nn.Module):
-    def __init__(self, dim, num_bands=None):
-        super(RotaryPositionEmbedding, self).__init__()
-        self.dim = dim
-        self.num_bands = num_bands
-
-        # Precompute the inverse frequency (div_term) for RoPE
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq)
-
-    def forward(self, x, band_indices=None):
-        batch_size, seq_len, dim = x.size()
-        if dim != self.dim:
-            raise ValueError(f"Input dimension {dim} does not match RoPE dimension {self.dim}")
-
-        # Generate position indices
-        position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)
-
-        # If band_indices are provided, adjust positions for each band
-        if band_indices is not None:
-            position = position + band_indices.unsqueeze(-1) * seq_len  # Offset positions by band index
-
-        # Compute the angles for rotation
-        angles = position * self.inv_freq  # (batch, seq_len, dim // 2)
-
-        # Create sin and cos embeddings
-        sin_emb = torch.sin(angles)  # (batch, seq_len, dim // 2)
-        cos_emb = torch.cos(angles)  # (batch, seq_len, dim // 2)
-
-        # Interleave sin and cos embeddings to match the input dimension
-        sin_emb = sin_emb.repeat_interleave(2, dim=-1)  # (batch, seq_len, dim)
-        cos_emb = cos_emb.repeat_interleave(2, dim=-1)  # (batch, seq_len, dim)
-
-        # Apply RoPE to the input
-        x_rotated = x * cos_emb + self._rotate_half(x) * sin_emb
-        return x_rotated
-
-    def _rotate_half(self, x):
-        """Rotates the second half of the input tensor."""
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-
 class MultiScaleAttention(nn.Module):
     def __init__(self, in_channels, out_channels, scales=[1, 1.5, 2]):
         super(MultiScaleAttention, self).__init__()
@@ -109,9 +67,6 @@ class NeuralOperatorModel(nn.Module):
         # Projection layer to match the input dimension to hidden_channels
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
-        # Rotary Position Embedding (RoPE)
-        self.rope = RotaryPositionEmbedding(dim=hidden_channels)
-
         # Multi-scale attention with residual connections
         self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales=[1, 1.5, 2])
 
@@ -122,19 +77,7 @@ class NeuralOperatorModel(nn.Module):
         # Project input to hidden_channels dimension
         x = self.projection(x)  # (batch, hidden_channels, height, width)
 
-        # Reshape for RoPE
-        batch, channels, height, width = x.shape
-        x = x.permute(0, 2, 3, 1)  # (batch, height, width, channels)
-        x = x.reshape(batch, height * width, channels)  # (batch, seq_len, channels)
-
-        # Apply RoPE (before attention)
-        x = self.rope(x)  # (batch, seq_len, channels)
-
-        # Reshape back to original dimensions
-        x = x.reshape(batch, height, width, channels)  # (batch, height, width, channels)
-        x = x.permute(0, 3, 1, 2)  # (batch, channels, height, width)
-
-        # Apply multi-scale attention
+        # Apply multi-scale attention to the input
         x = self.attention(x)
 
         # Pass through the Fourier Neural Operator
