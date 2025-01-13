@@ -13,7 +13,7 @@ import math
 import glob
 
 class MultiScaleAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, scales=[1, 1.5, 2]):
+    def __init__(self, in_channels, out_channels, scales = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5]):
         super(MultiScaleAttention, self).__init__()
         self.scales = scales
         self.conv_layers = nn.ModuleList([
@@ -68,7 +68,7 @@ class NeuralOperatorModel(nn.Module):
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
         # Multi-scale attention with residual connections
-        self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales=[1, 1.5, 2])
+        self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5])
 
         # Fourier Neural Operator (FNO) for global feature extraction
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=out_channels)
