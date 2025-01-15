@@ -11,9 +11,20 @@ import numpy as np
 from neuralop.models import FNO, TFNO
 import math
 import glob
+from torch.utils.checkpoint import checkpoint
+
+class SpatialAttention(nn.Module):
+    def __init__(self, in_channels):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=7, padding=3)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        att = self.conv(x)
+        att = self.sigmoid(att)
+        return x * att
 
 class MultiScaleAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, scales = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5]):
+    def __init__(self, in_channels, out_channels, scales = [0.5, 1, 2, 4]):
         super(MultiScaleAttention, self).__init__()
         self.scales = scales
         self.conv_layers = nn.ModuleList([
@@ -68,7 +79,10 @@ class NeuralOperatorModel(nn.Module):
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
         # Multi-scale attention with residual connections
-        self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5])
+        self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales=[0.5, 1, 2, 4])
+
+        # Spatial attention to focus on important regions
+        self.spatial_attention = SpatialAttention(hidden_channels)
 
         # Fourier Neural Operator (FNO) for global feature extraction
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=out_channels)
@@ -77,8 +91,11 @@ class NeuralOperatorModel(nn.Module):
         # Project input to hidden_channels dimension
         x = self.projection(x)  # (batch, hidden_channels, height, width)
 
-        # Apply multi-scale attention to the input
-        x = self.attention(x)
+        # Apply multi-scale attention with checkpointing
+        x = checkpoint(self.attention, x, use_reentrant=False)
+
+        # Apply spatial attention with checkpointing
+        x = checkpoint(self.spatial_attention, x, use_reentrant=False)
 
         # Pass through the Fourier Neural Operator
         x = self.operator(x)
@@ -403,7 +420,7 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48))
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16))
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
@@ -422,7 +439,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48))
+        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16))
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
