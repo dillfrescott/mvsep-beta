@@ -361,24 +361,48 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
 
-            chunk_mag = chunk_mag.unsqueeze(0).to(device)
+            # Ensure the input to the model has the correct shape
+            chunk_mag = chunk_mag.unsqueeze(0).to(device)  # Add batch dimension: [1, 2, 2049, 87]
 
             with torch.no_grad():
                 pred_inst_mask, pred_vocal_mask = model(chunk_mag)
 
-            pred_inst_mask = pred_inst_mask.squeeze(0)
-            pred_vocal_mask = pred_vocal_mask.squeeze(0)
+            # Remove the batch dimension from the masks
+            pred_inst_mask = pred_inst_mask.squeeze(0)  # Shape: [2, 2049, 87]
+            pred_vocal_mask = pred_vocal_mask.squeeze(0)  # Shape: [2, 2049, 87]
 
             # Apply the masks to the mixture magnitude
-            pred_inst_mag = chunk_mag * pred_inst_mask
-            pred_vocal_mag = chunk_mag * pred_vocal_mask
+            pred_inst_mag = chunk_mag.squeeze(0) * pred_inst_mask  # Shape: [2, 2049, 87]
+            pred_vocal_mag = chunk_mag.squeeze(0) * pred_vocal_mask  # Shape: [2, 2049, 87]
 
-            pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
-            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
+            # Reconstruct the complex spectrograms
+            pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)  # Shape: [2, 2049, 87]
+            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)  # Shape: [2, 2049, 87]
 
-            inst_chunk = torch.istft(pred_inst_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
-            vocal_chunk = torch.istft(pred_vocal_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
+            # Reconstruct the time-domain signals for each channel
+            inst_chunk = torch.zeros_like(chunk)
+            vocal_chunk = torch.zeros_like(chunk)
 
+            for channel in range(2):  # Process each channel separately
+                inst_chunk[channel] = torch.istft(
+                    pred_inst_spec[channel].unsqueeze(0),  # Add batch dimension: [1, 2049, 87]
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    window=window,
+                    length=chunk_size,
+                    return_complex=False
+                ).squeeze(0)  # Remove batch dimension
+
+                vocal_chunk[channel] = torch.istft(
+                    pred_vocal_spec[channel].unsqueeze(0),  # Add batch dimension: [1, 2049, 87]
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    window=window,
+                    length=chunk_size,
+                    return_complex=False
+                ).squeeze(0)  # Remove batch dimension
+
+            # Handle cross-fading between chunks
             if i == 0:
                 instrumentals[:, i:i + chunk_size] = inst_chunk
                 vocals[:, i:i + chunk_size] = vocal_chunk
@@ -399,9 +423,11 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
 
             pbar.update(1)
 
+    # Clamp the output to avoid clipping
     instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
     vocals = torch.clamp(vocals, -1.0, 1.0)
 
+    # Save the output audio files
     torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
     torchaudio.save(output_vocal_path, vocals.cpu(), sr)
 
