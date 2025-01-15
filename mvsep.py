@@ -58,7 +58,7 @@ class DynamicAttention(nn.Module):
         return output
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=64, n_modes=(48, 48)):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16)):
         super(NeuralOperatorModel, self).__init__()
 
         # Projection layer to match the input dimension to hidden_channels
@@ -71,7 +71,13 @@ class NeuralOperatorModel(nn.Module):
         self.spatial_attention = SpatialAttention(hidden_channels)
 
         # Fourier Neural Operator (FNO) for global feature extraction
-        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=out_channels)
+        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=hidden_channels)
+
+        # Final layer to predict the mask
+        self.mask_predictor = nn.Sequential(
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
+            nn.Sigmoid()  # Ensure the mask is in the range [0, 1]
+        )
 
     def forward(self, x):
         # Project input to hidden_channels dimension
@@ -84,19 +90,28 @@ class NeuralOperatorModel(nn.Module):
         x = checkpoint(self.spatial_attention, x, use_reentrant=False)
 
         # Pass through the Fourier Neural Operator
-        x = self.operator(x)
+        x = self.operator(x)  # (batch, hidden_channels, height, width)
 
-        # Split the output into instrumental and vocal magnitudes
-        pred_inst_mag, pred_vocal_mag = torch.split(x, 1, dim=1)
-        return pred_inst_mag, pred_vocal_mag
+        # Predict the mask
+        mask = self.mask_predictor(x)  # (batch, out_channels, height, width)
 
-def loss_fn(pred_inst_mag, pred_vocal_mag, target_inst_mag, target_vocal_mag, mixture_phase, window, n_fft, hop_length):
+        # Split the mask into instrumental and vocal masks
+        vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
+
+        return inst_mask, vocal_mask
+
+def loss_fn(pred_inst_mask, pred_vocal_mask, target_inst_mag, target_vocal_mag, mixture_mag, mixture_phase, window, n_fft, hop_length):
     # Ensure the input tensors have the correct shape
-    pred_inst_mag = pred_inst_mag.squeeze(0)
-    pred_vocal_mag = pred_vocal_mag.squeeze(0)
+    pred_inst_mask = pred_inst_mask.squeeze(0)
+    pred_vocal_mask = pred_vocal_mask.squeeze(0)
     target_inst_mag = target_inst_mag.squeeze(0)
     target_vocal_mag = target_vocal_mag.squeeze(0)
+    mixture_mag = mixture_mag.squeeze(0)
     mixture_phase = mixture_phase.squeeze(0)
+
+    # Apply the masks to the mixture magnitude
+    pred_inst_mag = mixture_mag * pred_inst_mask
+    pred_vocal_mag = mixture_mag * pred_vocal_mask
 
     # Reconstruct time-domain signals using the ground truth phase
     pred_inst_spec = pred_inst_mag * torch.exp(1j * mixture_phase)
@@ -229,8 +244,19 @@ class MUSDBDataset(Dataset):
 def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
     """
     Adjust the learning rate based on the gradient norm.
+    Avoids hard limits by using a smooth scaling factor.
     """
-    lr = base_lr * scale / (grad_norm + eps)
+    # Avoid division by zero or very small gradient norms
+    grad_norm = max(grad_norm, eps)
+    
+    # Calculate the new learning rate
+    lr = base_lr * scale / grad_norm
+    
+    # Apply a soft constraint to prevent extreme learning rates
+    # This ensures the learning rate doesn't explode or vanish
+    lr = base_lr * (1.0 / (1.0 + grad_norm / scale))
+    
+    # Update the learning rate for all parameter groups
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -239,9 +265,6 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     step = 0
     avg_loss = 0.0
     loss_log = []
-
-    # List to keep track of checkpoint files
-    checkpoint_files = []
 
     if checkpoint_path:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -257,7 +280,6 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     model.train()
     for epoch in range(epochs):
         for batch in dataloader:
-            # Unpack the batch
             mixture_mag, mixture_phase, instrumental_mag, _, vocal_mag, _ = batch
             mixture_mag = mixture_mag.to(device)
             mixture_phase = mixture_phase.to(device)
@@ -267,18 +289,24 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             optimizer.zero_grad()
 
             # Forward pass
-            pred_inst_mag, pred_vocal_mag = model(mixture_mag)
+            pred_inst_mask, pred_vocal_mask = model(mixture_mag)
 
-            # Compute loss in the time domain
-            loss = loss_fn(pred_inst_mag, pred_vocal_mag, instrumental_mag, vocal_mag, mixture_phase, window, args.n_fft, args.hop_length)
+            # Compute loss
+            loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag, mixture_mag, mixture_phase, window, args.n_fft, args.hop_length)
 
-            # Backward pass
+            # Backward pass with gradient clipping
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+
+            # Adjust learning rate based on gradient norm
             adjust_learning_rate(optimizer, grad_norm, base_lr=args.learning_rate)
 
             optimizer.step()
             scheduler.step()
+
+            # Check for NaN in loss
+            if torch.isnan(loss).any():
+                raise ValueError("Loss is NaN!")
 
             # Update metrics
             avg_loss = (avg_loss * step + loss.item()) / (step + 1)
@@ -301,15 +329,6 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                     'avg_loss': avg_loss,
                     'loss_log': loss_log
                 }, checkpoint_filename)
-
-                # Add the new checkpoint to the list
-                checkpoint_files.append(checkpoint_filename)
-
-                # Remove the oldest checkpoint if there are more than 3
-                if len(checkpoint_files) > 3:
-                    oldest_checkpoint = checkpoint_files.pop(0)
-                    if os.path.exists(oldest_checkpoint):
-                        os.remove(oldest_checkpoint)
 
     # Save final loss log
     torch.save({'loss_log': loss_log}, 'loss_log.pt')
@@ -345,10 +364,14 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             chunk_mag = chunk_mag.unsqueeze(0).to(device)
 
             with torch.no_grad():
-                pred_inst_mag, pred_vocal_mag = model(chunk_mag)
+                pred_inst_mask, pred_vocal_mask = model(chunk_mag)
 
-            pred_inst_mag = pred_inst_mag.squeeze(0)
-            pred_vocal_mag = pred_vocal_mag.squeeze(0)
+            pred_inst_mask = pred_inst_mask.squeeze(0)
+            pred_vocal_mask = pred_vocal_mask.squeeze(0)
+
+            # Apply the masks to the mixture magnitude
+            pred_inst_mag = chunk_mag * pred_inst_mask
+            pred_vocal_mag = chunk_mag * pred_vocal_mask
 
             pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
             pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
