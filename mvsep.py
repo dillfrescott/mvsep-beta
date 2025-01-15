@@ -23,51 +23,37 @@ class SpatialAttention(nn.Module):
         att = self.sigmoid(att)
         return x * att
 
-class MultiScaleAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, scales = [0.5, 1, 2, 4]):
-        super(MultiScaleAttention, self).__init__()
-        self.scales = scales
-        self.conv_layers = nn.ModuleList([
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-            for _ in scales
-        ])
+class DynamicAttention(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DynamicAttention, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.attention = nn.Sequential(
-            nn.Conv2d(out_channels * len(scales), out_channels * len(scales), kernel_size=1),
+            nn.Conv2d(out_channels, out_channels, kernel_size=1),
             nn.Sigmoid()
         )
-        self.final_conv = nn.Conv2d(out_channels * len(scales), out_channels, kernel_size=3, padding=1)
+        self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
-        # Residual connection: 1x1 convolution to match dimensions if in_channels != out_channels
+        # Residual connection
         self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
 
     def forward(self, x):
-        # Save the input for the residual connection
         residual = x
 
-        # Extract features at multiple scales
-        features = []
-        for i, conv in enumerate(self.conv_layers):
-            # Apply convolution with a small kernel and stride=1
-            feat = conv(x)
-            if self.scales[i] != 1:
-                # Resize the feature map to match the original resolution
-                feat = F.interpolate(feat, size=x.shape[2:], mode='bilinear', align_corners=False)
-            features.append(feat)
+        # Apply initial convolution
+        x = self.conv1(x)
 
-        # Concatenate features from all scales
-        features = torch.cat(features, dim=1)
+        # Dynamic attention mechanism
+        attention_map = self.attention(x)
+        attended_features = x * attention_map
 
-        # Apply attention to focus on fine-grained details
-        attention_map = self.attention(features)
-        attended_features = features * attention_map
-
-        # Final convolution to produce the output
+        # Final convolution
         output = self.final_conv(attended_features)
 
         # Add residual connection
         if self.residual_conv is not None:
             residual = self.residual_conv(residual)
-        output = output + residual  # Add the residual to the output
+        output = output + residual
 
         return output
 
@@ -78,8 +64,8 @@ class NeuralOperatorModel(nn.Module):
         # Projection layer to match the input dimension to hidden_channels
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
-        # Multi-scale attention with residual connections
-        self.attention = MultiScaleAttention(hidden_channels, hidden_channels, scales=[0.5, 1, 2, 4])
+        # Dynamic attention with residual connections
+        self.attention = DynamicAttention(hidden_channels, hidden_channels)
 
         # Spatial attention to focus on important regions
         self.spatial_attention = SpatialAttention(hidden_channels)
@@ -91,7 +77,7 @@ class NeuralOperatorModel(nn.Module):
         # Project input to hidden_channels dimension
         x = self.projection(x)  # (batch, hidden_channels, height, width)
 
-        # Apply multi-scale attention with checkpointing
+        # Apply dynamic attention with checkpointing
         x = checkpoint(self.attention, x, use_reentrant=False)
 
         # Apply spatial attention with checkpointing
