@@ -330,6 +330,12 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                     'loss_log': loss_log
                 }, checkpoint_filename)
 
+                # Keep only the last 3 checkpoints
+                checkpoint_files = sorted(glob.glob("checkpoint_step_*.pt"), key=os.path.getmtime)
+                if len(checkpoint_files) > 3:
+                    for old_checkpoint in checkpoint_files[:-3]:
+                        os.remove(old_checkpoint)
+
     # Save final loss log
     torch.save({'loss_log': loss_log}, 'loss_log.pt')
     progress_bar.close()
