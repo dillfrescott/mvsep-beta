@@ -23,37 +23,51 @@ class SpatialAttention(nn.Module):
         att = self.sigmoid(att)
         return x * att
 
-class DynamicAttention(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DynamicAttention, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+class MultiScaleAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, scales = [0.5, 1, 1.5, 2, 2.5]):
+        super(MultiScaleAttention, self).__init__()
+        self.scales = scales
+        self.conv_layers = nn.ModuleList([
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            for _ in scales
+        ])
         self.attention = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1),
+            nn.Conv2d(out_channels * len(scales), out_channels * len(scales), kernel_size=1),
             nn.Sigmoid()
         )
-        self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.final_conv = nn.Conv2d(out_channels * len(scales), out_channels, kernel_size=3, padding=1)
 
-        # Residual connection
+        # Residual connection: 1x1 convolution to match dimensions if in_channels != out_channels
         self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
 
     def forward(self, x):
+        # Save the input for the residual connection
         residual = x
 
-        # Apply initial convolution
-        x = self.conv1(x)
+        # Extract features at multiple scales
+        features = []
+        for i, conv in enumerate(self.conv_layers):
+            # Apply convolution with a small kernel and stride=1
+            feat = conv(x)
+            if self.scales[i] != 1:
+                # Resize the feature map to match the original resolution
+                feat = F.interpolate(feat, size=x.shape[2:], mode='bilinear', align_corners=False)
+            features.append(feat)
 
-        # Dynamic attention mechanism
-        attention_map = self.attention(x)
-        attended_features = x * attention_map
+        # Concatenate features from all scales
+        features = torch.cat(features, dim=1)
 
-        # Final convolution
+        # Apply attention to focus on fine-grained details
+        attention_map = self.attention(features)
+        attended_features = features * attention_map
+
+        # Final convolution to produce the output
         output = self.final_conv(attended_features)
 
         # Add residual connection
         if self.residual_conv is not None:
             residual = self.residual_conv(residual)
-        output = output + residual
+        output = output + residual  # Add the residual to the output
 
         return output
 
@@ -64,8 +78,8 @@ class NeuralOperatorModel(nn.Module):
         # Projection layer to match the input dimension to hidden_channels
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
-        # Dynamic attention with residual connections
-        self.attention = DynamicAttention(hidden_channels, hidden_channels)
+        # Multi-scale attention with residual connections
+        self.attention = MultiScaleAttention(hidden_channels, hidden_channels)
 
         # Spatial attention to focus on important regions
         self.spatial_attention = SpatialAttention(hidden_channels)
@@ -83,7 +97,7 @@ class NeuralOperatorModel(nn.Module):
         # Project input to hidden_channels dimension
         x = self.projection(x)  # (batch, hidden_channels, height, width)
 
-        # Apply dynamic attention with checkpointing
+        # Apply multi-scale attention with checkpointing
         x = checkpoint(self.attention, x, use_reentrant=False)
 
         # Apply spatial attention with checkpointing
@@ -330,12 +344,6 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                     'loss_log': loss_log
                 }, checkpoint_filename)
 
-                # Keep only the last 3 checkpoints
-                checkpoint_files = sorted(glob.glob("checkpoint_step_*.pt"), key=os.path.getmtime)
-                if len(checkpoint_files) > 3:
-                    for old_checkpoint in checkpoint_files[:-3]:
-                        os.remove(old_checkpoint)
-
     # Save final loss log
     torch.save({'loss_log': loss_log}, 'loss_log.pt')
     progress_bar.close()
@@ -461,7 +469,7 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16))
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(42, 42))
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
@@ -480,7 +488,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16))
+        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(42, 42))
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
