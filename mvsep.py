@@ -13,8 +13,119 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
+class SqueezeExcitation(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(SqueezeExcitation, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # Global average pooling
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction_ratio),  # Reduce channels
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction_ratio, in_channels),  # Restore channels
+            nn.Sigmoid()  # Sigmoid activation
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Squeeze: Global average pooling
+        y = self.avg_pool(x).view(B, C)  # Shape: (B, C)
+
+        # Excitation: Fully connected layers
+        y = self.fc(y).view(B, C, 1, 1)  # Shape: (B, C, 1, 1)
+
+        # Scale input features
+        return x * y
+
+class CoordinateAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(CoordinateAttention, self).__init__()
+        self.avg_pool_h = nn.AdaptiveAvgPool2d((None, 1))  # Height-wise pooling
+        self.avg_pool_w = nn.AdaptiveAvgPool2d((1, None))  # Width-wise pooling
+        self.conv1 = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
+        self.conv2 = nn.Conv2d(in_channels // reduction_ratio, in_channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Height-wise attention
+        x_h = self.avg_pool_h(x)  # Shape: (B, C, H, 1)
+        x_h = x_h.permute(0, 1, 3, 2)  # Shape: (B, C, 1, H)
+
+        # Width-wise attention
+        x_w = self.avg_pool_w(x)  # Shape: (B, C, 1, W)
+
+        # Concatenate height and width features
+        y = torch.cat([x_h, x_w], dim=3)  # Shape: (B, C, 1, H + W)
+
+        # Apply conv layers
+        y = self.conv1(y)  # Reduce channels
+        y = self.conv2(y)  # Restore channels
+
+        # Split into height and width attention maps
+        y_h, y_w = torch.split(y, [H, W], dim=3)  # Split along the concatenated dimension
+        y_h = y_h.permute(0, 1, 3, 2)  # Shape: (B, C, H, 1)
+        y_w = y_w  # Shape: (B, C, 1, W)
+
+        # Apply sigmoid
+        y_h = self.sigmoid(y_h)
+        y_w = self.sigmoid(y_w)
+
+        # Apply attention
+        return x * y_h * y_w
+
+class SEParallelCoordinateAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(SEParallelCoordinateAttention, self).__init__()
+        self.se = SqueezeExcitation(in_channels, reduction_ratio)
+        self.coord_attn = CoordinateAttention(in_channels, reduction_ratio)
+
+    def forward(self, x):
+        # Apply SE attention
+        se_out = self.se(x)
+
+        # Apply Coordinate Attention
+        coord_out = self.coord_attn(x)
+
+        # Combine outputs
+        return se_out + coord_out
+
+class DynamicAttention(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DynamicAttention, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.attention = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+        # Residual connection
+        self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+
+    def forward(self, x):
+        residual = x
+
+        # Apply initial convolution
+        x = self.conv1(x)
+
+        # Dynamic attention mechanism
+        attention_map = self.attention(x)
+        attended_features = x * attention_map
+
+        # Final convolution
+        output = self.final_conv(attended_features)
+
+        # Add residual connection
+        if self.residual_conv is not None:
+            residual = self.residual_conv(residual)
+        output = output + residual
+
+        return output
+
 class MultiScaleAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, scales = [0.5, 1, 1.5, 2, 2.5]):
+    def __init__(self, in_channels, out_channels, scales = [0.5, 1, 1.5, 2, 2.5, 4]):
         super(MultiScaleAttention, self).__init__()
         self.scales = scales
         self.conv_layers = nn.ModuleList([
@@ -65,35 +176,48 @@ class NeuralOperatorModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16)):
         super(NeuralOperatorModel, self).__init__()
 
-        # Projection layer to match the input dimension to hidden_channels
+        # Projection layer
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
-        # Multi-scale attention with residual connections
-        self.attention = MultiScaleAttention(hidden_channels, hidden_channels)
+        # Multi-scale attention
+        self.ms_attention = MultiScaleAttention(hidden_channels, hidden_channels)
 
-        # Fourier Neural Operator (FNO) for global feature extraction
+        # Dynamic attention
+        self.dyn_attention = DynamicAttention(hidden_channels, hidden_channels)
+
+        # SE + Coordinate Attention (Sequential Integration)
+        self.se_coord_attn = nn.Sequential(
+            SqueezeExcitation(hidden_channels),  # SE first
+            CoordinateAttention(hidden_channels)  # Coordinate Attention next
+        )
+
+        # Fourier Neural Operator (FNO)
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=hidden_channels)
 
-        # Final layer to predict the mask
+        # Final mask predictor
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
-            nn.Sigmoid()  # Ensure the mask is in the range [0, 1]
+            nn.Sigmoid()
         )
 
     def forward(self, x):
         # Project input to hidden_channels dimension
-        x = self.projection(x)  # (batch, hidden_channels, height, width)
+        x = self.projection(x)
 
-        # Apply multi-scale attention with checkpointing
-        x = checkpoint(self.attention, x, use_reentrant=False)
+        # Apply multi-scale attention
+        x = checkpoint(self.ms_attention, x, use_reentrant=False)
+
+        # Apply dynamic attention
+        x = checkpoint(self.dyn_attention, x, use_reentrant=False)
+
+        # Apply SE + Coordinate Attention
+        x = checkpoint(self.se_coord_attn, x, use_reentrant=False)
 
         # Pass through the Fourier Neural Operator
-        x = self.operator(x)  # (batch, hidden_channels, height, width)
+        x = self.operator(x)
 
         # Predict the mask
-        mask = self.mask_predictor(x)  # (batch, out_channels, height, width)
-
-        # Split the mask into instrumental and vocal masks
+        mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
 
         return inst_mask, vocal_mask
