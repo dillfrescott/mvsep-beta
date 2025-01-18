@@ -13,6 +13,17 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
+class DualAttention(nn.Module):
+    def __init__(self, in_channels):
+        super(DualAttention, self).__init__()
+        self.channel_attn = SqueezeExcitation(in_channels)
+        self.spatial_attn = CoordinateAttention(in_channels)
+
+    def forward(self, x):
+        channel_out = self.channel_attn(x)
+        spatial_out = self.spatial_attn(x)
+        return channel_out + spatial_out
+
 class SqueezeExcitation(nn.Module):
     def __init__(self, in_channels, reduction_ratio=16):
         super(SqueezeExcitation, self).__init__()
@@ -73,22 +84,6 @@ class CoordinateAttention(nn.Module):
 
         # Apply attention
         return x * y_h * y_w
-
-class SEParallelCoordinateAttention(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=16):
-        super(SEParallelCoordinateAttention, self).__init__()
-        self.se = SqueezeExcitation(in_channels, reduction_ratio)
-        self.coord_attn = CoordinateAttention(in_channels, reduction_ratio)
-
-    def forward(self, x):
-        # Apply SE attention
-        se_out = self.se(x)
-
-        # Apply Coordinate Attention
-        coord_out = self.coord_attn(x)
-
-        # Combine outputs
-        return se_out + coord_out
 
 class DynamicAttention(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -191,6 +186,9 @@ class NeuralOperatorModel(nn.Module):
             CoordinateAttention(hidden_channels)  # Coordinate Attention next
         )
 
+        # Dual Attention (Channel + Spatial)
+        self.dual_attn = DualAttention(hidden_channels)
+
         # Fourier Neural Operator (FNO)
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=hidden_channels)
 
@@ -212,6 +210,9 @@ class NeuralOperatorModel(nn.Module):
 
         # Apply SE + Coordinate Attention
         x = checkpoint(self.se_coord_attn, x, use_reentrant=False)
+
+        # Apply Dual Attention
+        x = checkpoint(self.dual_attn, x, use_reentrant=False)
 
         # Pass through the Fourier Neural Operator
         x = self.operator(x)
