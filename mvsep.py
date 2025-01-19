@@ -13,6 +13,43 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
+class RotaryPositionEmbedding(nn.Module):
+    def __init__(self, dim):
+        super(RotaryPositionEmbedding, self).__init__()
+        self.dim = dim
+
+    def forward(self, x, seq_len=None):
+        batch_size, seq_len, dim = x.size()
+        if dim != self.dim:
+            raise ValueError(f"Input dimension {dim} does not match RoPE dimension {self.dim}")
+
+        # Generate position indices
+        position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)
+
+        # Compute the angles for rotation
+        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32, device=x.device) * -(math.log(10000.0) / dim))
+        angles = position * div_term
+
+        # Create sin and cos embeddings for positive rotation
+        sin_emb_pos = torch.sin(angles)
+        cos_emb_pos = torch.cos(angles)
+
+        # Create sin and cos embeddings for negative rotation
+        sin_emb_neg = torch.sin(-angles)
+        cos_emb_neg = torch.cos(-angles)
+
+        # Apply positive rotation to all dimensions
+        x_pos_rotated = torch.zeros_like(x)
+        x_pos_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb_pos - x[:, :, 1::2] * sin_emb_pos
+        x_pos_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb_pos + x[:, :, 0::2] * sin_emb_pos
+
+        # Apply negative rotation to all dimensions
+        x_neg_rotated = torch.zeros_like(x)
+        x_neg_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb_neg - x[:, :, 1::2] * sin_emb_neg
+        x_neg_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb_neg + x[:, :, 0::2] * sin_emb_neg
+
+        return x_pos_rotated, x_neg_rotated
+
 class DualAttention(nn.Module):
     def __init__(self, in_channels):
         super(DualAttention, self).__init__()
@@ -174,6 +211,9 @@ class NeuralOperatorModel(nn.Module):
         # Projection layer
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
+        # Rotary Position Embedding (RoPE)
+        self.rope = RotaryPositionEmbedding(dim=hidden_channels)
+
         # Multi-scale attention
         self.ms_attention = MultiScaleAttention(hidden_channels, hidden_channels)
 
@@ -200,10 +240,25 @@ class NeuralOperatorModel(nn.Module):
 
     def forward(self, x):
         # Project input to hidden_channels dimension
-        x = self.projection(x)
+        x = self.projection(x)  # Shape: [batch, hidden_channels, height, width]
 
         # Apply multi-scale attention
         x = checkpoint(self.ms_attention, x, use_reentrant=False)
+        
+        # Reshape for RoPE: Treat the time dimension (width) as the sequence length
+        batch, channels, height, width = x.shape
+        x = x.permute(0, 2, 3, 1)  # Shape: [batch, height, width, channels]
+        x = x.reshape(batch * height, width, channels)  # Shape: [batch * height, width, channels]
+
+        # Apply Rotary Position Embedding (RoPE)
+        x_pos_rotated, x_neg_rotated = self.rope(x, seq_len=width)
+
+        # Combine the rotated embeddings (you can choose how to combine them)
+        x = x_pos_rotated + x_neg_rotated  # Simple addition, but you can experiment with other combinations
+
+        # Reshape back to the original shape
+        x = x.reshape(batch, height, width, channels)
+        x = x.permute(0, 3, 1, 2)  # Shape: [batch, channels, height, width]
 
         # Apply dynamic attention
         x = checkpoint(self.dyn_attention, x, use_reentrant=False)
