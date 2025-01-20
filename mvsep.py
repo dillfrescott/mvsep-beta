@@ -253,8 +253,8 @@ class NeuralOperatorModel(nn.Module):
         # Apply Rotary Position Embedding (RoPE)
         x_pos_rotated, x_neg_rotated = self.rope(x, seq_len=width)
 
-        # Combine the rotated embeddings (you can choose how to combine them)
-        x = x_pos_rotated + x_neg_rotated  # Simple addition, but you can experiment with other combinations
+        # Combine the rotated embeddings
+        x = x_pos_rotated + x_neg_rotated
 
         # Reshape back to the original shape
         x = x.reshape(batch, height, width, channels)
