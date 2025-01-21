@@ -13,269 +13,72 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class RotaryPositionEmbedding(nn.Module):
-    def __init__(self, dim):
-        super(RotaryPositionEmbedding, self).__init__()
-        self.dim = dim
+class FrequencyBandAttention(nn.Module):
+    def __init__(self, in_channels, num_bands=64):
+        super(FrequencyBandAttention, self).__init__()
+        self.num_bands = num_bands
+        self.in_channels = in_channels
 
-    def forward(self, x, seq_len=None):
-        batch_size, seq_len, dim = x.size()
-        if dim != self.dim:
-            raise ValueError(f"Input dimension {dim} does not match RoPE dimension {self.dim}")
-
-        # Generate position indices
-        position = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(-1)
-
-        # Compute the angles for rotation
-        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32, device=x.device) * -(math.log(10000.0) / dim))
-        angles = position * div_term
-
-        # Create sin and cos embeddings for positive rotation
-        sin_emb_pos = torch.sin(angles)
-        cos_emb_pos = torch.cos(angles)
-
-        # Create sin and cos embeddings for negative rotation
-        sin_emb_neg = torch.sin(-angles)
-        cos_emb_neg = torch.cos(-angles)
-
-        # Apply positive rotation to all dimensions
-        x_pos_rotated = torch.zeros_like(x)
-        x_pos_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb_pos - x[:, :, 1::2] * sin_emb_pos
-        x_pos_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb_pos + x[:, :, 0::2] * sin_emb_pos
-
-        # Apply negative rotation to all dimensions
-        x_neg_rotated = torch.zeros_like(x)
-        x_neg_rotated[:, :, 0::2] = x[:, :, 0::2] * cos_emb_neg - x[:, :, 1::2] * sin_emb_neg
-        x_neg_rotated[:, :, 1::2] = x[:, :, 1::2] * cos_emb_neg + x[:, :, 0::2] * sin_emb_neg
-
-        return x_pos_rotated, x_neg_rotated
-
-class DualAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(DualAttention, self).__init__()
-        self.channel_attn = SqueezeExcitation(in_channels)
-        self.spatial_attn = CoordinateAttention(in_channels)
-
-    def forward(self, x):
-        channel_out = self.channel_attn(x)
-        spatial_out = self.spatial_attn(x)
-        return channel_out + spatial_out
-
-class SqueezeExcitation(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=16):
-        super(SqueezeExcitation, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # Global average pooling
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, in_channels // reduction_ratio),  # Reduce channels
-            nn.ReLU(inplace=True),
-            nn.Linear(in_channels // reduction_ratio, in_channels),  # Restore channels
-            nn.Sigmoid()  # Sigmoid activation
-        )
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-
-        # Squeeze: Global average pooling
-        y = self.avg_pool(x).view(B, C)  # Shape: (B, C)
-
-        # Excitation: Fully connected layers
-        y = self.fc(y).view(B, C, 1, 1)  # Shape: (B, C, 1, 1)
-
-        # Scale input features
-        return x * y
-
-class CoordinateAttention(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=16):
-        super(CoordinateAttention, self).__init__()
-        self.avg_pool_h = nn.AdaptiveAvgPool2d((None, 1))  # Height-wise pooling
-        self.avg_pool_w = nn.AdaptiveAvgPool2d((1, None))  # Width-wise pooling
-        self.conv1 = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
-        self.conv2 = nn.Conv2d(in_channels // reduction_ratio, in_channels, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-
-        # Height-wise attention
-        x_h = self.avg_pool_h(x)  # Shape: (B, C, H, 1)
-        x_h = x_h.permute(0, 1, 3, 2)  # Shape: (B, C, 1, H)
-
-        # Width-wise attention
-        x_w = self.avg_pool_w(x)  # Shape: (B, C, 1, W)
-
-        # Concatenate height and width features
-        y = torch.cat([x_h, x_w], dim=3)  # Shape: (B, C, 1, H + W)
-
-        # Apply conv layers
-        y = self.conv1(y)  # Reduce channels
-        y = self.conv2(y)  # Restore channels
-
-        # Split into height and width attention maps
-        y_h, y_w = torch.split(y, [H, W], dim=3)  # Split along the concatenated dimension
-        y_h = y_h.permute(0, 1, 3, 2)  # Shape: (B, C, H, 1)
-        y_w = y_w  # Shape: (B, C, 1, W)
-
-        # Apply sigmoid
-        y_h = self.sigmoid(y_h)
-        y_w = self.sigmoid(y_w)
-
-        # Apply attention
-        return x * y_h * y_w
-
-class DynamicAttention(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DynamicAttention, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.attention = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1),
-            nn.Sigmoid()
-        )
-        self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-
-        # Residual connection
-        self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
-
-    def forward(self, x):
-        residual = x
-
-        # Apply initial convolution
-        x = self.conv1(x)
-
-        # Dynamic attention mechanism
-        attention_map = self.attention(x)
-        attended_features = x * attention_map
-
-        # Final convolution
-        output = self.final_conv(attended_features)
-
-        # Add residual connection
-        if self.residual_conv is not None:
-            residual = self.residual_conv(residual)
-        output = output + residual
-
-        return output
-
-class MultiScaleAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, scales = [0.5, 1, 1.5, 2, 2.5, 4]):
-        super(MultiScaleAttention, self).__init__()
-        self.scales = scales
-        self.conv_layers = nn.ModuleList([
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-            for _ in scales
+        # Band-specific attention
+        self.band_attention = nn.ModuleList([
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),  # Global average pooling for each band
+                nn.Conv2d(in_channels, in_channels, kernel_size=1),  # No reduction
+                nn.Sigmoid()  # Sigmoid to generate attention weights
+            )
+            for _ in range(num_bands)
         ])
-        self.attention = nn.Sequential(
-            nn.Conv2d(out_channels * len(scales), out_channels * len(scales), kernel_size=1),
-            nn.Sigmoid()
-        )
-        self.final_conv = nn.Conv2d(out_channels * len(scales), out_channels, kernel_size=3, padding=1)
-
-        # Residual connection: 1x1 convolution to match dimensions if in_channels != out_channels
-        self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
 
     def forward(self, x):
-        # Save the input for the residual connection
-        residual = x
+        B, C, H, W = x.shape  # H is frequency bins, W is time frames
 
-        # Extract features at multiple scales
-        features = []
-        for i, conv in enumerate(self.conv_layers):
-            # Apply convolution with a small kernel and stride=1
-            feat = conv(x)
-            if self.scales[i] != 1:
-                # Resize the feature map to match the original resolution
-                feat = F.interpolate(feat, size=x.shape[2:], mode='bilinear', align_corners=False)
-            features.append(feat)
+        # Pad the frequency dimension to make it divisible by num_bands
+        if H % self.num_bands != 0:
+            pad_size = self.num_bands - (H % self.num_bands)
+            x = F.pad(x, (0, 0, 0, pad_size))  # Pad along the frequency dimension (H)
+            padded_H = H + pad_size
+        else:
+            padded_H = H
 
-        # Concatenate features from all scales
-        features = torch.cat(features, dim=1)
+        # Split the frequency spectrum into sub-bands
+        band_height = padded_H // self.num_bands
+        bands = [x[:, :, i * band_height:(i + 1) * band_height, :] for i in range(self.num_bands)]
 
-        # Apply attention to focus on fine-grained details
-        attention_map = self.attention(features)
-        attended_features = features * attention_map
+        # Apply band-specific attention
+        attended_bands = []
+        for i, band in enumerate(bands):
+            attention_map = self.band_attention[i](band)
+            attended_band = band * attention_map
+            attended_bands.append(attended_band)
 
-        # Final convolution to produce the output
-        output = self.final_conv(attended_features)
+        # Concatenate the attended bands along the frequency dimension
+        output = torch.cat(attended_bands, dim=2)
 
-        # Add residual connection
-        if self.residual_conv is not None:
-            residual = self.residual_conv(residual)
-        output = output + residual  # Add the residual to the output
+        # Remove padding if it was added
+        if H % self.num_bands != 0:
+            output = output[:, :, :H, :]  # Trim back to the original frequency dimension
 
         return output
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16)):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16), num_bands=64):
         super(NeuralOperatorModel, self).__init__()
-
-        # Projection layer
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
-
-        # Rotary Position Embedding (RoPE)
-        self.rope = RotaryPositionEmbedding(dim=hidden_channels)
-
-        # Multi-scale attention
-        self.ms_attention = MultiScaleAttention(hidden_channels, hidden_channels)
-
-        # Dynamic attention
-        self.dyn_attention = DynamicAttention(hidden_channels, hidden_channels)
-
-        # SE + Coordinate Attention (Sequential Integration)
-        self.se_coord_attn = nn.Sequential(
-            SqueezeExcitation(hidden_channels),  # SE first
-            CoordinateAttention(hidden_channels)  # Coordinate Attention next
-        )
-
-        # Dual Attention (Channel + Spatial)
-        self.dual_attn = DualAttention(hidden_channels)
-
-        # Fourier Neural Operator (FNO)
+        self.frequency_band_attention = FrequencyBandAttention(in_channels=hidden_channels, num_bands=num_bands)
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=hidden_channels)
-
-        # Final mask predictor
         self.mask_predictor = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        # Project input to hidden_channels dimension
-        x = self.projection(x)  # Shape: [batch, hidden_channels, height, width]
-
-        # Apply multi-scale attention
-        x = checkpoint(self.ms_attention, x, use_reentrant=False)
-        
-        # Reshape for RoPE: Treat the time dimension (width) as the sequence length
-        batch, channels, height, width = x.shape
-        x = x.permute(0, 2, 3, 1)  # Shape: [batch, height, width, channels]
-        x = x.reshape(batch * height, width, channels)  # Shape: [batch * height, width, channels]
-
-        # Apply Rotary Position Embedding (RoPE)
-        x_pos_rotated, x_neg_rotated = self.rope(x, seq_len=width)
-
-        # Combine the rotated embeddings
-        x = x_pos_rotated + x_neg_rotated
-
-        # Reshape back to the original shape
-        x = x.reshape(batch, height, width, channels)
-        x = x.permute(0, 3, 1, 2)  # Shape: [batch, channels, height, width]
-
-        # Apply dynamic attention
-        x = checkpoint(self.dyn_attention, x, use_reentrant=False)
-
-        # Apply SE + Coordinate Attention
-        x = checkpoint(self.se_coord_attn, x, use_reentrant=False)
-
-        # Apply Dual Attention
-        x = checkpoint(self.dual_attn, x, use_reentrant=False)
-
-        # Pass through the Fourier Neural Operator
+        x = self.projection(x)
+        x = self.frequency_band_attention(x)
         x = self.operator(x)
-
-        # Predict the mask
         mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
-
         return inst_mask, vocal_mask
 
 def loss_fn(pred_inst_mask, pred_vocal_mask, target_inst_mag, target_vocal_mag, mixture_mag, mixture_phase, window, n_fft, hop_length):
@@ -645,7 +448,7 @@ def main():
     # Define the Hann window for STFT
     window = torch.hann_window(args.n_fft).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128))
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128), num_bands=64)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
@@ -664,7 +467,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128))
+        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128), num_bands=64)
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
