@@ -130,16 +130,16 @@ def loss_fn(pred_inst_mask, pred_vocal_mask, target_inst_mag, target_vocal_mag, 
 
 # Custom Dataset class
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=264600, n_fft=4096, hop_length=1024, segment=True):
+    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=264600, segment=True):
         self.root_dir = root_dir
         self.preprocess_dir = preprocess_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
-        self.n_fft = n_fft
-        self.hop_length = hop_length
+        self.n_fft = 4096
+        self.hop_length = 1024
         self.segment = segment
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
-        self.window = torch.hann_window(n_fft)
+        self.window = torch.hann_window(self.n_fft)
 
         # Preprocess data if preprocess_dir is provided
         if self.preprocess_dir:
@@ -276,7 +276,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             pred_inst_mask, pred_vocal_mask = model(mixture_mag)
 
             # Compute loss
-            loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag, mixture_mag, mixture_phase, window, args.n_fft, args.hop_length)
+            loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag, mixture_mag, mixture_phase, window, 4096, 1024)
 
             # Backward pass with gradient clipping
             loss.backward()
@@ -328,7 +328,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=88200, overlap=44100, device='cpu', n_fft=4096, hop_length=1024):
+              chunk_size=88200, overlap=44100, device='cpu'):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.eval()
@@ -344,58 +344,52 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     vocals = torch.zeros_like(input_audio)
 
     cross_fade_length = overlap // 2
-    window = torch.hann_window(n_fft).to(device)
+    window = torch.hann_window(4096).to(device)
 
     num_chunks = (total_length - overlap) // (chunk_size - overlap)
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
             chunk = input_audio[:, i:i + chunk_size]
-            chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+            chunk_spec = torch.stft(chunk, n_fft=4096, hop_length=1024, window=window, return_complex=True)
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
 
-            # Ensure the input to the model has the correct shape
-            chunk_mag = chunk_mag.unsqueeze(0).to(device)  # Add batch dimension: [1, 2, 2049, 87]
+            chunk_mag = chunk_mag.unsqueeze(0).to(device)
 
             with torch.no_grad():
                 pred_inst_mask, pred_vocal_mask = model(chunk_mag)
 
-            # Remove the batch dimension from the masks
-            pred_inst_mask = pred_inst_mask.squeeze(0)  # Shape: [2, 2049, 87]
-            pred_vocal_mask = pred_vocal_mask.squeeze(0)  # Shape: [2, 2049, 87]
+            pred_inst_mask = pred_inst_mask.squeeze(0)
+            pred_vocal_mask = pred_vocal_mask.squeeze(0)
 
-            # Apply the masks to the mixture magnitude
-            pred_inst_mag = chunk_mag.squeeze(0) * pred_inst_mask  # Shape: [2, 2049, 87]
-            pred_vocal_mag = chunk_mag.squeeze(0) * pred_vocal_mask  # Shape: [2, 2049, 87]
+            pred_inst_mag = chunk_mag.squeeze(0) * pred_inst_mask
+            pred_vocal_mag = chunk_mag.squeeze(0) * pred_vocal_mask
 
-            # Reconstruct the complex spectrograms
-            pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)  # Shape: [2, 2049, 87]
-            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)  # Shape: [2, 2049, 87]
+            pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
+            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
 
-            # Reconstruct the time-domain signals for each channel
             inst_chunk = torch.zeros_like(chunk)
             vocal_chunk = torch.zeros_like(chunk)
 
-            for channel in range(2):  # Process each channel separately
+            for channel in range(2):
                 inst_chunk[channel] = torch.istft(
-                    pred_inst_spec[channel].unsqueeze(0),  # Add batch dimension: [1, 2049, 87]
-                    n_fft=n_fft,
-                    hop_length=hop_length,
+                    pred_inst_spec[channel].unsqueeze(0),
+                    n_fft=4096,
+                    hop_length=1024,
                     window=window,
                     length=chunk_size,
                     return_complex=False
-                ).squeeze(0)  # Remove batch dimension
+                ).squeeze(0)
 
                 vocal_chunk[channel] = torch.istft(
-                    pred_vocal_spec[channel].unsqueeze(0),  # Add batch dimension: [1, 2049, 87]
-                    n_fft=n_fft,
-                    hop_length=hop_length,
+                    pred_vocal_spec[channel].unsqueeze(0),
+                    n_fft=4096,
+                    hop_length=1024,
                     window=window,
                     length=chunk_size,
                     return_complex=False
-                ).squeeze(0)  # Remove batch dimension
+                ).squeeze(0)
 
-            # Handle cross-fading between chunks
             if i == 0:
                 instrumentals[:, i:i + chunk_size] = inst_chunk
                 vocals[:, i:i + chunk_size] = vocal_chunk
@@ -416,11 +410,9 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
 
             pbar.update(1)
 
-    # Clamp the output to avoid clipping
     instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
     vocals = torch.clamp(vocals, -1.0, 1.0)
 
-    # Save the output audio files
     torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
     torchaudio.save(output_vocal_path, vocals.cpu(), sr)
 
@@ -438,37 +430,31 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
-    parser.add_argument('--n_fft', type=int, default=4096, help='Number of FFT bins for STFT')
-    parser.add_argument('--hop_length', type=int, default=1024, help='Hop length for STFT')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Define the Hann window for STFT
-    window = torch.hann_window(args.n_fft).to(device)
+    window = torch.hann_window(4096).to(device)
 
     model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128), num_bands=64)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
-        # Create the dataset with preprocessing if preprocess_dir is provided
         train_dataset = MUSDBDataset(root_dir=args.data_dir, preprocess_dir=args.preprocess_dir,
-                                     segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length, segment=True)
+                                     segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               num_workers=16, pin_memory=False, persistent_workers=True)
 
         total_steps = args.epochs * len(train_dataloader)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
-        # Pass the window to the train function
         train(model, train_dataloader, optimizer, scheduler, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128), num_bands=64)
-        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
+        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device)
     else:
         print("Please specify either --train or --infer")
 
