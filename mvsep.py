@@ -484,7 +484,7 @@ def main():
 
     window = torch.hann_window(4096).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128), num_bands=64)
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128), num_bands=16)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
