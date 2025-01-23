@@ -13,101 +13,46 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class CoordinateAttention(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=16):
-        super(CoordinateAttention, self).__init__()
-        self.avg_pool_h = nn.AdaptiveAvgPool2d((None, 1))  # Height-wise pooling
-        self.avg_pool_w = nn.AdaptiveAvgPool2d((1, None))  # Width-wise pooling
-        self.conv1 = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
-        self.conv2 = nn.Conv2d(in_channels // reduction_ratio, in_channels, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-
-        # Height-wise attention
-        x_h = self.avg_pool_h(x)  # Shape: (B, C, H, 1)
-        x_h = x_h.permute(0, 1, 3, 2)  # Shape: (B, C, 1, H)
-
-        # Width-wise attention
-        x_w = self.avg_pool_w(x)  # Shape: (B, C, 1, W)
-
-        # Concatenate height and width features
-        y = torch.cat([x_h, x_w], dim=3)  # Shape: (B, C, 1, H + W)
-
-        # Apply conv layers
-        y = self.conv1(y)  # Reduce channels
-        y = self.conv2(y)  # Restore channels
-
-        # Split into height and width attention maps
-        y_h, y_w = torch.split(y, [H, W], dim=3)  # Split along the concatenated dimension
-        y_h = y_h.permute(0, 1, 3, 2)  # Shape: (B, C, H, 1)
-        y_w = y_w  # Shape: (B, C, 1, W)
-
-        # Apply sigmoid
-        y_h = self.sigmoid(y_h)
-        y_w = self.sigmoid(y_w)
-
-        # Apply attention
-        return x * y_h * y_w
-
-class FrequencyBandAttention(nn.Module):
-    def __init__(self, in_channels, num_bands=64):
-        super(FrequencyBandAttention, self).__init__()
-        self.num_bands = num_bands
-        self.in_channels = in_channels
-
-        # Band-specific attention
-        self.band_attention = nn.ModuleList([
-            nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),  # Global average pooling for each band
-                nn.Conv2d(in_channels, in_channels, kernel_size=1),  # No reduction
-                nn.Sigmoid()  # Sigmoid to generate attention weights
+class HybridAttention(nn.Module):
+    def __init__(self, in_channels, kernel_sizes=[7, 5, 3, 1]):
+        super(HybridAttention, self).__init__()
+        
+        # Global to Local Attention
+        self.attn_layers = nn.ModuleList()
+        for kernel_size in kernel_sizes:
+            padding = kernel_size // 2
+            self.attn_layers.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=padding, groups=in_channels),
+                    nn.Conv2d(in_channels, in_channels, kernel_size=1),
+                    nn.Sigmoid()
+                )
             )
-            for _ in range(num_bands)
-        ])
+        
+        # Fusion layer to combine all attention maps
+        self.fuse = nn.Conv2d(in_channels * len(kernel_sizes), in_channels, kernel_size=1)
 
     def forward(self, x):
-        B, C, H, W = x.shape  # H is frequency bins, W is time frames
-
-        # Pad the frequency dimension to make it divisible by num_bands
-        if H % self.num_bands != 0:
-            pad_size = self.num_bands - (H % self.num_bands)
-            x = F.pad(x, (0, 0, 0, pad_size))  # Pad along the frequency dimension (H)
-            padded_H = H + pad_size
-        else:
-            padded_H = H
-
-        # Split the frequency spectrum into sub-bands
-        band_height = padded_H // self.num_bands
-        bands = [x[:, :, i * band_height:(i + 1) * band_height, :] for i in range(self.num_bands)]
-
-        # Apply band-specific attention
-        attended_bands = []
-        for i, band in enumerate(bands):
-            attention_map = self.band_attention[i](band)
-            attended_band = band * attention_map
-            attended_bands.append(attended_band)
-
-        # Concatenate the attended bands along the frequency dimension
-        output = torch.cat(attended_bands, dim=2)
-
-        # Remove padding if it was added
-        if H % self.num_bands != 0:
-            output = output[:, :, :H, :]  # Trim back to the original frequency dimension
-
-        return output
+        attention_maps = []
+        
+        # Apply each attention layer
+        for attn_layer in self.attn_layers:
+            attention_map = attn_layer(x)
+            attention_maps.append(attention_map)
+        
+        # Combine all attention maps
+        combined = torch.cat(attention_maps, dim=1)
+        combined = self.fuse(combined)
+        
+        return combined
 
 class NeuralOperatorModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16), num_bands=64):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16)):
         super(NeuralOperatorModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
-        # Frequency Band Attention
-        self.frequency_band_attention = FrequencyBandAttention(in_channels=hidden_channels, num_bands=num_bands)
-
-        # SE + Coordinate Attention (Sequential Integration)
-        self.coord_attn = CoordinateAttention(hidden_channels)
+        # Hybrid Attention with varying kernel sizes
+        self.hybrid_attn = HybridAttention(hidden_channels)
 
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=hidden_channels)
         self.mask_predictor = nn.Sequential(
@@ -119,10 +64,10 @@ class NeuralOperatorModel(nn.Module):
 
     def forward(self, x):
         x = self.projection(x)
-        # Apply Freq Band Attention
-        x = self.frequency_band_attention(x)
-        # Apply Coordinate Attention
-        x = checkpoint(self.coord_attn, x, use_reentrant=False)
+        
+        # Apply Hybrid Attention
+        x = checkpoint(self.hybrid_attn, x, use_reentrant=False)
+        
         x = self.operator(x)
         mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
@@ -484,7 +429,7 @@ def main():
 
     window = torch.hann_window(4096).to(device)
 
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128), num_bands=16)
+    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(128, 128))
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
