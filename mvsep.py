@@ -13,9 +13,9 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class HybridAttention(nn.Module):
+class KernelScaleAttention(nn.Module):
     def __init__(self, in_channels, kernel_sizes=[7, 5, 3, 1]):
-        super(HybridAttention, self).__init__()
+        super(KernelScaleAttention, self).__init__()
         
         # Global to Local Attention
         self.attn_layers = nn.ModuleList()
@@ -51,8 +51,8 @@ class NeuralOperatorModel(nn.Module):
         super(NeuralOperatorModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
 
-        # Hybrid Attention with varying kernel sizes
-        self.hybrid_attn = HybridAttention(hidden_channels)
+        # Kernel Scale Attention with varying kernel sizes
+        self.ks_attn = KernelScaleAttention(hidden_channels)
 
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=hidden_channels)
         self.mask_predictor = nn.Sequential(
@@ -65,8 +65,8 @@ class NeuralOperatorModel(nn.Module):
     def forward(self, x):
         x = self.projection(x)
         
-        # Apply Hybrid Attention
-        x = checkpoint(self.hybrid_attn, x, use_reentrant=False)
+        # Apply KSA
+        x = checkpoint(self.ks_attn, x, use_reentrant=False)
         
         x = self.operator(x)
         mask = self.mask_predictor(x)
