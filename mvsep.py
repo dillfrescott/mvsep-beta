@@ -13,6 +13,54 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
+class MultiScaleAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, scales = [0.5, 1, 1.5, 2, 2.5, 3]):
+        super(MultiScaleAttention, self).__init__()
+        self.scales = scales
+        self.conv_layers = nn.ModuleList([
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            for _ in scales
+        ])
+        self.attention = nn.Sequential(
+            nn.Conv2d(out_channels * len(scales), out_channels * len(scales), kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.final_conv = nn.Conv2d(out_channels * len(scales), out_channels, kernel_size=3, padding=1)
+
+        # Residual connection: 1x1 convolution to match dimensions if in_channels != out_channels
+        self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+
+    def forward(self, x):
+        # Save the input for the residual connection
+        residual = x
+
+        # Extract features at multiple scales
+        features = []
+        for i, conv in enumerate(self.conv_layers):
+            # Apply convolution with a small kernel and stride=1
+            feat = conv(x)
+            if self.scales[i] != 1:
+                # Resize the feature map to match the original resolution
+                feat = F.interpolate(feat, size=x.shape[2:], mode='bilinear', align_corners=False)
+            features.append(feat)
+
+        # Concatenate features from all scales
+        features = torch.cat(features, dim=1)
+
+        # Apply attention to focus on fine-grained details
+        attention_map = self.attention(features)
+        attended_features = features * attention_map
+
+        # Final convolution to produce the output
+        output = self.final_conv(attended_features)
+
+        # Add residual connection
+        if self.residual_conv is not None:
+            residual = self.residual_conv(residual)
+        output = output + residual  # Add the residual to the output
+
+        return output
+
 class KernelScaleAttention(nn.Module):
     def __init__(self, in_channels, kernel_sizes=[7, 5, 3, 1]):
         super(KernelScaleAttention, self).__init__()
@@ -50,6 +98,9 @@ class NeuralOperatorModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16)):
         super(NeuralOperatorModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
+        
+        # Multi-scale attention
+        self.ms_attention = MultiScaleAttention(hidden_channels, hidden_channels)
 
         # Kernel Scale Attention with varying kernel sizes
         self.ks_attn = KernelScaleAttention(hidden_channels)
@@ -64,6 +115,9 @@ class NeuralOperatorModel(nn.Module):
 
     def forward(self, x):
         x = self.projection(x)
+        
+        # Apply multi-scale attention
+        x = checkpoint(self.ms_attention, x, use_reentrant=False)
         
         # Apply KSA
         x = checkpoint(self.ks_attn, x, use_reentrant=False)
