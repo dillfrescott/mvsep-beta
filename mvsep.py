@@ -13,46 +13,10 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class KernelScaleAttention(nn.Module):
-    def __init__(self, in_channels, kernel_sizes=[7, 5, 3, 1]):
-        super(KernelScaleAttention, self).__init__()
-        
-        # Global to Local Attention
-        self.attn_layers = nn.ModuleList()
-        for kernel_size in kernel_sizes:
-            padding = kernel_size // 2
-            self.attn_layers.append(
-                nn.Sequential(
-                    nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=padding, groups=in_channels),
-                    nn.Conv2d(in_channels, in_channels, kernel_size=1),
-                    nn.Sigmoid()
-                )
-            )
-        
-        # Fusion layer to combine all attention maps
-        self.fuse = nn.Conv2d(in_channels * len(kernel_sizes), in_channels, kernel_size=1)
-
-    def forward(self, x):
-        attention_maps = []
-        
-        # Apply each attention layer
-        for attn_layer in self.attn_layers:
-            attention_map = attn_layer(x)
-            attention_maps.append(attention_map)
-        
-        # Combine all attention maps
-        combined = torch.cat(attention_maps, dim=1)
-        combined = self.fuse(combined)
-        
-        return combined
-
 class NeuralOperatorModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16)):
         super(NeuralOperatorModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
-
-        # Kernel Scale Attention with varying kernel sizes
-        self.ks_attn = KernelScaleAttention(hidden_channels)
 
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, in_channels=hidden_channels, out_channels=hidden_channels)
         self.mask_predictor = nn.Sequential(
@@ -64,10 +28,6 @@ class NeuralOperatorModel(nn.Module):
 
     def forward(self, x):
         x = self.projection(x)
-        
-        # Apply KSA
-        x = checkpoint(self.ks_attn, x, use_reentrant=False)
-        
         x = self.operator(x)
         mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
