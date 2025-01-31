@@ -8,7 +8,6 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import numpy as np
-from neuralop.models import FNO, TFNO
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
