@@ -70,10 +70,10 @@ class RNNModel(nn.Module):
         # Multi-scale attention before RNN
         self.multi_scale_attention = MultiScaleAttention(hidden_channels, hidden_channels)
 
-        # RNN layer
-        self.rnn = nn.GRU(input_size=hidden_channels, hidden_size=hidden_channels, num_layers=num_layers, batch_first=True)
+        # LSTM layer
+        self.lstm = nn.LSTM(input_size=hidden_channels, hidden_size=hidden_channels, num_layers=num_layers, batch_first=True)
 
-        # Multi-scale attention after RNN
+        # Multi-scale attention after LSTM
         self.post_rnn_attention = MultiScaleAttention(hidden_channels, hidden_channels)
 
         # Mask predictor
@@ -88,22 +88,22 @@ class RNNModel(nn.Module):
         # Project input to hidden_channels
         x = self.projection(x)  # Shape: (batch, hidden_channels, freq, time)
 
-        # Apply multi-scale attention before RNN
+        # Apply multi-scale attention before LSTM
         x = self.multi_scale_attention(x)
 
         # Get dimensions
         batch, channels, freq, time = x.shape
 
-        # Reshape for RNN: (batch * freq, time, hidden_channels)
+        # Reshape for LSTM: (batch * freq, time, hidden_channels)
         x = x.permute(0, 2, 3, 1).reshape(batch * freq, time, channels)
 
-        # Pass through RNN
-        x, _ = self.rnn(x)  # Shape: (batch * freq, time, hidden_channels)
+        # Pass through LSTM
+        x, (h_n, c_n) = self.lstm(x)  # Shape: (batch * freq, time, hidden_channels)
 
         # Reshape back: (batch, hidden_channels, freq, time)
         x = x.reshape(batch, freq, time, channels).permute(0, 3, 1, 2)
 
-        # Apply multi-scale attention after RNN
+        # Apply multi-scale attention after LSTM
         x = self.post_rnn_attention(x)
 
         # Predict masks
