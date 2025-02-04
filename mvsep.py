@@ -12,6 +12,49 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
+class Discriminator(nn.Module):
+    def __init__(self, in_channels=4, hidden_channels=128, num_layers=2):
+        super(Discriminator, self).__init__()
+        
+        # Initial feature projection
+        self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
+
+        # LSTM layer
+        self.lstm = nn.LSTM(input_size=hidden_channels, hidden_size=hidden_channels, num_layers=num_layers, batch_first=True)
+
+        # Final classification layer
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # Project input to hidden_channels
+        x = self.projection(x)  # Shape: (batch, hidden_channels, freq, time)
+
+        # Get dimensions
+        batch, channels, freq, time = x.shape
+
+        # Reshape for LSTM: (batch * freq, time, hidden_channels)
+        x = x.permute(0, 2, 3, 1).reshape(batch * freq, time, channels)
+
+        # Pass through LSTM
+        x, (h_n, c_n) = self.lstm(x)  # Shape: (batch * freq, time, hidden_channels)
+
+        # Take the last time step's output
+        x = x[:, -1, :]  # Shape: (batch * freq, hidden_channels)
+
+        # Reshape back: (batch, freq, hidden_channels)
+        x = x.reshape(batch, freq, channels)
+
+        # Average over frequency dimension
+        x = x.mean(dim=1)  # Shape: (batch, hidden_channels)
+
+        # Final classification
+        x = self.fc(x)  # Shape: (batch, 1)
+
+        return x
+
 class MultiScaleAttention(nn.Module):
     def __init__(self, in_channels, out_channels, scales = [0.5, 1, 1.5, 2, 2.5, 3]):
         super(MultiScaleAttention, self).__init__()
@@ -274,11 +317,14 @@ def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
+def train_gan(model, discriminator, dataloader, optimizer, optimizer_d, scheduler, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
     model.to(device)
+    discriminator.to(device)
     step = 0
     avg_loss = 0.0
+    avg_loss_d = 0.0
     loss_log = []
+    loss_d_log = []
 
     # List to keep track of checkpoint filenames
     checkpoint_files = []
@@ -286,15 +332,20 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     if checkpoint_path:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        discriminator.load_state_dict(checkpoint['discriminator_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
         step = checkpoint['step']
         avg_loss = checkpoint['avg_loss']
+        avg_loss_d = checkpoint['avg_loss_d']
         loss_log = checkpoint['loss_log']
-        print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
+        loss_d_log = checkpoint['loss_d_log']
+        print(f"Resuming training from step {step} with average loss {avg_loss:.4f} and discriminator loss {avg_loss_d:.4f}")
 
     progress_bar = tqdm(total=epochs * len(dataloader))
 
     model.train()
+    discriminator.train()
     for epoch in range(epochs):
         for batch in dataloader:
             mixture_mag, mixture_phase, instrumental_mag, _, vocal_mag, _ = batch
@@ -303,13 +354,43 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             instrumental_mag = instrumental_mag.to(device)
             vocal_mag = vocal_mag.to(device)
 
+            # Train Discriminator
+            optimizer_d.zero_grad()
+
+            # Real data
+            real_masks = torch.cat([instrumental_mag, vocal_mag], dim=1)
+            real_labels = torch.ones((real_masks.shape[0], 1)).to(device)
+
+            # Fake data
+            with torch.no_grad():
+                pred_inst_mask, pred_vocal_mask = model(mixture_mag)
+            fake_masks = torch.cat([pred_inst_mask.repeat(1, 2, 1, 1), pred_vocal_mask.repeat(1, 2, 1, 1)], dim=1)
+            fake_labels = torch.zeros((fake_masks.shape[0], 1)).to(device)
+
+            # Discriminator loss
+            real_loss = F.binary_cross_entropy(discriminator(real_masks), real_labels)
+            fake_loss = F.binary_cross_entropy(discriminator(fake_masks.detach()), fake_labels)
+            loss_d = (real_loss + fake_loss) / 2
+
+            loss_d.backward()
+            optimizer_d.step()
+
+            # Train Generator
             optimizer.zero_grad()
 
-            # Forward pass
+            # Generate fake masks
             pred_inst_mask, pred_vocal_mask = model(mixture_mag)
+            fake_masks = torch.cat([pred_inst_mask.repeat(1, 2, 1, 1), pred_vocal_mask.repeat(1, 2, 1, 1)], dim=1)
 
-            # Compute loss
-            loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag, mixture_mag, mixture_phase, window, 4096, 1024)
+            # Adversarial loss
+            adversarial_labels = torch.ones((fake_masks.shape[0], 1)).to(device)
+            adversarial_loss = F.binary_cross_entropy(discriminator(fake_masks), adversarial_labels)
+
+            # Reconstruction loss
+            reconstruction_loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag, mixture_mag, mixture_phase, window, 4096, 1024)
+
+            # Total loss
+            loss = reconstruction_loss + adversarial_loss
 
             # Backward pass with gradient clipping
             loss.backward()
@@ -322,18 +403,20 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             scheduler.step()
 
             # Check for NaN in loss
-            if torch.isnan(loss).any():
+            if torch.isnan(loss).any() or torch.isnan(loss_d).any():
                 raise ValueError("Loss is NaN!")
 
             # Update metrics
             avg_loss = (avg_loss * step + loss.item()) / (step + 1)
+            avg_loss_d = (avg_loss_d * step + loss_d.item()) / (step + 1)
             loss_log.append(loss.item())
+            loss_d_log.append(loss_d.item())
             step += 1
             progress_bar.update(1)
 
             # Update progress bar description
             current_lr = optimizer.param_groups[0]['lr']
-            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
+            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - Loss D: {loss_d.item():.4f} - Avg Loss D: {avg_loss_d:.4f} - LR: {current_lr:.8f}"
             progress_bar.set_description(desc)
 
             # Save checkpoint periodically
@@ -342,9 +425,13 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                 torch.save({
                     'step': step,
                     'model_state_dict': model.state_dict(),
+                    'discriminator_state_dict': discriminator.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'optimizer_d_state_dict': optimizer_d.state_dict(),
                     'avg_loss': avg_loss,
-                    'loss_log': loss_log
+                    'avg_loss_d': avg_loss_d,
+                    'loss_log': loss_log,
+                    'loss_d_log': loss_d_log
                 }, checkpoint_filename)
 
                 # Add the new checkpoint to the list
@@ -357,7 +444,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                         os.remove(oldest_checkpoint)
 
     # Save final loss log
-    torch.save({'loss_log': loss_log}, 'loss_log.pt')
+    torch.save({'loss_log': loss_log, 'loss_d_log': loss_d_log}, 'loss_log.pt')
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
@@ -464,14 +551,17 @@ def main():
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
+    parser.add_argument('--learning_rate_d', type=float, default=1e-4, help='Learning rate for the discriminator optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     window = torch.hann_window(4096).to(device)
 
-    model = RNNModel(in_channels=2, out_channels=2, hidden_channels=48, num_layers=4)
-    optimizer = torch.optim.Adam(model.parameters())
+    model = RNNModel(in_channels=2, out_channels=2, hidden_channels=38, num_layers=4)
+    discriminator = Discriminator(in_channels=4, hidden_channels=38, num_layers=4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=args.learning_rate_d)
 
     if args.train:
         train_dataset = MUSDBDataset(root_dir=args.data_dir, preprocess_dir=args.preprocess_dir,
@@ -482,7 +572,7 @@ def main():
         total_steps = args.epochs * len(train_dataloader)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
-        train(model, train_dataloader, optimizer, scheduler, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
+        train_gan(model, discriminator, train_dataloader, optimizer, optimizer_d, scheduler, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
