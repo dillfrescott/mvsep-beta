@@ -333,7 +333,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
             # Update progress bar description
             current_lr = optimizer.param_groups[0]['lr']
-            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
+            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.6f} - Avg Loss: {avg_loss:.6f} - LR: {current_lr:.8f}"
             progress_bar.set_description(desc)
 
             # Save checkpoint periodically
