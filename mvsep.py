@@ -290,7 +290,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
         step = checkpoint['step']
         avg_loss = checkpoint['avg_loss']
         loss_log = checkpoint['loss_log']
-        print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
+        print(f"Resuming training from step {step} with average loss {avg_loss:.6f}")
 
     progress_bar = tqdm(total=epochs * len(dataloader))
 
