@@ -1,4 +1,5 @@
 auraloss
+librosa
 neuraloperator
 numpy
 tqdm
