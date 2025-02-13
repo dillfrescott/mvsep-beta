@@ -1,3 +1,4 @@
+auraloss
 neuraloperator
 numpy==1.26.4
 tqdm
