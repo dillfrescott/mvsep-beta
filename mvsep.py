@@ -292,7 +292,6 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     model.to(device)
     step = 0
     avg_loss = 0.0
-    loss_log = []
     checkpoint_files = []
 
     if checkpoint_path:
@@ -301,7 +300,6 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
         optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
         step = checkpoint_data['step']
         avg_loss = checkpoint_data['avg_loss']
-        loss_log = checkpoint_data['loss_log']
         print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
 
     progress_bar = tqdm(total=epochs * len(dataloader))
@@ -327,7 +325,6 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                 raise ValueError("Loss is NaN!")
 
             avg_loss = (avg_loss * step + loss.item()) / (step + 1)
-            loss_log.append(loss.item())
             step += 1
             progress_bar.update(1)
             current_lr = optimizer.param_groups[0]['lr']
@@ -340,15 +337,13 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                     'step': step,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    'avg_loss': avg_loss,
-                    'loss_log': loss_log
+                    'avg_loss': avg_loss
                 }, checkpoint_filename)
                 checkpoint_files.append(checkpoint_filename)
                 if len(checkpoint_files) > 3:
                     oldest_checkpoint = checkpoint_files.pop(0)
                     if os.path.exists(oldest_checkpoint):
                         os.remove(oldest_checkpoint)
-    torch.save({'loss_log': loss_log}, 'loss_log.pt')
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
