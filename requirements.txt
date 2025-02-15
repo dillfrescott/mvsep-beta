@@ -1,5 +1,5 @@
-auraloss
 librosa
 neuraloperator
 numpy
+torch-log-wmse
 tqdm
