@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from neuralop.models import FNO
 import numpy as np
-import auraloss
+from torch_log_wmse import LogWMSE
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
@@ -158,27 +158,36 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
         target_vocal_audio.append(target_vocal_audio_ch)
 
     # Stack along the channel dimension (resulting shape: [channels, time])
-    pred_inst_audio = torch.stack(pred_inst_audio, dim=0)
-    pred_vocal_audio = torch.stack(pred_vocal_audio, dim=0)
-    target_inst_audio = torch.stack(target_inst_audio, dim=0)
-    target_vocal_audio = torch.stack(target_vocal_audio, dim=0)
+    pred_inst_audio = torch.stack(pred_inst_audio, dim=0)  # shape: [channels, time]
+    pred_vocal_audio = torch.stack(pred_vocal_audio, dim=0)  # shape: [channels, time]
+    target_inst_audio = torch.stack(target_inst_audio, dim=0)  # shape: [channels, time]
+    target_vocal_audio = torch.stack(target_vocal_audio, dim=0)  # shape: [channels, time]
 
-    # auraloss expects inputs with a batch dimension.
-    # Here, we add a batch dimension so that our signals have shape [1, channels, time]
-    pred_inst_audio = pred_inst_audio.unsqueeze(0)
-    pred_vocal_audio = pred_vocal_audio.unsqueeze(0)
-    target_inst_audio = target_inst_audio.unsqueeze(0)
-    target_vocal_audio = target_vocal_audio.unsqueeze(0)
+    mixture_audio = torch.istft(
+        mixture_mag * torch.exp(1j * mixture_phase), n_fft=n_fft, hop_length=hop_length, window=window
+    )  # shape: [channels, time]
+    mixture_audio = mixture_audio.unsqueeze(0)  # shape: [1, channels, time]
 
-    # Define the parameters for the multi-resolution STFT loss
-    loss_fn = auraloss.freq.MultiResolutionSTFTLoss()
+    pred_inst_audio = pred_inst_audio.unsqueeze(0).unsqueeze(1)  # shape: [1, 1, channels, time]
+    pred_vocal_audio = pred_vocal_audio.unsqueeze(0).unsqueeze(1)  # shape: [1, 1, channels, time]
+    target_inst_audio = target_inst_audio.unsqueeze(0).unsqueeze(1)  # shape: [1, 1, channels, time]
+    target_vocal_audio = target_vocal_audio.unsqueeze(0).unsqueeze(1)  # shape: [1, 1, channels, time]
 
-    # Compute the multi-resolution STFT loss for instruments and vocals separately
-    loss_inst_stft = loss_fn(pred_inst_audio, target_inst_audio)
-    loss_vocal_stft = loss_fn(pred_vocal_audio, target_vocal_audio)
-    
-    # Combine the losses for a total STFT loss
-    total_loss = loss_inst_stft + loss_vocal_stft
+    # Instantiate LogWMSE loss
+    audio_length = pred_inst_audio.shape[-1] / 44100
+    log_wmse = LogWMSE(
+        audio_length=audio_length,
+        sample_rate=44100,
+        return_as_loss=True,
+        bypass_filter=False
+    )
+
+    # Compute LogWMSE loss for instruments and vocals separately
+    loss_inst = log_wmse(mixture_audio, pred_inst_audio, target_inst_audio)
+    loss_vocal = log_wmse(mixture_audio, pred_vocal_audio, target_vocal_audio)
+
+    # Combine the losses for a total loss
+    total_loss = loss_inst + loss_vocal
 
     return total_loss
 
@@ -426,7 +435,7 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
+    parser.add_argument('--learning_rate', type=float, default=1e-3, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
