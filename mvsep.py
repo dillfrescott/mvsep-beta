@@ -15,67 +15,13 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class MultiScaleAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, scales=[0.5, 1, 1.5, 2, 2.5, 3]):
-        super(MultiScaleAttention, self).__init__()
-        self.scales = scales
-        self.conv_layers = nn.ModuleList([
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-            for _ in scales
-        ])
-        self.attention = nn.Sequential(
-            nn.Conv2d(out_channels * len(scales), out_channels * len(scales), kernel_size=1),
-            nn.Sigmoid()
-        )
-        self.final_conv = nn.Conv2d(out_channels * len(scales), out_channels, kernel_size=3, padding=1)
-
-        # Residual connection: 1x1 convolution to match dimensions if in_channels != out_channels
-        self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
-
-    def forward(self, x):
-        # Save the input for the residual connection
-        residual = x
-
-        # Extract features at multiple scales
-        features = []
-        for i, conv in enumerate(self.conv_layers):
-            feat = conv(x)
-            if self.scales[i] != 1:
-                # Resize the feature map to match the original resolution
-                feat = F.interpolate(feat, size=x.shape[2:], mode='bilinear', align_corners=False)
-            features.append(feat)
-
-        # Concatenate features from all scales
-        features = torch.cat(features, dim=1)
-
-        # Apply attention to focus on fine-grained details
-        attention_map = self.attention(features)
-        attended_features = features * attention_map
-
-        # Final convolution to produce the output
-        output = self.final_conv(attended_features)
-
-        # Add residual connection
-        if self.residual_conv is not None:
-            residual = self.residual_conv(residual)
-        output = output + residual
-
-        return output
-
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16), num_layers=1):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16)):
         super(NeuralModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
         
-        self.multi_scale_attention = MultiScaleAttention(hidden_channels, hidden_channels)
-        
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
                             in_channels=hidden_channels, out_channels=hidden_channels)
-        
-        self.lstm = nn.LSTM(input_size=hidden_channels, hidden_size=hidden_channels,
-                            num_layers=num_layers, batch_first=True)
-        
-        self.post_msa = MultiScaleAttention(hidden_channels, hidden_channels)
         
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
@@ -87,25 +33,10 @@ class NeuralModel(nn.Module):
     def forward(self, x):
         # x: shape (B, in_channels, H, W)
         x = self.projection(x)
-        # Use checkpointing on the first multi-scale attention block.
-        x = checkpoint(self.multi_scale_attention, x, use_reentrant=False)
         
         # Wrap the operator (FNO) with checkpointing.
         x = checkpoint(self.operator, x, use_reentrant=False)
         
-        B, C, F, T = x.shape
-        x = x.permute(0, 2, 3, 1)  # now (B, F, T, C)
-        x = x.reshape(B * F, T, C)  # merge batch and frequency dims
-
-        # Wrap the LSTM forward pass using a lambda that returns only the output.
-        x = checkpoint(lambda inp: self.lstm(inp)[0], x, use_reentrant=False)
-        
-        # Reshape back to (B, F, T, C) then permute to (B, C, F, T)
-        x = x.reshape(B, F, T, C)
-        x = x.permute(0, 3, 1, 2)
-        
-        # Use checkpointing on the post multi-scale attention block.
-        x = checkpoint(self.post_msa, x, use_reentrant=False)
         mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
         return inst_mask, vocal_mask
@@ -170,10 +101,6 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     )
     mrstft = auraloss.freq.MultiResolutionSTFTLoss()
 
-    # Compute L1 loss in time domain
-    l1_inst = F.l1_loss(pred_inst_audio, target_inst_audio)
-    l1_vocal = F.l1_loss(pred_vocal_audio, target_vocal_audio)
-
     # Compute LogWMSE loss
     logwmse_loss = log_wmse(mixture_audio, processed_audio, target_audio)
 
@@ -182,9 +109,7 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     mrstft_vocal = mrstft(pred_vocal_audio, target_vocal_audio)
 
     # Combine losses (you may adjust weighting as needed)
-    total_loss = (l1_inst + l1_vocal)/3 + \
-                 logwmse_loss/3 + \
-                 (mrstft_inst + mrstft_vocal)/3
+    total_loss = logwmse_loss/2 + (mrstft_inst + mrstft_vocal)/2
 
     return total_loss
 
@@ -432,7 +357,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(86, 86), num_layers=2)
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=86, n_modes=(86, 86))
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
