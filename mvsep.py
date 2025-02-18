@@ -7,8 +7,9 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from neuralop.models import FNO
 import numpy as np
+from neuralop.models import FNO
+import auraloss
 from torch_log_wmse import LogWMSE
 import math
 import glob
@@ -61,9 +62,9 @@ class MultiScaleAttention(nn.Module):
 
         return output
 
-class NeuralOperatorModel(nn.Module):
+class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16), num_layers=1):
-        super(NeuralOperatorModel, self).__init__()
+        super(NeuralModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
         
         self.multi_scale_attention = MultiScaleAttention(hidden_channels, hidden_channels)
@@ -113,81 +114,77 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
             target_inst_mag, target_vocal_mag,
             mixture_mag, mixture_phase,
             window, n_fft, hop_length):
-
-    # Remove the batch dimension (assumes batch size 1)
-    pred_inst_mask = pred_inst_mask.squeeze(0)  # shape: [channels, F, T]
+    # Remove batch dimension (assuming batch_size=1)
+    pred_inst_mask = pred_inst_mask.squeeze(0)  # [channels, F, T]
     pred_vocal_mask = pred_vocal_mask.squeeze(0)
     target_inst_mag = target_inst_mag.squeeze(0)
     target_vocal_mag = target_vocal_mag.squeeze(0)
     mixture_mag = mixture_mag.squeeze(0)
     mixture_phase = mixture_phase.squeeze(0)
 
-    # Apply the predicted masks to the mixture magnitude
+    # Apply masks to mixture magnitude
     pred_inst_mag = mixture_mag * pred_inst_mask
     pred_vocal_mag = mixture_mag * pred_vocal_mask
 
-    # Reconstruct complex spectrograms using the mixture phase
-    pred_inst_spec = pred_inst_mag * torch.exp(1j * mixture_phase)
-    pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)
-    target_inst_spec = target_inst_mag * torch.exp(1j * mixture_phase)
-    target_vocal_spec = target_vocal_mag * torch.exp(1j * mixture_phase)
+    # Reconstruct complex spectrograms
+    def make_complex(mag):
+        return mag * torch.exp(1j * mixture_phase)
+    
+    pred_inst_spec = make_complex(pred_inst_mag)
+    pred_vocal_spec = make_complex(pred_vocal_mag)
+    target_inst_spec = make_complex(target_inst_mag)
+    target_vocal_spec = make_complex(target_vocal_mag)
+    mixture_spec = make_complex(mixture_mag)
 
-    # Convert each channel’s spectrogram back to the time–domain signal via ISTFT
-    pred_inst_audio = []
-    pred_vocal_audio = []
-    target_inst_audio = []
-    target_vocal_audio = []
+    # ISTFT function for each channel
+    def istft_channels(spec):
+        return torch.stack([
+            torch.istft(spec[ch], n_fft=n_fft, hop_length=hop_length, window=window)
+            for ch in range(spec.shape[0])
+        ], dim=0)
 
-    # Loop over channels (e.g. 2 channels for stereo)
-    for channel in range(pred_inst_spec.shape[0]):
-        pred_inst_audio_ch = torch.istft(
-            pred_inst_spec[channel], n_fft=n_fft, hop_length=hop_length, window=window
-        )
-        pred_vocal_audio_ch = torch.istft(
-            pred_vocal_spec[channel], n_fft=n_fft, hop_length=hop_length, window=window
-        )
-        target_inst_audio_ch = torch.istft(
-            target_inst_spec[channel], n_fft=n_fft, hop_length=hop_length, window=window
-        )
-        target_vocal_audio_ch = torch.istft(
-            target_vocal_spec[channel], n_fft=n_fft, hop_length=hop_length, window=window
-        )
-        pred_inst_audio.append(pred_inst_audio_ch)
-        pred_vocal_audio.append(pred_vocal_audio_ch)
-        target_inst_audio.append(target_inst_audio_ch)
-        target_vocal_audio.append(target_vocal_audio_ch)
+    # Convert to time-domain audio
+    pred_inst_audio = istft_channels(pred_inst_spec)  # [channels, time]
+    pred_vocal_audio = istft_channels(pred_vocal_spec)
+    target_inst_audio = istft_channels(target_inst_spec)
+    target_vocal_audio = istft_channels(target_vocal_spec)
+    mixture_audio = istft_channels(mixture_spec)  # [channels, time]
 
-    # Stack along the channel dimension (resulting shape: [channels, time])
-    pred_inst_audio = torch.stack(pred_inst_audio, dim=0)  # shape: [channels, time]
-    pred_vocal_audio = torch.stack(pred_vocal_audio, dim=0)  # shape: [channels, time]
-    target_inst_audio = torch.stack(target_inst_audio, dim=0)  # shape: [channels, time]
-    target_vocal_audio = torch.stack(target_vocal_audio, dim=0)  # shape: [channels, time]
+    # Add batch dimension
+    pred_inst_audio = pred_inst_audio.unsqueeze(0)  # [1, channels, time]
+    pred_vocal_audio = pred_vocal_audio.unsqueeze(0)
+    target_inst_audio = target_inst_audio.unsqueeze(0)
+    target_vocal_audio = target_vocal_audio.unsqueeze(0)
+    mixture_audio = mixture_audio.unsqueeze(0)
 
-    mixture_audio = torch.istft(
-        mixture_mag * torch.exp(1j * mixture_phase), n_fft=n_fft, hop_length=hop_length, window=window
-    )  # shape: [channels, time]
-    mixture_audio = mixture_audio.unsqueeze(0)  # shape: [1, channels, time]
+    # Format for LogWMSE: [batch, stems, channels, time]
+    processed_audio = torch.stack([pred_inst_audio, pred_vocal_audio], dim=1)  # [1, 2, 2, time]
+    target_audio = torch.stack([target_inst_audio, target_vocal_audio], dim=1)
 
-    pred_inst_audio = pred_inst_audio.unsqueeze(0).unsqueeze(1)  # shape: [1, 1, channels, time]
-    pred_vocal_audio = pred_vocal_audio.unsqueeze(0).unsqueeze(1)  # shape: [1, 1, channels, time]
-    target_inst_audio = target_inst_audio.unsqueeze(0).unsqueeze(1)  # shape: [1, 1, channels, time]
-    target_vocal_audio = target_vocal_audio.unsqueeze(0).unsqueeze(1)  # shape: [1, 1, channels, time]
-
-    # Instantiate LogWMSE loss
-    audio_length = pred_inst_audio.shape[-1] / 44100
+    # Initialize losses
     log_wmse = LogWMSE(
-        audio_length=audio_length,
+        audio_length=pred_inst_audio.shape[-1]/44100,
         sample_rate=44100,
         return_as_loss=True,
         bypass_filter=False
     )
+    mrstft = auraloss.freq.MultiResolutionSTFTLoss()
 
-    # Compute LogWMSE loss for instruments and vocals separately
-    loss_inst = log_wmse(mixture_audio, pred_inst_audio, target_inst_audio)
-    loss_vocal = log_wmse(mixture_audio, pred_vocal_audio, target_vocal_audio)
+    # Compute L1 loss in time domain
+    l1_inst = F.l1_loss(pred_inst_audio, target_inst_audio)
+    l1_vocal = F.l1_loss(pred_vocal_audio, target_vocal_audio)
 
-    # Combine the losses for a total loss
-    total_loss = loss_inst + loss_vocal
+    # Compute LogWMSE loss
+    logwmse_loss = log_wmse(mixture_audio, processed_audio, target_audio)
+
+    # Compute Multi-Resolution STFT loss
+    mrstft_inst = mrstft(pred_inst_audio, target_inst_audio)
+    mrstft_vocal = mrstft(pred_vocal_audio, target_vocal_audio)
+
+    # Combine losses (you may adjust weighting as needed)
+    total_loss = (l1_inst + l1_vocal)/3 + \
+                 logwmse_loss/3 + \
+                 (mrstft_inst + mrstft_vocal)/3
 
     return total_loss
 
@@ -435,7 +432,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=48, n_modes=(86, 86), num_layers=6)
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(86, 86), num_layers=2)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
