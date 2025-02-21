@@ -15,50 +15,6 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class WindowCrossAttention(nn.Module):
-    def __init__(self, dim, window_size):
-        super().__init__()
-        self.dim = dim
-        self.window_size = window_size
-        self.query = nn.Linear(dim, dim)
-        self.key = nn.Linear(dim, dim)
-        self.value = nn.Linear(dim, dim)
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x):
-        B, H, W, C = x.shape
-        L = H * W
-        remainder = L % self.window_size
-        # If the flattened length isn't divisible by window_size, pad it.
-        if remainder != 0:
-            pad_length = self.window_size - remainder
-            x = x.view(B, L, C)
-            # Create a zero tensor for padding (or use a different padding strategy)
-            padding = torch.zeros(B, pad_length, C, device=x.device, dtype=x.dtype)
-            x = torch.cat([x, padding], dim=1)
-        else:
-            x = x.view(B, L, C)
-        
-        # Now apply the sliding window
-        x_windows = x.unfold(1, self.window_size, self.window_size)
-        x_windows = x_windows.contiguous().view(B, -1, self.window_size, C)
-
-        # Compute queries, keys, and values
-        Q = self.query(x_windows)
-        K = self.key(x_windows)
-        V = self.value(x_windows)
-        
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.dim ** 0.5)
-        attn = self.softmax(scores)
-        out_windows = torch.matmul(attn, V)
-        
-        # Merge the windows back into a sequence
-        out = out_windows.view(B, -1, C)
-        # Remove the padded tokens if any were added
-        out = out[:, :L, :]
-        out = out.view(B, H, W, C)
-        return out
-
 class RotaryEmbedding3D(nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
@@ -84,7 +40,7 @@ class RotaryEmbedding3D(nn.Module):
         return x_rot.view(-1, self.dim)
 
 class RotaryPositionalEmbedding3D(nn.Module):
-    def __init__(self, hidden_channels, base=10000, window_size=6):
+    def __init__(self, hidden_channels, base=10000):
         super().__init__()
         if hidden_channels % 3 != 0:
             raise ValueError("hidden_channels must be divisible by 3 for 3D rotary embedding")
@@ -95,7 +51,6 @@ class RotaryPositionalEmbedding3D(nn.Module):
         self.rotary_time = RotaryEmbedding3D(self.dim_each, base)   # Time dimension
         self.rotary_mag = RotaryEmbedding3D(self.dim_each, base)    # Magnitude dimension
         self.rotary_phase = RotaryEmbedding3D(self.dim_each, base)  # Phase dimension
-        self.cross_attention = WindowCrossAttention(self.dim_each, window_size)
 
     def forward(self, x):
         B, C, H, W = x.shape  # Assume: H = number of frequency bins, W = number of time steps
@@ -137,46 +92,35 @@ class RotaryPositionalEmbedding3D(nn.Module):
         x_mag_rot = x_mag_rot.view(B, H, W, self.dim_each)
         x_phase_rot = x_phase_rot.view(B, H, W, self.dim_each)
 
-        # Apply cross-attention
-        x_time_rot = self.cross_attention(x_time_rot)
-        x_mag_rot = self.cross_attention(x_mag_rot)
-        x_phase_rot = self.cross_attention(x_phase_rot)
-
         # Concatenate along the channel dimension and permute back to (B, hidden_channels, H, W)
         x_out = torch.cat([x_time_rot, x_mag_rot, x_phase_rot], dim=-1)  # (B, H, W, hidden_channels)
         x_out = x_out.permute(0, 3, 1, 2)
         return x_out
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=84, n_modes=(86, 86), num_layers=2):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=90, n_modes=(90, 90)):
         super(NeuralModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
+        # Add the 3D rotary positional embedding module:
         self.rotary_pos_emb = RotaryPositionalEmbedding3D(hidden_channels)
-        
+
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
                             in_channels=hidden_channels, out_channels=hidden_channels)
-                            
-        self.lstm = nn.LSTM(input_size=hidden_channels, hidden_size=hidden_channels,
-                            num_layers=num_layers, batch_first=True, bidirectional=True)
-                            
-        # Adjust the input channels to the mask predictor
+        
         self.mask_predictor = nn.Sequential(
-            nn.Conv2d(hidden_channels * 2, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
+        # x: shape (B, in_channels, H, W)
         x = self.projection(x)
+        # Apply rotary position embedding
         x = self.rotary_pos_emb(x)
+        # Wrap the operator (FNO) with checkpointing.
         x = checkpoint(self.operator, x, use_reentrant=False)
-        B, C, F, T = x.shape
-        x = x.permute(0, 2, 3, 1)  # now (B, F, T, C)
-        x = x.reshape(B * F, T, C)  # merge batch and frequency dims
-        x, _ = self.lstm(x)  # Process with LSTM
-        x = x.reshape(B, F, T, -1)  # -1 infers the correct size, which is 2*hidden_channels
-        x = x.permute(0, 3, 1, 2)
         mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
         return inst_mask, vocal_mask
@@ -497,7 +441,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=54, n_modes=(86, 86), num_layers=1)
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=84, n_modes=(86, 86))
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
