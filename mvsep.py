@@ -105,7 +105,7 @@ class MUSDBDataset(Dataset):
         self.n_fft = 4096
         self.hop_length = 1024
         self.segment = segment
-        self.train = train  # Add a flag to distinguish between training and inference
+        self.train = train
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
         self.window = torch.hann_window(self.n_fft)
 
@@ -199,15 +199,14 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     model.train()
     for epoch in range(epochs):
         for batch in dataloader:
-            mixture_mag, mixture_phase, instrumental_mag, _, vocal_mag, _ = batch
+            mixture_mag, mixture_phase, vocal_mag, vocal_phase = batch
             mixture_mag = mixture_mag.to(device)
             mixture_phase = mixture_phase.to(device)
-            instrumental_mag = instrumental_mag.to(device)
             vocal_mag = vocal_mag.to(device)
 
             optimizer.zero_grad()
             pred_inst_mask, pred_vocal_mask = model(mixture_mag)
-            loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag, mixture_mag, mixture_phase, window, 4096, 1024)
+            loss = loss_fn(pred_inst_mask, pred_vocal_mask, None, vocal_mag, mixture_mag, mixture_phase, window, 4096, 1024)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             adjust_learning_rate(optimizer, grad_norm, base_lr=args.learning_rate)
