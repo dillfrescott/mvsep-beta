@@ -228,8 +228,8 @@ class MUSDBDataset(Dataset):
                          vocal_mag=vocal_mag, vocal_phase=vocal_phase)
 
     def _process_track(self, track_path):
-        instrumental, _ = torchaudio.load(os.path.join(track_path, 'other.wav'))
-        vocal, _ = torchaudio.load(os.path.join(track_path, 'vocals.wav'))
+        instrumental, _ = torchaudio.load(os.path.join(track_path, 'vocals.wav'))
+        vocal, _ = torchaudio.load(os.path.join(track_path, 'other.wav'))
 
         if instrumental.shape[0] != 2 or vocal.shape[0] != 2:
             raise ValueError("Audio files must have 2 channels.")
@@ -458,14 +458,14 @@ def main():
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
-    parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
+    parser.add_argument('--output_vocal', type=str, default='output_vocals.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
     parser.add_argument('--learning_rate', type=float, default=1e-3, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=84, num_layers=2)
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=90, num_layers=2)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
