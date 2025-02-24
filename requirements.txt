@@ -1,3 +1,4 @@
+cupy-cuda12x
 librosa
 numpy
 torch-log-wmse
