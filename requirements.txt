@@ -1,4 +1,4 @@
 librosa
 numpy
-torch-log-wmse
+prodigyopt
 tqdm
