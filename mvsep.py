@@ -61,7 +61,6 @@ class RotaryPositionalEmbedding3D(nn.Module):
         # For magnitude (H axis)
         pos_mag = torch.arange(H, device=x.device).float().view(1, 1, H, 1)   # (1,1,H,1)
         # For phase, we generate a distinct coordinate grid.
-        # For example, let phase vary from -pi to pi over H bins.
         pos_phase = torch.linspace(-math.pi, math.pi, H, device=x.device).float().view(1, 1, H, 1)
 
         # Bring the channel dimension to the end:
