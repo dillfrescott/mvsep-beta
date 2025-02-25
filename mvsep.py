@@ -163,7 +163,8 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     # ISTFT function for each channel
     def istft_channels(spec):
         return torch.stack([
-            torch.istft(spec[ch], n_fft=n_fft, hop_length=hop_length, window=window)
+            torch.istft(spec[ch], n_fft=n_fft, hop_length=hop_length, window=window, 
+                       win_length=n_fft, return_complex=False)
             for ch in range(spec.shape[0])
         ], dim=0)
 
@@ -509,7 +510,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train a model for instrumental separation')
     parser.add_argument('--train', action='store_true', help='Train the model')
     parser.add_argument('--infer', action='store_true', help='Inference mode')
-    parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
+    parser.add_argument('--data_dir', type=str, default='augmented_train', help='Path to training dataset')
     parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
