@@ -8,7 +8,6 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import numpy as np
-import cupy as cp
 from torch_log_wmse import LogWMSE
 import math
 import glob
@@ -163,8 +162,7 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     # ISTFT function for each channel
     def istft_channels(spec):
         return torch.stack([
-            torch.istft(spec[ch], n_fft=n_fft, hop_length=hop_length, window=window, 
-                       win_length=n_fft, return_complex=False)
+            torch.istft(spec[ch], n_fft=n_fft, hop_length=hop_length, window=window)
             for ch in range(spec.shape[0])
         ], dim=0)
 
@@ -200,8 +198,9 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
 
     return total_loss
 
+# Custom Dataset class
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True, use_gpu=True):
+    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True):
         self.root_dir = root_dir
         self.preprocess_dir = preprocess_dir
         self.sample_rate = sample_rate
@@ -211,35 +210,17 @@ class MUSDBDataset(Dataset):
         self.segment = segment
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
         self.window = torch.hann_window(self.n_fft)
-        self.use_gpu = use_gpu and torch.cuda.is_available()
-        
-        if self.use_gpu:
-            self.device = torch.device('cuda')
-            self.window = self.window.to(self.device)
-        else:
-            self.device = torch.device('cpu')
 
         if self.preprocess_dir:
-            os.makedirs(self.preprocess_dir, exist_ok=True)
             self.preprocess_data()
 
     def preprocess_data(self):
+        os.makedirs(self.preprocess_dir, exist_ok=True)
         for idx, track_path in enumerate(tqdm(self.tracks, desc="Preprocessing data")):
             preprocess_path = os.path.join(self.preprocess_dir, f'track_{idx}.npz')
             if not os.path.exists(preprocess_path):
                 (mixture_mag, mixture_phase, instrumental_mag, instrumental_phase,
                  vocal_mag, vocal_phase, _, _, _) = self._process_track(track_path)
-                
-                # Convert from GPU to CPU if necessary before saving
-                if self.use_gpu:
-                    # Convert CuPy arrays to NumPy for saving
-                    mixture_mag = cp.asnumpy(mixture_mag)
-                    mixture_phase = cp.asnumpy(mixture_phase)
-                    instrumental_mag = cp.asnumpy(instrumental_mag)
-                    instrumental_phase = cp.asnumpy(instrumental_phase)
-                    vocal_mag = cp.asnumpy(vocal_mag)
-                    vocal_phase = cp.asnumpy(vocal_phase)
-                
                 np.savez(preprocess_path, mixture_mag=mixture_mag, mixture_phase=mixture_phase,
                          instrumental_mag=instrumental_mag, instrumental_phase=instrumental_phase,
                          vocal_mag=vocal_mag, vocal_phase=vocal_phase)
@@ -256,20 +237,10 @@ class MUSDBDataset(Dataset):
         vocal = vocal[:, :min_length]
         mixture = instrumental + vocal
 
-        if self.use_gpu:
-            instrumental = instrumental.to(self.device)
-            vocal = vocal.to(self.device)
-            mixture = mixture.to(self.device)
+        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
+        instrumental_spec = torch.stft(instrumental, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
+        vocal_spec = torch.stft(vocal, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
 
-        # Compute STFTs on GPU if enabled
-        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, 
-                                window=self.window, return_complex=True)
-        instrumental_spec = torch.stft(instrumental, n_fft=self.n_fft, hop_length=self.hop_length, 
-                                    window=self.window, return_complex=True)
-        vocal_spec = torch.stft(vocal, n_fft=self.n_fft, hop_length=self.hop_length, 
-                             window=self.window, return_complex=True)
-
-        # Compute magnitude and phase
         mixture_mag = torch.abs(mixture_spec)
         mixture_phase = torch.angle(mixture_spec)
         instrumental_mag = torch.abs(instrumental_spec)
@@ -277,7 +248,6 @@ class MUSDBDataset(Dataset):
         vocal_mag = torch.abs(vocal_spec)
         vocal_phase = torch.angle(vocal_spec)
 
-        # Apply segmentation on GPU if enabled
         if self.segment and self.segment_length:
             if mixture_mag.shape[2] >= self.segment_length // self.hop_length:
                 start = torch.randint(0, mixture_mag.shape[2] - self.segment_length // self.hop_length, (1,))
@@ -296,31 +266,10 @@ class MUSDBDataset(Dataset):
                 vocal_mag = F.pad(vocal_mag, (0, pad_amount))
                 vocal_phase = F.pad(vocal_phase, (0, pad_amount))
 
-        # Convert to CuPy arrays for efficient GPU processing
-        if self.use_gpu:
-            # Convert to CuPy arrays for downstream processing
-            mixture_mag_cp = cp.asarray(mixture_mag.detach().cpu().numpy())
-            mixture_phase_cp = cp.asarray(mixture_phase.detach().cpu().numpy())
-            instrumental_mag_cp = cp.asarray(instrumental_mag.detach().cpu().numpy())
-            instrumental_phase_cp = cp.asarray(instrumental_phase.detach().cpu().numpy())
-            vocal_mag_cp = cp.asarray(vocal_mag.detach().cpu().numpy())
-            vocal_phase_cp = cp.asarray(vocal_phase.detach().cpu().numpy())
-            
-            # Move audio to CPU for return
-            mixture_np = mixture.detach().cpu().numpy()
-            instrumental_np = instrumental.detach().cpu().numpy()
-            vocal_np = vocal.detach().cpu().numpy()
-            
-            return (mixture_mag_cp, mixture_phase_cp,
-                    instrumental_mag_cp, instrumental_phase_cp,
-                    vocal_mag_cp, vocal_phase_cp,
-                    mixture_np, instrumental_np, vocal_np)
-        else:
-            # CPU processing - return as NumPy arrays
-            return (mixture_mag.numpy(), mixture_phase.numpy(),
-                    instrumental_mag.numpy(), instrumental_phase.numpy(),
-                    vocal_mag.numpy(), vocal_phase.numpy(),
-                    mixture.numpy(), instrumental.numpy(), vocal.numpy())
+        return (mixture_mag.numpy(), mixture_phase.numpy(),
+                instrumental_mag.numpy(), instrumental_phase.numpy(),
+                vocal_mag.numpy(), vocal_phase.numpy(),
+                mixture.numpy(), instrumental.numpy(), vocal.numpy())
 
     def __len__(self):
         return len(self.tracks)
@@ -329,48 +278,16 @@ class MUSDBDataset(Dataset):
         if self.preprocess_dir:
             preprocess_path = os.path.join(self.preprocess_dir, f'track_{idx}.npz')
             data = np.load(preprocess_path)
-            
-            # Load data from disk
             mixture_mag = torch.from_numpy(data['mixture_mag'])
             mixture_phase = torch.from_numpy(data['mixture_phase'])
             instrumental_mag = torch.from_numpy(data['instrumental_mag'])
             instrumental_phase = torch.from_numpy(data['instrumental_phase'])
             vocal_mag = torch.from_numpy(data['vocal_mag'])
             vocal_phase = torch.from_numpy(data['vocal_phase'])
-            
-            # Move to GPU if needed (for training)
-            if self.use_gpu:
-                mixture_mag = mixture_mag.to(self.device)
-                mixture_phase = mixture_phase.to(self.device)
-                instrumental_mag = instrumental_mag.to(self.device)
-                instrumental_phase = instrumental_phase.to(self.device)
-                vocal_mag = vocal_mag.to(self.device)
-                vocal_phase = vocal_phase.to(self.device)
-                
             return mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase
         else:
-            # Process track on-the-fly
             track_path = self.tracks[idx]
-            result = self._process_track(track_path)
-            
-            # If using GPU, convert CuPy arrays to PyTorch tensors on GPU
-            if self.use_gpu:
-                mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase = result[:6]
-                return (torch.from_numpy(cp.asnumpy(mixture_mag)).to(self.device),
-                        torch.from_numpy(cp.asnumpy(mixture_phase)).to(self.device),
-                        torch.from_numpy(cp.asnumpy(instrumental_mag)).to(self.device),
-                        torch.from_numpy(cp.asnumpy(instrumental_phase)).to(self.device),
-                        torch.from_numpy(cp.asnumpy(vocal_mag)).to(self.device),
-                        torch.from_numpy(cp.asnumpy(vocal_phase)).to(self.device))
-            else:
-                # Convert NumPy arrays to PyTorch tensors
-                mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase = result[:6]
-                return (torch.from_numpy(mixture_mag),
-                        torch.from_numpy(mixture_phase),
-                        torch.from_numpy(instrumental_mag),
-                        torch.from_numpy(instrumental_phase),
-                        torch.from_numpy(vocal_mag),
-                        torch.from_numpy(vocal_phase))
+            return self._process_track(track_path)
 
 def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
     grad_norm = max(grad_norm, eps)
