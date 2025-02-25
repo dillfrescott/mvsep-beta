@@ -84,7 +84,7 @@ class NeuralModel(nn.Module):
         self.rotary_pos_emb = RotaryPositionalEmbedding3D(hidden_channels)
         self.lstm = nn.LSTM(input_size=hidden_channels, hidden_size=hidden_channels,
                             num_layers=num_layers, batch_first=True)
-        self.mask_predictor = nn.Sequential(
+        self.mag_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, out_channels=4, kernel_size=1),
@@ -99,7 +99,7 @@ class NeuralModel(nn.Module):
         x, _ = self.lstm(x)
         x = x.reshape(B, F, T, C)
         x = x.permute(0, 3, 1, 2)  # Back to (B, C, F, T)
-        magnitudes = self.mask_predictor(x)
+        magnitudes = self.mag_predictor(x)
         inst_mag, vocal_mag = torch.split(magnitudes, 2, dim=1)
         return inst_mag, vocal_mag
 
