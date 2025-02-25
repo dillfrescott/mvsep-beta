@@ -7,20 +7,102 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from neuralop.models import FNO
 import numpy as np
 from torch_log_wmse import LogWMSE
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
+class RotaryEmbedding3D(nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError("dim must be even for rotary embedding")
+        self.dim = dim
+        self.base = base
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, x, pos):
+        # Compute the rotary angles: (N, dim//2)
+        theta = pos.unsqueeze(1) * self.inv_freq.unsqueeze(0)
+        sin, cos = theta.sin(), theta.cos()
+        # Reshape x into pairs: (N, dim//2, 2)
+        x = x.view(-1, self.dim // 2, 2)
+        x1 = x[..., 0]
+        x2 = x[..., 1]
+        # Apply the rotation for each pair
+        x_rotated_0 = x1 * cos - x2 * sin
+        x_rotated_1 = x1 * sin + x2 * cos
+        x_rot = torch.stack([x_rotated_0, x_rotated_1], dim=-1)
+        return x_rot.view(-1, self.dim)
+
+class RotaryPositionalEmbedding3D(nn.Module):
+    def __init__(self, hidden_channels, base=10000):
+        super().__init__()
+        if hidden_channels % 3 != 0:
+            raise ValueError("hidden_channels must be divisible by 3 for 3D rotary embedding")
+        self.hidden_channels = hidden_channels
+        self.dim_each = hidden_channels // 3
+        if self.dim_each % 2 != 0:
+            raise ValueError("hidden_channels/3 must be even for rotary embedding")
+        self.rotary_time = RotaryEmbedding3D(self.dim_each, base)   # Time dimension
+        self.rotary_mag = RotaryEmbedding3D(self.dim_each, base)    # Magnitude dimension
+        self.rotary_phase = RotaryEmbedding3D(self.dim_each, base)  # Phase dimension
+
+    def forward(self, x):
+        B, C, H, W = x.shape  # Assume: H = number of frequency bins, W = number of time steps
+        # Split channels into three parts: time, magnitude, phase
+        x_time, x_mag, x_phase = torch.chunk(x, 3, dim=1)  # each is (B, C/3, H, W)
+
+        # Create coordinate grids for each dimension:
+        # For time (W axis)
+        pos_time = torch.arange(W, device=x.device).float().view(1, 1, 1, W)  # (1,1,1,W)
+        # For magnitude (H axis)
+        pos_mag = torch.arange(H, device=x.device).float().view(1, 1, H, 1)   # (1,1,H,1)
+        # For phase, we generate a distinct coordinate grid.
+        pos_phase = torch.linspace(-math.pi, math.pi, H, device=x.device).float().view(1, 1, H, 1)
+
+        # Bring the channel dimension to the end:
+        # Now each x_* is (B, H, W, dim_each)
+        x_time = x_time.permute(0, 2, 3, 1)
+        x_mag = x_mag.permute(0, 2, 3, 1)
+        x_phase = x_phase.permute(0, 2, 3, 1)
+
+        # Flatten the (B, H, W) dimensions:
+        x_time_flat = x_time.reshape(-1, self.dim_each)
+        x_mag_flat = x_mag.reshape(-1, self.dim_each)
+        x_phase_flat = x_phase.reshape(-1, self.dim_each)
+
+        # Expand and flatten the position tensors to match (B*H*W,)
+        pos_time_flat = pos_time.expand(B, 1, H, W).reshape(-1)
+        pos_mag_flat = pos_mag.expand(B, 1, H, W).reshape(-1)
+        pos_phase_flat = pos_phase.expand(B, 1, H, W).reshape(-1)
+
+        # Apply rotary embedding on each part
+        x_time_rot = self.rotary_time(x_time_flat, pos_time_flat)
+        x_mag_rot = self.rotary_mag(x_mag_flat, pos_mag_flat)
+        x_phase_rot = self.rotary_phase(x_phase_flat, pos_phase_flat)
+
+        # Reshape back to (B, H, W, dim_each)
+        x_time_rot = x_time_rot.view(B, H, W, self.dim_each)
+        x_mag_rot = x_mag_rot.view(B, H, W, self.dim_each)
+        x_phase_rot = x_phase_rot.view(B, H, W, self.dim_each)
+
+        # Concatenate along the channel dimension and permute back to (B, hidden_channels, H, W)
+        x_out = torch.cat([x_time_rot, x_mag_rot, x_phase_rot], dim=-1)  # (B, H, W, hidden_channels)
+        x_out = x_out.permute(0, 3, 1, 2)
+        return x_out
+
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=90, n_modes=(90, 90)):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, num_layers=1):
         super(NeuralModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
-
-        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
-                            in_channels=hidden_channels, out_channels=hidden_channels)
+        
+        self.rotary_pos_emb = RotaryPositionalEmbedding3D(hidden_channels)
+        
+        self.lstm = nn.LSTM(input_size=hidden_channels, hidden_size=hidden_channels,
+                            num_layers=num_layers, batch_first=True)
         
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
@@ -32,8 +114,20 @@ class NeuralModel(nn.Module):
     def forward(self, x):
         # x: shape (B, in_channels, H, W)
         x = self.projection(x)
-        # Wrap the operator (FNO) with checkpointing.
-        x = checkpoint(self.operator, x, use_reentrant=False)
+        
+        x = self.rotary_pos_emb(x)
+        
+        B, C, F, T = x.shape
+        x = x.permute(0, 2, 3, 1)  # now (B, F, T, C)
+        x = x.reshape(B * F, T, C)  # merge batch and frequency dims
+
+        # Wrap the LSTM forward pass using a lambda that returns only the output.
+        x = checkpoint(lambda inp: self.lstm(inp)[0], x, use_reentrant=False)
+        
+        # Reshape back to (B, F, T, C) then permute to (B, C, F, T)
+        x = x.reshape(B, F, T, C)
+        x = x.permute(0, 3, 1, 2)
+        
         mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
         return inst_mask, vocal_mask
@@ -42,48 +136,51 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
             target_inst_mag, target_vocal_mag,
             mixture_mag, mixture_phase,
             window, n_fft, hop_length):
-    # Keep batch dimension intact
-    batch_size = pred_inst_mask.shape[0]
-    
+    # Remove batch dimension (assuming batch_size=1)
+    pred_inst_mask = pred_inst_mask.squeeze(0)  # [channels, F, T]
+    pred_vocal_mask = pred_vocal_mask.squeeze(0)
+    target_inst_mag = target_inst_mag.squeeze(0)
+    target_vocal_mag = target_vocal_mag.squeeze(0)
+    mixture_mag = mixture_mag.squeeze(0)
+    mixture_phase = mixture_phase.squeeze(0)
+
     # Apply masks to mixture magnitude
     pred_inst_mag = mixture_mag * pred_inst_mask
     pred_vocal_mag = mixture_mag * pred_vocal_mask
 
-    # Reconstruct complex spectrograms with batch processing
-    def make_complex(mag, phase):
-        return mag * torch.exp(1j * phase)
+    # Reconstruct complex spectrograms
+    def make_complex(mag):
+        return mag * torch.exp(1j * mixture_phase)
     
-    pred_inst_spec = make_complex(pred_inst_mag, mixture_phase)
-    pred_vocal_spec = make_complex(pred_vocal_mag, mixture_phase)
-    target_inst_spec = make_complex(target_inst_mag, mixture_phase)
-    target_vocal_spec = make_complex(target_vocal_mag, mixture_phase)
-    mixture_spec = make_complex(mixture_mag, mixture_phase)
+    pred_inst_spec = make_complex(pred_inst_mag)
+    pred_vocal_spec = make_complex(pred_vocal_mag)
+    target_inst_spec = make_complex(target_inst_mag)
+    target_vocal_spec = make_complex(target_vocal_mag)
+    mixture_spec = make_complex(mixture_mag)
 
-    # Batch ISTFT function processing each item and channel
-    def batch_istft(spec):
-        batch_audio = []
-        for b in range(batch_size):
-            channels_audio = []
-            for ch in range(spec.shape[1]):
-                audio = torch.istft(
-                    spec[b, ch], 
-                    n_fft=n_fft, 
-                    hop_length=hop_length, 
-                    window=window
-                )
-                channels_audio.append(audio)
-            batch_audio.append(torch.stack(channels_audio, dim=0))
-        return torch.stack(batch_audio, dim=0)  # [batch, channels, time]
+    # ISTFT function for each channel
+    def istft_channels(spec):
+        return torch.stack([
+            torch.istft(spec[ch], n_fft=n_fft, hop_length=hop_length, window=window)
+            for ch in range(spec.shape[0])
+        ], dim=0)
 
     # Convert to time-domain audio
-    pred_inst_audio = batch_istft(pred_inst_spec)  # [batch, channels, time]
-    pred_vocal_audio = batch_istft(pred_vocal_spec)
-    target_inst_audio = batch_istft(target_inst_spec)
-    target_vocal_audio = batch_istft(target_vocal_spec)
-    mixture_audio = batch_istft(mixture_spec)
+    pred_inst_audio = istft_channels(pred_inst_spec)  # [channels, time]
+    pred_vocal_audio = istft_channels(pred_vocal_spec)
+    target_inst_audio = istft_channels(target_inst_spec)
+    target_vocal_audio = istft_channels(target_vocal_spec)
+    mixture_audio = istft_channels(mixture_spec)  # [channels, time]
+
+    # Add batch dimension
+    pred_inst_audio = pred_inst_audio.unsqueeze(0)  # [1, channels, time]
+    pred_vocal_audio = pred_vocal_audio.unsqueeze(0)
+    target_inst_audio = target_inst_audio.unsqueeze(0)
+    target_vocal_audio = target_vocal_audio.unsqueeze(0)
+    mixture_audio = mixture_audio.unsqueeze(0)
 
     # Format for LogWMSE: [batch, stems, channels, time]
-    processed_audio = torch.stack([pred_inst_audio, pred_vocal_audio], dim=1)  # [batch, 2, 2, time]
+    processed_audio = torch.stack([pred_inst_audio, pred_vocal_audio], dim=1)  # [1, 2, 2, time]
     target_audio = torch.stack([target_inst_audio, target_vocal_audio], dim=1)
 
     # Initialize losses
@@ -333,7 +430,7 @@ def main():
     parser.add_argument('--data_dir', type=str, default='augmented_train', help='Path to training dataset')
     parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
@@ -345,7 +442,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=128, n_modes=(64, 64))
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=252, num_layers=3)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
