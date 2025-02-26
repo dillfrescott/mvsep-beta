@@ -9,99 +9,17 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import numpy as np
 from torch_log_wmse import LogWMSE
+import auraloss
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
-
-class RotaryEmbedding3D(nn.Module):
-    def __init__(self, dim, base=10000):
-        super().__init__()
-        if dim % 2 != 0:
-            raise ValueError("dim must be even for rotary embedding")
-        self.dim = dim
-        self.base = base
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-
-    def forward(self, x, pos):
-        # Compute the rotary angles: (N, dim//2)
-        theta = pos.unsqueeze(1) * self.inv_freq.unsqueeze(0)
-        sin, cos = theta.sin(), theta.cos()
-        # Reshape x into pairs: (N, dim//2, 2)
-        x = x.view(-1, self.dim // 2, 2)
-        x1 = x[..., 0]
-        x2 = x[..., 1]
-        # Apply the rotation for each pair
-        x_rotated_0 = x1 * cos - x2 * sin
-        x_rotated_1 = x1 * sin + x2 * cos
-        x_rot = torch.stack([x_rotated_0, x_rotated_1], dim=-1)
-        return x_rot.view(-1, self.dim)
-
-class RotaryPositionalEmbedding3D(nn.Module):
-    def __init__(self, hidden_channels, base=10000):
-        super().__init__()
-        if hidden_channels % 3 != 0:
-            raise ValueError("hidden_channels must be divisible by 3 for 3D rotary embedding")
-        self.hidden_channels = hidden_channels
-        self.dim_each = hidden_channels // 3
-        if self.dim_each % 2 != 0:
-            raise ValueError("hidden_channels/3 must be even for rotary embedding")
-        self.rotary_time = RotaryEmbedding3D(self.dim_each, base)   # Time dimension
-        self.rotary_mag = RotaryEmbedding3D(self.dim_each, base)    # Magnitude dimension
-        self.rotary_phase = RotaryEmbedding3D(self.dim_each, base)  # Phase dimension
-
-    def forward(self, x):
-        B, C, H, W = x.shape  # Assume: H = number of frequency bins, W = number of time steps
-        # Split channels into three parts: time, magnitude, phase
-        x_time, x_mag, x_phase = torch.chunk(x, 3, dim=1)  # each is (B, C/3, H, W)
-
-        # Create coordinate grids for each dimension:
-        # For time (W axis)
-        pos_time = torch.arange(W, device=x.device).float().view(1, 1, 1, W)  # (1,1,1,W)
-        # For magnitude (H axis)
-        pos_mag = torch.arange(H, device=x.device).float().view(1, 1, H, 1)   # (1,1,H,1)
-        # For phase, we generate a distinct coordinate grid.
-        pos_phase = torch.linspace(-math.pi, math.pi, H, device=x.device).float().view(1, 1, H, 1)
-
-        # Bring the channel dimension to the end:
-        # Now each x_* is (B, H, W, dim_each)
-        x_time = x_time.permute(0, 2, 3, 1)
-        x_mag = x_mag.permute(0, 2, 3, 1)
-        x_phase = x_phase.permute(0, 2, 3, 1)
-
-        # Flatten the (B, H, W) dimensions:
-        x_time_flat = x_time.reshape(-1, self.dim_each)
-        x_mag_flat = x_mag.reshape(-1, self.dim_each)
-        x_phase_flat = x_phase.reshape(-1, self.dim_each)
-
-        # Expand and flatten the position tensors to match (B*H*W,)
-        pos_time_flat = pos_time.expand(B, 1, H, W).reshape(-1)
-        pos_mag_flat = pos_mag.expand(B, 1, H, W).reshape(-1)
-        pos_phase_flat = pos_phase.expand(B, 1, H, W).reshape(-1)
-
-        # Apply rotary embedding on each part
-        x_time_rot = self.rotary_time(x_time_flat, pos_time_flat)
-        x_mag_rot = self.rotary_mag(x_mag_flat, pos_mag_flat)
-        x_phase_rot = self.rotary_phase(x_phase_flat, pos_phase_flat)
-
-        # Reshape back to (B, H, W, dim_each)
-        x_time_rot = x_time_rot.view(B, H, W, self.dim_each)
-        x_mag_rot = x_mag_rot.view(B, H, W, self.dim_each)
-        x_phase_rot = x_phase_rot.view(B, H, W, self.dim_each)
-
-        # Concatenate along the channel dimension and permute back to (B, hidden_channels, H, W)
-        x_out = torch.cat([x_time_rot, x_mag_rot, x_phase_rot], dim=-1)  # (B, H, W, hidden_channels)
-        x_out = x_out.permute(0, 3, 1, 2)
-        return x_out
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, num_layers=1):
         super(NeuralModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
         
-        self.rotary_pos_emb = RotaryPositionalEmbedding3D(hidden_channels)
-        
-        self.lstm = nn.LSTM(input_size=hidden_channels, hidden_size=hidden_channels,
+        self.gru = nn.GRU(input_size=hidden_channels, hidden_size=hidden_channels,
                             num_layers=num_layers, batch_first=True)
         
         self.mask_predictor = nn.Sequential(
@@ -114,14 +32,12 @@ class NeuralModel(nn.Module):
     def forward(self, x):
         # x: shape (B, in_channels, H, W)
         x = self.projection(x)
-        x = self.rotary_pos_emb(x)
         
         B, C, F, T = x.shape
         x = x.permute(0, 2, 3, 1)  # now (B, F, T, C)
         x = x.reshape(B * F, T, C)  # merge batch and frequency dims
 
-        # Use checkpointing for the LSTM pass.
-        x = checkpoint(lambda inp: self.lstm(inp)[0], x, use_reentrant=False)
+        x = checkpoint(lambda inp: self.gru(inp)[0], x, use_reentrant=False)
         
         # Reshape back to (B, F, T, C) then permute to (B, C, F, T)
         x = x.reshape(B, F, T, C)
@@ -182,29 +98,24 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     processed_audio = torch.stack([pred_inst_audio, pred_vocal_audio], dim=1)  # [1, 2, 2, time]
     target_audio = torch.stack([target_inst_audio, target_vocal_audio], dim=1)
 
-    # Initialize LogWMSE loss
+    # Initialize losses
     log_wmse = LogWMSE(
-        audio_length=pred_inst_audio.shape[-1] / 44100,
+        audio_length=pred_inst_audio.shape[-1]/44100,
         sample_rate=44100,
         return_as_loss=True,
         bypass_filter=False
     )
+    mrstft = auraloss.freq.MultiResolutionSTFTLoss()
 
-    # Compute LogWMSE loss (primary separation loss)
+    # Compute LogWMSE loss
     logwmse_loss = log_wmse(mixture_audio, processed_audio, target_audio)
-    
-    # Consistency Loss: Force the sum of the separated sources to match the mixture
-    recon_audio = pred_inst_audio + pred_vocal_audio  # [1, channels, time]
-    consistency_loss = F.l1_loss(recon_audio, mixture_audio)
 
-    # Vocal Energy Loss: Force the predicted vocal energy to match the target
-    vocal_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
+    # Compute Multi-Resolution STFT loss
+    mrstft_inst = mrstft(pred_inst_audio, target_inst_audio)
+    mrstft_vocal = mrstft(pred_vocal_audio, target_vocal_audio)
 
-    # Weighting factors (adjust these based on experiments)
-    lambda_consistency = 10.0  # Strong penalty for reconstruction inconsistency
-    lambda_vocal = 10.0        # Strong penalty to ensure vocal energy is matched
-
-    total_loss = logwmse_loss + lambda_consistency * consistency_loss + lambda_vocal * vocal_loss
+    # Combine losses
+    total_loss = logwmse_loss/2 + (mrstft_inst + mrstft_vocal)/2
 
     return total_loss
 
@@ -442,7 +353,7 @@ def main():
     parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
+    parser.add_argument('--checkpoint_steps', type=int, default=1000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
@@ -453,7 +364,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=252, num_layers=3)
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=384, num_layers=2)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
