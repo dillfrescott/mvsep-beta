@@ -26,7 +26,7 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
-            nn.Softmax(dim=1)
+            nn.Sigmoid()
         )
 
     def forward(self, x):
