@@ -21,13 +21,12 @@ class NeuralModel(nn.Module):
         self.patch_size = patch_size
         self.n_fft = n_fft
         self.max_freq = (n_fft // 2 + 1)
-        # Ensure max_freq is divisible by patch_size *and* greater than or equal to n_fft // 2 + 1
-        self.max_freq = max(math.ceil(self.max_freq / patch_size) * patch_size, n_fft // 2 + 1)  # Important fix
+        self.max_freq = max(math.ceil(self.max_freq / patch_size) * patch_size, n_fft // 2 + 1)
         print(f"Using max_freq: {self.max_freq}")
 
         self.lvsm = LVSM(
             dim=hidden_channels,
-            max_image_size=self.max_freq,  # Use self.max_freq consistently
+            max_image_size=self.max_freq,
             patch_size=patch_size,
             channels=3,
             depth=2,
@@ -137,7 +136,7 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     return total_loss
 
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True, n_fft=4096, hop_length=1024):
+    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True, n_fft=4096, hop_length=1024, patch_size=17):  # Add patch_size here
         super().__init__()
         self.root_dir = root_dir
         self.preprocess_dir = preprocess_dir
@@ -148,8 +147,9 @@ class MUSDBDataset(Dataset):
         self.segment = segment
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
         self.window = torch.hann_window(self.n_fft)
+        self.patch_size = patch_size  # Save patch_size
         self.max_freq = (self.n_fft // 2 + 1)
-        self.max_freq = max(math.ceil(self.max_freq / 17) * 17, n_fft//2 + 1)
+        self.max_freq = max(math.ceil(self.max_freq / self.patch_size) * self.patch_size, self.n_fft // 2 + 1)  # Use self.patch_size
 
         if self.preprocess_dir:
             self.preprocess_data()
@@ -414,8 +414,8 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
-    parser.add_argument('--patch_size', type=int, default=17, help='patch size for lvsm')
+    parser.add_argument('--learning_rate', type=float, default=1e-3, help='Learning rate for the optimizer')
+    parser.add_argument('--patch_size', type=int, default=32, help='patch size for lvsm')
     parser.add_argument('--n_fft', type=int, default=4096, help='n_fft for STFT')
     parser.add_argument('--hop_length', type=int, default=1024, help='Hop length for STFT')
     args = parser.parse_args()
@@ -426,8 +426,14 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     if args.train:
-        train_dataset = MUSDBDataset(root_dir=args.data_dir, preprocess_dir=args.preprocess_dir,
-                                     segment_length=args.segment_length, segment=True, n_fft=args.n_fft, hop_length=args.hop_length)
+        train_dataset = MUSDBDataset(
+            root_dir=args.data_dir,
+            preprocess_dir=args.preprocess_dir,
+            segment_length=args.segment_length,
+            n_fft=args.n_fft,
+            hop_length=args.hop_length,
+            patch_size=args.patch_size
+        )
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                       num_workers=16, pin_memory=False, persistent_workers=True)
         total_steps = args.epochs * len(train_dataloader)
