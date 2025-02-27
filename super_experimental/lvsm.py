@@ -115,7 +115,7 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
             output.append(torch.stack(channel_output, dim=0))
         return torch.stack(output, dim=0)
 
-    pred_inst_audio = istft_channels(pred_inst_spec, padded_length)  # Pass padded_length
+    pred_inst_audio = istft_channels(pred_inst_spec, padded_length)
     pred_vocal_audio = istft_channels(pred_vocal_spec, padded_length)
     target_inst_audio = istft_channels(target_inst_spec, padded_length)
     target_vocal_audio = istft_channels(target_vocal_spec, padded_length)
@@ -136,7 +136,7 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     return total_loss
 
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True, n_fft=4096, hop_length=1024, patch_size=17):  # Add patch_size here
+    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True, n_fft=4096, hop_length=1024, patch_size=17):
         super().__init__()
         self.root_dir = root_dir
         self.preprocess_dir = preprocess_dir
@@ -147,9 +147,9 @@ class MUSDBDataset(Dataset):
         self.segment = segment
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
         self.window = torch.hann_window(self.n_fft)
-        self.patch_size = patch_size  # Save patch_size
+        self.patch_size = patch_size
         self.max_freq = (self.n_fft // 2 + 1)
-        self.max_freq = max(math.ceil(self.max_freq / self.patch_size) * self.patch_size, self.n_fft // 2 + 1)  # Use self.patch_size
+        self.max_freq = max(math.ceil(self.max_freq / self.patch_size) * self.patch_size, self.n_fft // 2 + 1)
 
         if self.preprocess_dir:
             self.preprocess_data()
@@ -281,7 +281,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             mixture_mag, mixture_phase, instrumental_mag, _, vocal_mag, _, original_length, padded_length = [b.to(device) for b in batch]
             optimizer.zero_grad()
             pred_inst_mask, pred_vocal_mask = model(mixture_mag)
-            # Pass padded_length to the loss function
+
             loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag, mixture_mag, mixture_phase, window, args.n_fft, args.hop_length, original_length, padded_length)
             loss.backward()
 
@@ -345,12 +345,12 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                 chunk_mag = F.pad(chunk_mag, (0, 0, 0, pad_amount))
                 chunk_phase = F.pad(chunk_phase, (0, 0, 0, pad_amount))
 
-            chunk_mag = chunk_mag.unsqueeze(0).to(device)  # Add batch dimension
+            chunk_mag = chunk_mag.unsqueeze(0).to(device)
             with torch.no_grad():
                 pred_inst_mask, pred_vocal_mask = model(chunk_mag)
             pred_inst_mask = pred_inst_mask.squeeze(0)
             pred_vocal_mask = pred_vocal_mask.squeeze(0)
-            pred_inst_mag = chunk_mag.squeeze(0) * pred_inst_mask  # Now dimensions match
+            pred_inst_mag = chunk_mag.squeeze(0) * pred_inst_mask
             pred_vocal_mag = chunk_mag.squeeze(0) * pred_vocal_mask
 
             pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
