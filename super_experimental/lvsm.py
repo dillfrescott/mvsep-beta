@@ -24,7 +24,6 @@ class NeuralModel(nn.Module):
         self.max_freq = max(math.ceil(self.max_freq / patch_size) * patch_size, n_fft // 2 + 1)
         print(f"Using max_freq: {self.max_freq}")
 
-        # LVSM Transformer
         self.lvsm = LVSM(
             dim=hidden_channels,
             max_image_size=self.max_freq,
@@ -34,13 +33,12 @@ class NeuralModel(nn.Module):
             dropout_input_ray_prob=0.0
         )
 
-        # Replace Conv3d with Conv2d
         self.feature_mapper = nn.Conv2d(3, hidden_channels, kernel_size=1)
 
         self.mask_predictor = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),  # 2D convolution
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, out_channels, kernel_size=1),  # 2D convolution
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
             nn.Sigmoid()
         )
 
