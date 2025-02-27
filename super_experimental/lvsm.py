@@ -29,7 +29,7 @@ class NeuralModel(nn.Module):
             max_image_size=self.max_freq,
             patch_size=patch_size,
             channels=3,
-            depth=2,
+            depth=12,
             dropout_input_ray_prob=0.0
         )
 
