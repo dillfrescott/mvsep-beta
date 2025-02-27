@@ -24,6 +24,7 @@ class NeuralModel(nn.Module):
         self.max_freq = max(math.ceil(self.max_freq / patch_size) * patch_size, n_fft // 2 + 1)
         print(f"Using max_freq: {self.max_freq}")
 
+        # LVSM Transformer
         self.lvsm = LVSM(
             dim=hidden_channels,
             max_image_size=self.max_freq,
@@ -33,46 +34,57 @@ class NeuralModel(nn.Module):
             dropout_input_ray_prob=0.0
         )
 
-        self.feature_mapper = nn.Conv3d(3, hidden_channels, kernel_size=1)
+        # Replace Conv3d with Conv2d
+        self.feature_mapper = nn.Conv2d(3, hidden_channels, kernel_size=1)
 
         self.mask_predictor = nn.Sequential(
-            nn.Conv3d(hidden_channels, hidden_channels, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),  # 2D convolution
             nn.GELU(),
-            nn.Conv3d(hidden_channels, out_channels, kernel_size=1),
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1),  # 2D convolution
             nn.Sigmoid()
         )
-        
+
     def forward(self, x):
         batch_size, channels, freq, time = x.shape
-        original_time = time  # Store the original time
+        original_time = time  # Store the original time dimension
+
+        # Frequency and time padding
         pad_freq = self.max_freq - freq  # Calculate padding based on self.max_freq
         pad_time = (self.patch_size - (time % self.patch_size)) % self.patch_size
         if pad_freq > 0 or pad_time > 0:
-            x = F.pad(x, (0, pad_time, 0, pad_freq))  # Apply padding
+            x = torch.nn.functional.pad(x, (0, pad_time, 0, pad_freq))  # Apply padding
             freq, time = x.shape[2], x.shape[3]
+
+        # Add a dummy channel if input has only 2 channels
         if channels == 2:
             x = torch.cat([x, torch.zeros(batch_size, 1, freq, time, device=x.device)], dim=1)
             channels = 3
 
+        # Create frequency and time coordinates
         freq_coords = torch.linspace(0, 1, freq, device=x.device).view(1, freq, 1).expand(batch_size, freq, time)
         time_coords = torch.linspace(0, 1, time, device=x.device).view(1, 1, time).expand(batch_size, freq, time)
         rays = torch.stack([freq_coords, time_coords], dim=1)
         rays = rays.repeat(1, 3, 1, 1)
 
-        x = x.unsqueeze(1)
-        rays = rays.unsqueeze(1)
+        # Process with LVSM
+        lvsm_out = checkpoint(self.lvsm, input_images=x.unsqueeze(1), input_rays=rays.unsqueeze(1), target_rays=rays.unsqueeze(1), use_reentrant=False)
 
-        lvsm_out = checkpoint(self.lvsm, input_images=x, input_rays=rays, target_rays=rays, use_reentrant=False)
-
+        # Reshape LVSM output for 2D processing
         if lvsm_out.dim() == 4:
             lvsm_out = lvsm_out.unsqueeze(2)
 
         if lvsm_out.size(1) == 1 and lvsm_out.size(2) == 3:
             lvsm_out = lvsm_out.permute(0, 2, 1, 3, 4)
 
+        # Merge patch dimension into channels for 2D convolutions
+        batch_size, _, _, freq, time = lvsm_out.shape
+        lvsm_out = lvsm_out.view(batch_size, -1, freq, time)  # Merge patch dim into channels
+
+        # Feature mapping and mask prediction
         lvsm_feat = self.feature_mapper(lvsm_out)
         mask = self.mask_predictor(lvsm_feat)
-        mask = mask.squeeze(2)
+
+        # Truncate to original time dimension
         mask = mask[..., :original_time]
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
 
