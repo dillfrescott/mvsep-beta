@@ -286,7 +286,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=88200, overlap=44100, device='cpu'):
+              chunk_size=176400, overlap=44100, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
