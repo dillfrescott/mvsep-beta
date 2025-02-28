@@ -339,7 +339,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     hop_length = 1024
     window = torch.hann_window(n_fft).to(device)
 
-    # Calculate the number of chunks based on chunk size and overlap
+    # Calculate the number of chunks
     num_chunks = (total_length - overlap + (chunk_size - overlap) - 1) // (chunk_size - overlap)
 
     # Lists to store instrumental and vocal chunks
@@ -358,35 +358,38 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
 
             # Compute STFT of the current chunk
             chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+            mixture_phase = torch.angle(chunk_spec)
+            mixture_mag = torch.abs(chunk_spec)
 
             # Stack real and imaginary parts along the channel dimension
             chunk_spec_stacked = torch.cat([chunk_spec.real, chunk_spec.imag], dim=0)
-
-            # Add a batch dimension before passing to the model
-            chunk_spec_stacked = chunk_spec_stacked.unsqueeze(0)  # Shape: (1, 4, F, T)
+            chunk_spec_stacked = chunk_spec_stacked.unsqueeze(0)
 
             # Predict instrumental and vocal spectrograms
             instrumental_spec, vocal_spec = model.sample(chunk_spec_stacked)
-            instrumental_spec = instrumental_spec.squeeze(0)  # Remove batch dim
-            vocal_spec = vocal_spec.squeeze(0)                # Remove batch dim
+            instrumental_spec = instrumental_spec.squeeze(0)
+            vocal_spec = vocal_spec.squeeze(0)
 
-            # Separate real and imaginary parts for instrumental and vocal
-            inst_real = instrumental_spec[:2]  # Real parts for left/right channels
-            inst_imag = instrumental_spec[2:]  # Imaginary parts for left/right channels
+            # Separate real and imaginary parts
+            inst_real = instrumental_spec[:2]
+            inst_imag = instrumental_spec[2:]
             vocal_real = vocal_spec[:2]
             vocal_imag = vocal_spec[2:]
+            
+            # Reconstruct complex spectrograms (magnitudes only, for now)
+            pred_inst_mag = torch.abs(torch.complex(inst_real, inst_imag))
+            pred_vocal_mag = torch.abs(torch.complex(vocal_real, vocal_imag))
 
-            # Reconstruct complex spectrograms
-            pred_inst_spec = torch.complex(inst_real, inst_imag)  # Shape: (2, F, T)
-            pred_vocal_spec = torch.complex(vocal_real, vocal_imag)  # Shape: (2, F, T)
+            # Normalize predicted magnitudes relative to the mixture magnitude
+            magnitude_sum = pred_inst_mag + pred_vocal_mag
+            epsilon = 1e-8  # Small constant to prevent division by zero
+            pred_inst_mag = pred_inst_mag / (magnitude_sum + epsilon) * mixture_mag
+            pred_vocal_mag = pred_vocal_mag / (magnitude_sum + epsilon) * mixture_mag
 
-            # Phase-aware reconstruction using the mixture phase
-            mixture_phase = torch.angle(chunk_spec)  # Extract phase from the mixture
-            pred_inst_mag = torch.abs(pred_inst_spec)  # Magnitude of predicted instrumental
-            pred_vocal_mag = torch.abs(pred_vocal_spec)  # Magnitude of predicted vocal
 
-            pred_inst_spec = pred_inst_mag * torch.exp(1j * mixture_phase)  # Reconstruct with mixture phase
-            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)  # Reconstruct with mixture phase
+            # Reconstruct complex spectrograms with mixture phase
+            pred_inst_spec = pred_inst_mag * torch.exp(1j * mixture_phase)
+            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)
 
             # Convert back to time domain
             inst_chunk = torch.stack([
@@ -398,7 +401,6 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                 for ch in range(pred_vocal_spec.shape[0])
             ], dim=0)
 
-            # Append the processed chunks to the respective lists
             instrumentals.append(inst_chunk)
             vocals.append(vocal_chunk)
 
@@ -411,11 +413,9 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
         end = start + inst_chunk.shape[1]
 
         if i == 0:
-            # For the first chunk, directly assign
             output_instrumental[:, start:end] = inst_chunk
             output_vocal[:, start:end] = vocal_chunk
         else:
-            # Apply cross-fade for overlapping regions
             cross_fade_length = overlap // 2
             fade_in = torch.linspace(0, 1, cross_fade_length, device=device)
             fade_out = torch.linspace(1, 0, cross_fade_length, device=device)
@@ -430,22 +430,19 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
 
             output_instrumental[:, start + cross_fade_length:end] = inst_chunk[:, cross_fade_length:]
             output_vocal[:, start + cross_fade_length:end] = vocal_chunk[:, cross_fade_length:]
-
-    # Apply fade-in and fade-out to the entire output
+    
     fade_length = 4410
     fade_in = torch.linspace(0, 1, fade_length, device=device)
     fade_out = torch.linspace(1, 0, fade_length, device=device)
-
+    
     output_instrumental[:, :fade_length] *= fade_in
     output_instrumental[:, -fade_length:] *= fade_out
     output_vocal[:, :fade_length] *= fade_in
     output_vocal[:, -fade_length:] *= fade_out
 
-    # Clamp outputs to [-1, 1] to avoid clipping
     output_instrumental = torch.clamp(output_instrumental, -1.0, 1.0)
     output_vocal = torch.clamp(output_vocal, -1.0, 1.0)
 
-    # Save the separated instrumental and vocal tracks
     torchaudio.save(output_instrumental_path, output_instrumental.cpu(), sr)
     torchaudio.save(output_vocal_path, output_vocal.cpu(), sr)
 
