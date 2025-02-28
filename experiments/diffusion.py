@@ -287,11 +287,13 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
               chunk_size=176400, overlap=44100, device='cpu'):
+    # Load model checkpoint
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
     model.to(device)
 
+    # Load input audio
     input_audio, sr = torchaudio.load(input_wav_path)
     if input_audio.shape[0] != 2:
         raise ValueError("Input audio must have 2 channels.")
@@ -302,7 +304,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     n_fft = 4096
     hop_length = 1024
     window = torch.hann_window(n_fft).to(device)
-    num_chunks = (total_length - overlap + (chunk_size - overlap) -1) // (chunk_size - overlap)
+    num_chunks = (total_length - overlap + (chunk_size - overlap) - 1) // (chunk_size - overlap)
 
     # Lists to store instrumental and vocal audio chunks
     instrumentals = []
@@ -320,10 +322,10 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
             chunk_mag = torch.abs(chunk_spec).unsqueeze(0)
             chunk_phase = torch.angle(chunk_spec)
+
             # Sample from the diffusion model
             sampled_mags = model.sample(chunk_mag.shape).squeeze(0)  # [4, H, W]
-            #Separate in inst and vocal mags
-            pred_inst_mag, pred_vocal_mag = torch.split(sampled_mags, sampled_mags.shape[0]//2, dim=0)
+            pred_inst_mag, pred_vocal_mag = torch.split(sampled_mags, sampled_mags.shape[0] // 2, dim=0)
 
             # Reconstruct complex spectrogram using predicted magnitudes and original phase
             pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
@@ -350,30 +352,43 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
         start = i * (chunk_size - overlap)
         end = start + inst_chunk.shape[1]  # Use the actual chunk length
 
-        if i == 0: #first chunk
+        if i == 0:  # First chunk
             output_instrumental[:, start:end] = inst_chunk
             output_vocal[:, start:end] = vocal_chunk
         else:
-          # Cross-fade
-          cross_fade_length = overlap //2
-          fade_in = torch.linspace(0, 1, cross_fade_length, device=device)
-          fade_out = torch.linspace(1, 0, cross_fade_length, device=device)
+            # Cross-fade
+            cross_fade_length = overlap // 2
+            fade_in = torch.linspace(0, 1, cross_fade_length, device=device)
+            fade_out = torch.linspace(1, 0, cross_fade_length, device=device)
 
-          # Apply cross-fade to overlapping region in the chunks
-          inst_chunk[:, :cross_fade_length] *= fade_in
-          vocal_chunk[:, :cross_fade_length] *= fade_in
+            # Apply cross-fade to overlapping region in the chunks
+            inst_chunk[:, :cross_fade_length] *= fade_in
+            vocal_chunk[:, :cross_fade_length] *= fade_in
 
-          # Apply cross-fade to overlapping region in the output
-          output_instrumental[:, start:start + cross_fade_length] *= fade_out
-          output_vocal[:, start:start + cross_fade_length] *= fade_out
+            # Apply cross-fade to overlapping region in the output
+            output_instrumental[:, start:start + cross_fade_length] *= fade_out
+            output_vocal[:, start:start + cross_fade_length] *= fade_out
 
-          # Add the cross-faded regions
-          output_instrumental[:, start:start + cross_fade_length] += inst_chunk[:, :cross_fade_length]
-          output_vocal[:, start:start + cross_fade_length] += vocal_chunk[:, :cross_fade_length]
+            # Add the cross-faded regions
+            output_instrumental[:, start:start + cross_fade_length] += inst_chunk[:, :cross_fade_length]
+            output_vocal[:, start:start + cross_fade_length] += vocal_chunk[:, :cross_fade_length]
 
-          # Add non-overlaping region
-          output_instrumental[:, start+cross_fade_length:end] = inst_chunk[:, cross_fade_length:]
-          output_vocal[:, start+cross_fade_length:end] = vocal_chunk[:, cross_fade_length:]
+            # Add non-overlapping region
+            output_instrumental[:, start + cross_fade_length:end] = inst_chunk[:, cross_fade_length:]
+            output_vocal[:, start + cross_fade_length:end] = vocal_chunk[:, cross_fade_length:]
+
+    # Apply global fade-in and fade-out to smooth edges
+    fade_length = 4410  # 0.1 seconds at 44.1kHz
+    fade_in = torch.linspace(0, 1, fade_length, device=device)
+    fade_out = torch.linspace(1, 0, fade_length, device=device)
+
+    # Apply to instrumental
+    output_instrumental[:, :fade_length] *= fade_in
+    output_instrumental[:, -fade_length:] *= fade_out
+
+    # Apply to vocal
+    output_vocal[:, :fade_length] *= fade_in
+    output_vocal[:, -fade_length:] *= fade_out
 
     # Clamp and save
     output_instrumental = torch.clamp(output_instrumental, -1.0, 1.0)
