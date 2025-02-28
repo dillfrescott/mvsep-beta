@@ -22,7 +22,7 @@ class DiffusionModel(nn.Module):
         self.projection = nn.Conv2d(in_channels + hidden_channels, hidden_channels, kernel_size=1)
 
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
-                            in_channels=hidden_channels, out_channels=hidden_channels, use_complex=False) # Set to False
+                            in_channels=hidden_channels, out_channels=hidden_channels, use_complex=False)
 
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
