@@ -15,7 +15,7 @@ from torch.utils.checkpoint import checkpoint
 import random
 
 class DiffusionModel(nn.Module):
-    def __init__(self, in_channels=4, out_channels=4, hidden_channels=84, n_modes=(86, 86), T=1000, beta_start=1e-4, beta_end=0.02, window=None):
+    def __init__(self, in_channels=4, out_channels=4, hidden_channels=84, n_modes=(86, 86), T=10, beta_start=1e-4, beta_end=0.02, window=None):
         super(DiffusionModel, self).__init__()
         self.window = window
         self.hidden_channels = hidden_channels
