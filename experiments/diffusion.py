@@ -386,7 +386,6 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             pred_inst_mag = pred_inst_mag / (magnitude_sum + epsilon) * mixture_mag
             pred_vocal_mag = pred_vocal_mag / (magnitude_sum + epsilon) * mixture_mag
 
-
             # Reconstruct complex spectrograms with mixture phase
             pred_inst_spec = pred_inst_mag * torch.exp(1j * mixture_phase)
             pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)
@@ -404,41 +403,14 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             instrumentals.append(inst_chunk)
             vocals.append(vocal_chunk)
 
-    # Combine chunks with cross-fade
     output_instrumental = torch.zeros_like(input_audio)
     output_vocal = torch.zeros_like(input_audio)
 
     for i, (inst_chunk, vocal_chunk) in enumerate(zip(instrumentals, vocals)):
         start = i * (chunk_size - overlap)
         end = start + inst_chunk.shape[1]
-
-        if i == 0:
-            output_instrumental[:, start:end] = inst_chunk
-            output_vocal[:, start:end] = vocal_chunk
-        else:
-            cross_fade_length = overlap // 2
-            fade_in = torch.linspace(0, 1, cross_fade_length, device=device)
-            fade_out = torch.linspace(1, 0, cross_fade_length, device=device)
-
-            inst_chunk[:, :cross_fade_length] *= fade_in
-            vocal_chunk[:, :cross_fade_length] *= fade_in
-            output_instrumental[:, start:start + cross_fade_length] *= fade_out
-            output_vocal[:, start:start + cross_fade_length] *= fade_out
-
-            output_instrumental[:, start:start + cross_fade_length] += inst_chunk[:, :cross_fade_length]
-            output_vocal[:, start:start + cross_fade_length] += vocal_chunk[:, :cross_fade_length]
-
-            output_instrumental[:, start + cross_fade_length:end] = inst_chunk[:, cross_fade_length:]
-            output_vocal[:, start + cross_fade_length:end] = vocal_chunk[:, cross_fade_length:]
-    
-    fade_length = 4410
-    fade_in = torch.linspace(0, 1, fade_length, device=device)
-    fade_out = torch.linspace(1, 0, fade_length, device=device)
-    
-    output_instrumental[:, :fade_length] *= fade_in
-    output_instrumental[:, -fade_length:] *= fade_out
-    output_vocal[:, :fade_length] *= fade_in
-    output_vocal[:, -fade_length:] *= fade_out
+        output_instrumental[:, start:end] = inst_chunk
+        output_vocal[:, start:end] = vocal_chunk
 
     output_instrumental = torch.clamp(output_instrumental, -1.0, 1.0)
     output_vocal = torch.clamp(output_vocal, -1.0, 1.0)
