@@ -15,7 +15,7 @@ from torch.utils.checkpoint import checkpoint
 import random
 
 class DiffusionModel(nn.Module):
-    def __init__(self, in_channels=4, out_channels=4, hidden_channels=84, n_modes=(86, 86), T=10, beta_start=1e-4, beta_end=0.02, window=None):
+    def __init__(self, in_channels=4, out_channels=4, hidden_channels=84, n_modes=(86, 86), T=1000, beta_start=1e-4, beta_end=0.02, window=None):
         super(DiffusionModel, self).__init__()
         self.window = window
         self.hidden_channels = hidden_channels
@@ -319,6 +319,17 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                         os.remove(oldest_checkpoint)
     progress_bar.close()
 
+def update_diffusion_schedule(model, new_T):
+    model.T = new_T
+    model.betas = model.linear_beta_schedule(new_T)
+    model.alphas = 1. - model.betas
+    model.alphas_cumprod = torch.cumprod(model.alphas, axis=0)
+    model.alphas_cumprod_prev = F.pad(model.alphas_cumprod[:-1], (1, 0), value=1.0)
+    model.sqrt_recip_alphas = torch.sqrt(1.0 / model.alphas)
+    model.sqrt_alphas_cumprod = torch.sqrt(model.alphas_cumprod)
+    model.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - model.alphas_cumprod)
+    model.posterior_variance = model.betas * (1. - model.alphas_cumprod_prev) / (1. - model.alphas_cumprod)
+
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
               chunk_size=176400, overlap=44100, device='cpu'):
     # Load the checkpoint and prepare the model for inference
@@ -326,6 +337,9 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
     model.to(device)
+    
+    # Update the diffusion schedule for inference (T=10)
+    update_diffusion_schedule(model, new_T=10)
 
     # Load the input audio file
     input_audio, sr = torchaudio.load(input_wav_path)
@@ -365,7 +379,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             chunk_spec_stacked = torch.cat([chunk_spec.real, chunk_spec.imag], dim=0)
             chunk_spec_stacked = chunk_spec_stacked.unsqueeze(0)
 
-            # Predict instrumental and vocal spectrograms
+            # Predict instrumental and vocal spectrograms using the diffusion model
             instrumental_spec, vocal_spec = model.sample(chunk_spec_stacked)
             instrumental_spec = instrumental_spec.squeeze(0)
             vocal_spec = vocal_spec.squeeze(0)
