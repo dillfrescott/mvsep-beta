@@ -104,7 +104,6 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
 
     return total_loss
 
-# Custom Dataset class
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True):
         self.root_dir = root_dir
