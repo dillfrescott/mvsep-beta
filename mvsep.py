@@ -100,7 +100,7 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
 
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, 
-                 segment_length=485100, segment=True, preprocess_workers=1):
+                 segment_length=485100, segment=True, preprocess_workers=32):
         self.root_dir = root_dir
         self.preprocess_dir = preprocess_dir
         self.sample_rate = sample_rate
@@ -117,10 +117,6 @@ class MUSDBDataset(Dataset):
 
     @staticmethod
     def process_and_save_track(args):
-        """
-        Helper function for processing a single track and saving preprocessed data.
-        This is defined as a static method so it can be pickled for multiprocessing.
-        """
         idx, track_path, preprocess_path, n_fft, hop_length, segment, segment_length = args
         window = torch.hann_window(n_fft)
 
@@ -181,7 +177,6 @@ class MUSDBDataset(Dataset):
         return preprocess_path
 
     def preprocess_data(self):
-        """Preprocess all tracks using multiple workers if specified."""
         os.makedirs(self.preprocess_dir, exist_ok=True)
         tasks = []
         # Build a list of tasks for tracks that haven't been preprocessed yet.
@@ -364,7 +359,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train a model for instrumental separation')
     parser.add_argument('--train', action='store_true', help='Train the model')
     parser.add_argument('--infer', action='store_true', help='Inference mode')
-    parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
+    parser.add_argument('--data_dir', type=str, default='new', help='Path to training dataset')
     parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
@@ -384,7 +379,7 @@ def main():
 
     if args.train:
         train_dataset = MUSDBDataset(root_dir=args.data_dir, preprocess_dir=args.preprocess_dir,
-                                     segment_length=args.segment_length, segment=True)
+                                     segment_length=args.segment_length, segment=True, preprocess_workers=4)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                       num_workers=32, pin_memory=False, persistent_workers=True)
         total_steps = args.epochs * len(train_dataloader)
