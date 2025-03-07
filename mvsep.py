@@ -12,6 +12,7 @@ from torch.amp import autocast, GradScaler
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
+from multiprocessing import Pool
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, num_layers=1):
@@ -98,7 +99,8 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     return total_loss
 
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True):
+    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, 
+                 segment_length=485100, segment=True, preprocess_workers=1):
         self.root_dir = root_dir
         self.preprocess_dir = preprocess_dir
         self.sample_rate = sample_rate
@@ -106,39 +108,41 @@ class MUSDBDataset(Dataset):
         self.n_fft = 4096
         self.hop_length = 1024
         self.segment = segment
+        self.preprocess_workers = preprocess_workers
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
         self.window = torch.hann_window(self.n_fft)
 
         if self.preprocess_dir:
             self.preprocess_data()
 
-    def preprocess_data(self):
-        os.makedirs(self.preprocess_dir, exist_ok=True)
-        for idx, track_path in enumerate(tqdm(self.tracks, desc="Preprocessing data")):
-            preprocess_path = os.path.join(self.preprocess_dir, f'track_{idx}.npz')
-            if not os.path.exists(preprocess_path):
-                (mixture_mag, mixture_phase, instrumental_mag, instrumental_phase,
-                 vocal_mag, vocal_phase, _, _, _) = self._process_track(track_path)
-                np.savez(preprocess_path, mixture_mag=mixture_mag, mixture_phase=mixture_phase,
-                         instrumental_mag=instrumental_mag, instrumental_phase=instrumental_phase,
-                         vocal_mag=vocal_mag, vocal_phase=vocal_phase)
+    @staticmethod
+    def process_and_save_track(args):
+        """
+        Helper function for processing a single track and saving preprocessed data.
+        This is defined as a static method so it can be pickled for multiprocessing.
+        """
+        idx, track_path, preprocess_path, n_fft, hop_length, segment, segment_length = args
+        window = torch.hann_window(n_fft)
 
-    def _process_track(self, track_path):
-        instrumental, _ = torchaudio.load(os.path.join(track_path, 'other.wav'))
-        vocal, _ = torchaudio.load(os.path.join(track_path, 'vocals.wav'))
+        # Load the two audio files
+        instrumental, _ = torchaudio.load(os.path.join(track_path, 'other.flac'))
+        vocal, _ = torchaudio.load(os.path.join(track_path, 'vocals.flac'))
 
         if instrumental.shape[0] != 2 or vocal.shape[0] != 2:
             raise ValueError("Audio files must have 2 channels.")
 
+        # Ensure both sources have the same length
         min_length = min(instrumental.shape[1], vocal.shape[1])
         instrumental = instrumental[:, :min_length]
         vocal = vocal[:, :min_length]
         mixture = instrumental + vocal
 
-        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
-        instrumental_spec = torch.stft(instrumental, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
-        vocal_spec = torch.stft(vocal, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
+        # Compute STFTs
+        mixture_spec = torch.stft(mixture, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+        instrumental_spec = torch.stft(instrumental, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+        vocal_spec = torch.stft(vocal, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
 
+        # Magnitude and phase extraction
         mixture_mag = torch.abs(mixture_spec)
         mixture_phase = torch.angle(mixture_spec)
         instrumental_mag = torch.abs(instrumental_spec)
@@ -146,17 +150,19 @@ class MUSDBDataset(Dataset):
         vocal_mag = torch.abs(vocal_spec)
         vocal_phase = torch.angle(vocal_spec)
 
-        if self.segment and self.segment_length:
-            if mixture_mag.shape[2] >= self.segment_length // self.hop_length:
-                start = torch.randint(0, mixture_mag.shape[2] - self.segment_length // self.hop_length, (1,))
-                mixture_mag = mixture_mag[:, :, start:start + self.segment_length // self.hop_length]
-                mixture_phase = mixture_phase[:, :, start:start + self.segment_length // self.hop_length]
-                instrumental_mag = instrumental_mag[:, :, start:start + self.segment_length // self.hop_length]
-                instrumental_phase = instrumental_phase[:, :, start:start + self.segment_length // self.hop_length]
-                vocal_mag = vocal_mag[:, :, start:start + self.segment_length // self.hop_length]
-                vocal_phase = vocal_phase[:, :, start:start + self.segment_length // self.hop_length]
+        # Segment or pad if needed
+        if segment and segment_length:
+            required_frames = segment_length // hop_length
+            if mixture_mag.shape[2] >= required_frames:
+                start = torch.randint(0, mixture_mag.shape[2] - required_frames, (1,)).item()
+                mixture_mag = mixture_mag[:, :, start:start + required_frames]
+                mixture_phase = mixture_phase[:, :, start:start + required_frames]
+                instrumental_mag = instrumental_mag[:, :, start:start + required_frames]
+                instrumental_phase = instrumental_phase[:, :, start:start + required_frames]
+                vocal_mag = vocal_mag[:, :, start:start + required_frames]
+                vocal_phase = vocal_phase[:, :, start:start + required_frames]
             else:
-                pad_amount = self.segment_length // self.hop_length - mixture_mag.shape[2]
+                pad_amount = required_frames - mixture_mag.shape[2]
                 mixture_mag = F.pad(mixture_mag, (0, pad_amount))
                 mixture_phase = F.pad(mixture_phase, (0, pad_amount))
                 instrumental_mag = F.pad(instrumental_mag, (0, pad_amount))
@@ -164,10 +170,34 @@ class MUSDBDataset(Dataset):
                 vocal_mag = F.pad(vocal_mag, (0, pad_amount))
                 vocal_phase = F.pad(vocal_phase, (0, pad_amount))
 
-        return (mixture_mag.numpy(), mixture_phase.numpy(),
-                instrumental_mag.numpy(), instrumental_phase.numpy(),
-                vocal_mag.numpy(), vocal_phase.numpy(),
-                mixture.numpy(), instrumental.numpy(), vocal.numpy())
+        # Save the preprocessed data as a .npz file
+        np.savez(preprocess_path,
+                 mixture_mag=mixture_mag.numpy(),
+                 mixture_phase=mixture_phase.numpy(),
+                 instrumental_mag=instrumental_mag.numpy(),
+                 instrumental_phase=instrumental_phase.numpy(),
+                 vocal_mag=vocal_mag.numpy(),
+                 vocal_phase=vocal_phase.numpy())
+        return preprocess_path
+
+    def preprocess_data(self):
+        """Preprocess all tracks using multiple workers if specified."""
+        os.makedirs(self.preprocess_dir, exist_ok=True)
+        tasks = []
+        # Build a list of tasks for tracks that haven't been preprocessed yet.
+        for idx, track_path in enumerate(self.tracks):
+            preprocess_path = os.path.join(self.preprocess_dir, f'track_{idx}.npz')
+            if not os.path.exists(preprocess_path):
+                tasks.append((idx, track_path, preprocess_path, self.n_fft, self.hop_length, self.segment, self.segment_length))
+        if tasks:
+            if self.preprocess_workers > 1:
+                with Pool(processes=self.preprocess_workers) as pool:
+                    for _ in tqdm(pool.imap_unordered(MUSDBDataset.process_and_save_track, tasks),
+                                  total=len(tasks), desc="Preprocessing data"):
+                        pass
+            else:
+                for args in tqdm(tasks, total=len(tasks), desc="Preprocessing data"):
+                    MUSDBDataset.process_and_save_track(args)
 
     def __len__(self):
         return len(self.tracks)
@@ -184,8 +214,7 @@ class MUSDBDataset(Dataset):
             vocal_phase = torch.from_numpy(data['vocal_phase'])
             return mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase
         else:
-            track_path = self.tracks[idx]
-            return self._process_track(track_path)
+            raise NotImplementedError("On-the-fly processing is not implemented")
 
 def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
     model.to(device)
@@ -357,7 +386,7 @@ def main():
         train_dataset = MUSDBDataset(root_dir=args.data_dir, preprocess_dir=args.preprocess_dir,
                                      segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                      num_workers=16, pin_memory=False, persistent_workers=True)
+                                      num_workers=32, pin_memory=False, persistent_workers=True)
         total_steps = args.epochs * len(train_dataloader)
         train(model, train_dataloader, optimizer, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
