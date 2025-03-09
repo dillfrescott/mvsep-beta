@@ -8,18 +8,18 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import numpy as np
-from torch.amp import autocast, GradScaler
+from neuralop.models import FNO
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, num_layers=1):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=90, n_modes=(90, 90)):
         super(NeuralModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
-        
-        self.gru = nn.GRU(input_size=hidden_channels, hidden_size=hidden_channels,
-                            num_layers=num_layers, batch_first=True)
+
+        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
+                            in_channels=hidden_channels, out_channels=hidden_channels)
         
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
@@ -29,19 +29,8 @@ class NeuralModel(nn.Module):
         )
 
     def forward(self, x):
-        # x: shape (B, in_channels, H, W)
         x = self.projection(x)
-        
-        B, C, F, T = x.shape
-        x = x.permute(0, 2, 3, 1)  # now (B, F, T, C)
-        x = x.reshape(B * F, T, C)  # merge batch and frequency dims
-
-        x = checkpoint(lambda inp: self.gru(inp)[0], x, use_reentrant=False)
-        
-        # Reshape back to (B, F, T, C) then permute to (B, C, F, T)
-        x = x.reshape(B, F, T, C)
-        x = x.permute(0, 3, 1, 2)
-        
+        x = checkpoint(self.operator, x, use_reentrant=False)
         mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
         return inst_mask, vocal_mask
@@ -193,15 +182,10 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     avg_loss = 0.0
     checkpoint_files = []
 
-    use_amp = device.type == 'cuda'
-    scaler = GradScaler(enabled=use_amp)
-
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
-        if use_amp and 'scaler_state_dict' in checkpoint_data:
-            scaler.load_state_dict(checkpoint_data['scaler_state_dict'])
         step = checkpoint_data['step']
         avg_loss = checkpoint_data['avg_loss']
         print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
@@ -219,21 +203,14 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
             instrumental_mag = instrumental_mag.to(device)
             vocal_mag = vocal_mag.to(device)
 
-            with autocast(device_type='cuda', enabled=use_amp):
-                pred_inst_mask, pred_vocal_mask = model(mixture_mag)
-                loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag,
-                               mixture_mag, mixture_phase, window, 4096, 1024)
+            # Forward pass without mixed precision
+            pred_inst_mask, pred_vocal_mask = model(mixture_mag)
+            loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag,
+                           mixture_mag, mixture_phase, window, 4096, 1024)
 
-            if use_amp:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)  # Unscale before clipping
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
             if torch.isnan(loss).any():
                 raise ValueError("Loss is NaN!")  # Good practice
@@ -251,7 +228,6 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
-                    'scaler_state_dict': scaler.state_dict() if use_amp else None  # Conditionally save
                 }
                 torch.save(checkpoint_data, checkpoint_filename)
                 checkpoint_files.append(checkpoint_filename)
@@ -344,13 +320,13 @@ def main():
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=88200, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
     parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=512, num_layers=6)
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=84, n_modes=(86, 86))
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     if args.train:
