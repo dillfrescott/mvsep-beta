@@ -183,7 +183,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     checkpoint_files = []
 
     if checkpoint_path:
-        checkpoint_data = torch.load(checkpoint_path, map_location=device)
+        checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
         step = checkpoint_data['step']
