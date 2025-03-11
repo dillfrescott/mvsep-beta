@@ -8,21 +8,19 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from neuralop.models import FNO
+from torch_log_wmse import LogWMSE
 import numpy as np
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16), num_layers=1):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16)):
         super(NeuralModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
         
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
                             in_channels=hidden_channels, out_channels=hidden_channels)
-        
-        self.lstm = nn.LSTM(input_size=hidden_channels, hidden_size=hidden_channels,
-                            num_layers=num_layers, batch_first=True)
         
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
@@ -36,64 +34,63 @@ class NeuralModel(nn.Module):
         
         x = checkpoint(self.operator, x, use_reentrant=False)
         
-        B, C, F, T = x.shape
-        x = x.permute(0, 2, 3, 1)  # now (B, F, T, C)
-        x = x.reshape(B * F, T, C)  # merge batch and frequency dims
-
-        # Wrap the LSTM forward pass using a lambda that returns only the output.
-        x = checkpoint(lambda inp: self.lstm(inp)[0], x, use_reentrant=False)
-        
-        # Reshape back to (B, F, T, C) then permute to (B, C, F, T)
-        x = x.reshape(B, F, T, C)
-        x = x.permute(0, 3, 1, 2)
-        
         mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
         return inst_mask, vocal_mask
 
-def loss_fn(pred_inst_mask, pred_vocal_mask, target_inst_mag, target_vocal_mag, mixture_mag, mixture_phase, window, n_fft, hop_length):
-    # Ensure the input tensors have the correct shape
-    pred_inst_mask = pred_inst_mask.squeeze(0)
-    pred_vocal_mask = pred_vocal_mask.squeeze(0)
-    target_inst_mag = target_inst_mag.squeeze(0)
-    target_vocal_mag = target_vocal_mag.squeeze(0)
-    mixture_mag = mixture_mag.squeeze(0)
-    mixture_phase = mixture_phase.squeeze(0)
+def loss_fn(pred_inst_mask, pred_vocal_mask,
+            target_inst_mag, target_vocal_mag,
+            mixture_mag, mixture_phase,
+            window, n_fft, hop_length):
+    # Apply masks to mixture magnitude (batch dimension retained)
+    pred_inst_mag = mixture_mag * pred_inst_mask  # [B, 2, F, T]
+    pred_vocal_mag = mixture_mag * pred_vocal_mask  # [B, 2, F, T]
 
-    # Apply the masks to the mixture magnitude
-    pred_inst_mag = mixture_mag * pred_inst_mask
-    pred_vocal_mag = mixture_mag * pred_vocal_mask
+    # Reconstruct complex spectrograms
+    def make_complex(mag):
+        return mag * torch.exp(1j * mixture_phase)
+    
+    pred_inst_spec = make_complex(pred_inst_mag)
+    pred_vocal_spec = make_complex(pred_vocal_mag)
+    target_inst_spec = make_complex(target_inst_mag)
+    target_vocal_spec = make_complex(target_vocal_mag)
+    mixture_spec = make_complex(mixture_mag)
 
-    # Reconstruct time-domain signals using the ground truth phase
-    pred_inst_spec = pred_inst_mag * torch.exp(1j * mixture_phase)
-    pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)
+    # ISTFT function for batches and channels
+    def istft_channels(spec):
+        # spec shape: [B, C, F, T]
+        batch_size, channels, F, T = spec.shape
+        # Combine batch and channels for processing
+        spec_combined = spec.reshape(batch_size * channels, F, T)
+        # Apply ISTFT
+        audio = torch.istft(spec_combined, n_fft=n_fft, hop_length=hop_length, window=window)
+        # Reshape back to [B, C, L]
+        audio = audio.reshape(batch_size, channels, -1)
+        return audio
 
-    # Process each channel separately
-    pred_inst_audio = []
-    pred_vocal_audio = []
-    target_inst_audio = []
-    target_vocal_audio = []
+    # Convert to time-domain audio
+    pred_inst_audio = istft_channels(pred_inst_spec)  # [B, 2, L]
+    pred_vocal_audio = istft_channels(pred_vocal_spec)
+    target_inst_audio = istft_channels(target_inst_spec)
+    target_vocal_audio = istft_channels(target_vocal_spec)
+    mixture_audio = istft_channels(mixture_spec)       # [B, 2, L]
 
-    for channel in range(pred_inst_spec.shape[0]):
-        pred_inst_audio_ch = torch.istft(pred_inst_spec[channel], n_fft=n_fft, hop_length=hop_length, window=window)
-        pred_vocal_audio_ch = torch.istft(pred_vocal_spec[channel], n_fft=n_fft, hop_length=hop_length, window=window)
-        target_inst_audio_ch = torch.istft(target_inst_mag[channel] * torch.exp(1j * mixture_phase[channel]), n_fft=n_fft, hop_length=hop_length, window=window)
-        target_vocal_audio_ch = torch.istft(target_vocal_mag[channel] * torch.exp(1j * mixture_phase[channel]), n_fft=n_fft, hop_length=hop_length, window=window)
+    # Stack stems (instrumental and vocal) along dim=1
+    processed_audio = torch.stack([pred_inst_audio, pred_vocal_audio], dim=1)  # [B, 2, 2, L]
+    target_audio = torch.stack([target_inst_audio, target_vocal_audio], dim=1) # [B, 2, 2, L]
 
-        pred_inst_audio.append(pred_inst_audio_ch)
-        pred_vocal_audio.append(pred_vocal_audio_ch)
-        target_inst_audio.append(target_inst_audio_ch)
-        target_vocal_audio.append(target_vocal_audio_ch)
+    # Initialize LogWMSE loss
+    log_wmse = LogWMSE(
+        audio_length=pred_inst_audio.shape[-1] / 44100,
+        sample_rate=44100,
+        return_as_loss=True,
+        bypass_filter=False
+    )
 
-    pred_inst_audio = torch.stack(pred_inst_audio, dim=0)
-    pred_vocal_audio = torch.stack(pred_vocal_audio, dim=0)
-    target_inst_audio = torch.stack(target_inst_audio, dim=0)
-    target_vocal_audio = torch.stack(target_vocal_audio, dim=0)
+    # Compute loss
+    logwmse_loss = log_wmse(mixture_audio, processed_audio, target_audio)
 
-    inst_loss = F.l1_loss(pred_inst_audio, target_inst_audio)
-    vocal_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
-
-    return inst_loss + vocal_loss
+    return logwmse_loss
 
 # Custom Dataset class
 class MUSDBDataset(Dataset):
@@ -339,7 +336,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=54, n_modes=(86, 86), num_layers=6)
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=64, n_modes=(86, 86))
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
