@@ -13,67 +13,142 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
+class MultiScaleAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, scales=[0.5, 1, 1.5, 2, 2.5, 3]):
+        super(MultiScaleAttention, self).__init__()
+        self.scales = scales
+        self.conv_layers = nn.ModuleList([
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            for _ in scales
+        ])
+        self.attention = nn.Sequential(
+            nn.Conv2d(out_channels * len(scales), out_channels * len(scales), kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.final_conv = nn.Conv2d(out_channels * len(scales), out_channels, kernel_size=3, padding=1)
+
+        # Residual connection: 1x1 convolution to match dimensions if in_channels != out_channels
+        self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+
+    def forward(self, x):
+        # Save the input for the residual connection
+        residual = x
+
+        # Extract features at multiple scales
+        features = []
+        for i, conv in enumerate(self.conv_layers):
+            feat = conv(x)
+            if self.scales[i] != 1:
+                # Resize the feature map to match the original resolution
+                feat = F.interpolate(feat, size=x.shape[2:], mode='bilinear', align_corners=False)
+            features.append(feat)
+
+        # Concatenate features from all scales
+        features = torch.cat(features, dim=1)
+
+        # Apply attention to focus on fine-grained details
+        attention_map = self.attention(features)
+        attended_features = features * attention_map
+
+        # Final convolution to produce the output
+        output = self.final_conv(attended_features)
+
+        # Add residual connection
+        if self.residual_conv is not None:
+            residual = self.residual_conv(residual)
+        output = output + residual
+
+        return output
+
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=90, n_modes=(90, 90)):
+    def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16), num_layers=1):
         super(NeuralModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
-
+        
+        self.multi_scale_attention = MultiScaleAttention(hidden_channels, hidden_channels)
+        
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
                             in_channels=hidden_channels, out_channels=hidden_channels)
-
-        self.spec_predictor = nn.Sequential(
+        
+        self.lstm = nn.LSTM(input_size=hidden_channels, hidden_size=hidden_channels,
+                            num_layers=num_layers, batch_first=True)
+        
+        self.post_msa = MultiScaleAttention(hidden_channels, hidden_channels)
+        
+        self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, out_channels * 2, kernel_size=1),  # Output both stems, 2 channels each
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
+            nn.Sigmoid()
         )
 
     def forward(self, x):
         x = self.projection(x)
+        x = checkpoint(self.multi_scale_attention, x, use_reentrant=False)
+        
         x = checkpoint(self.operator, x, use_reentrant=False)
-        specs = self.spec_predictor(x)
-        # Split the output into instrumental and vocal spectrograms
-        pred_inst_mag, pred_vocal_mag = torch.split(specs, 2, dim=1)
-        return pred_inst_mag, pred_vocal_mag
+        
+        B, C, F, T = x.shape
+        x = x.permute(0, 2, 3, 1)  # now (B, F, T, C)
+        x = x.reshape(B * F, T, C)  # merge batch and frequency dims
 
-def loss_fn(pred_inst_mag, pred_vocal_mag,
+        # Wrap the LSTM forward pass using a lambda that returns only the output.
+        x = checkpoint(lambda inp: self.lstm(inp)[0], x, use_reentrant=False)
+        
+        # Reshape back to (B, F, T, C) then permute to (B, C, F, T)
+        x = x.reshape(B, F, T, C)
+        x = x.permute(0, 3, 1, 2)
+        
+        # Use checkpointing on the post multi-scale attention block.
+        x = checkpoint(self.post_msa, x, use_reentrant=False)
+        mask = self.mask_predictor(x)
+        vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
+        return inst_mask, vocal_mask
+
+def loss_fn(pred_inst_mask, pred_vocal_mask,
             target_inst_mag, target_vocal_mag,
-            mixture_phase,
+            mixture_mag, mixture_phase,
             window, n_fft, hop_length):
-            
-    pred_inst_mag = pred_inst_mag.squeeze(0)  # [channels, F, T]
-    pred_vocal_mag = pred_vocal_mag.squeeze(0)
+    # Remove batch dimension (assuming batch_size=1)
+    pred_inst_mask = pred_inst_mask.squeeze(0)  # [channels, F, T]
+    pred_vocal_mask = pred_vocal_mask.squeeze(0)
     target_inst_mag = target_inst_mag.squeeze(0)
     target_vocal_mag = target_vocal_mag.squeeze(0)
+    mixture_mag = mixture_mag.squeeze(0)
     mixture_phase = mixture_phase.squeeze(0)
+
+    # Apply masks to mixture magnitude
+    pred_inst_mag = mixture_mag * pred_inst_mask
+    pred_vocal_mag = mixture_mag * pred_vocal_mask
 
     # Reconstruct complex spectrograms using the mixture phase
     def make_complex(mag):
         return mag * torch.exp(1j * mixture_phase)
-
+    
     pred_inst_spec = make_complex(pred_inst_mag)
     pred_vocal_spec = make_complex(pred_vocal_mag)
     target_inst_spec = make_complex(target_inst_mag)
     target_vocal_spec = make_complex(target_vocal_mag)
-
+    
     # ISTFT function for each channel
     def istft_channels(spec):
         return torch.stack([
             torch.istft(spec[ch], n_fft=n_fft, hop_length=hop_length, window=window)
             for ch in range(spec.shape[0])
         ], dim=0)
-
+    
     # Convert back to time-domain audio
     pred_inst_audio = istft_channels(pred_inst_spec)  # [channels, time]
     pred_vocal_audio = istft_channels(pred_vocal_spec)
     target_inst_audio = istft_channels(target_inst_spec)
     target_vocal_audio = istft_channels(target_vocal_spec)
-
+    
     # Replace any potential NaNs (e.g., from digital silence) with zeros
     pred_inst_audio = torch.nan_to_num(pred_inst_audio, nan=0.0)
     pred_vocal_audio = torch.nan_to_num(pred_vocal_audio, nan=0.0)
     target_inst_audio = torch.nan_to_num(target_inst_audio, nan=0.0)
     target_vocal_audio = torch.nan_to_num(target_vocal_audio, nan=0.0)
-
+    
     # Compute the L1 loss for both stems and sum them
     loss_inst = F.l1_loss(pred_inst_audio, target_inst_audio)
     loss_vocal = F.l1_loss(pred_vocal_audio, target_vocal_audio)
@@ -198,10 +273,10 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
             instrumental_mag = instrumental_mag.to(device)
             vocal_mag = vocal_mag.to(device)
 
-            # Forward pass:  Directly predict spectrograms
-            pred_inst_mag, pred_vocal_mag = model(mixture_mag)
-            loss = loss_fn(pred_inst_mag, pred_vocal_mag, instrumental_mag, vocal_mag,
-                           mixture_phase, window, 4096, 1024)  # No mixture_mag needed in loss
+            # Forward pass without mixed precision
+            pred_inst_mask, pred_vocal_mask = model(mixture_mag)
+            loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag,
+                           mixture_mag, mixture_phase, window, 4096, 1024)
 
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -238,53 +313,42 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
     model.to(device)
-
     input_audio, sr = torchaudio.load(input_wav_path)
     if input_audio.shape[0] != 2:
         raise ValueError("Input audio must have 2 channels.")
     input_audio = input_audio.to(device)
     total_length = input_audio.shape[1]
-
     instrumentals = torch.zeros_like(input_audio)
     vocals = torch.zeros_like(input_audio)
     cross_fade_length = overlap // 2
     window = torch.hann_window(4096).to(device)
-
     num_chunks = (total_length - overlap) // (chunk_size - overlap)
-
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
             chunk = input_audio[:, i:i + chunk_size]
             chunk_spec = torch.stft(chunk, n_fft=4096, hop_length=1024, window=window, return_complex=True)
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
-            chunk_mag = chunk_mag.unsqueeze(0).to(device)  # Add batch dimension
-
+            chunk_mag = chunk_mag.unsqueeze(0).to(device)
             with torch.no_grad():
-                # Direct spectrogram prediction
-                pred_inst_mag, pred_vocal_mag = model(chunk_mag)
-
-            pred_inst_mag = pred_inst_mag.squeeze(0)  # Remove batch dimension
-            pred_vocal_mag = pred_vocal_mag.squeeze(0)
-
-            # Reconstruct using predicted magnitude and mixture phase
+                pred_inst_mask, pred_vocal_mask = model(chunk_mag)
+            pred_inst_mask = pred_inst_mask.squeeze(0)
+            pred_vocal_mask = pred_vocal_mask.squeeze(0)
+            pred_inst_mag = chunk_mag.squeeze(0) * pred_inst_mask
+            pred_vocal_mag = chunk_mag.squeeze(0) * pred_vocal_mask
             pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
             pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
-
             inst_chunk = torch.zeros_like(chunk)
             vocal_chunk = torch.zeros_like(chunk)
-
-            # ISTFT per channel
             for channel in range(2):
                 inst_chunk[channel] = torch.istft(
-                    pred_inst_spec[channel].unsqueeze(0),  # Add singleton dimension for istft
+                    pred_inst_spec[channel].unsqueeze(0),
                     n_fft=4096,
                     hop_length=1024,
                     window=window,
                     length=chunk_size,
-                    return_complex=False  # Ensure real output
-                ).squeeze(0)  # Remove singleton dimension
-
+                    return_complex=False
+                ).squeeze(0)
                 vocal_chunk[channel] = torch.istft(
                     pred_vocal_spec[channel].unsqueeze(0),
                     n_fft=4096,
@@ -293,8 +357,6 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                     length=chunk_size,
                     return_complex=False
                 ).squeeze(0)
-
-            # Crossfading (same as before)
             if i == 0:
                 instrumentals[:, i:i + chunk_size] = inst_chunk
                 vocals[:, i:i + chunk_size] = vocal_chunk
@@ -307,12 +369,9 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                 vocal_chunk[:, :cross_fade_length] *= fade_in
                 vocals[:, i:i + cross_fade_length] *= fade_out
                 vocals[:, i:i + cross_fade_length] += vocal_chunk[:, :cross_fade_length]
-
             instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
             vocals[:, i + cross_fade_length:i + chunk_size] = vocal_chunk[:, cross_fade_length:]
-
             pbar.update(1)
-
     instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
     vocals = torch.clamp(vocals, -1.0, 1.0)
     torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
@@ -337,7 +396,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=84, n_modes=(86, 86))
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=48, n_modes=(86, 86), num_layers=6)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     if args.train:
@@ -347,7 +406,6 @@ def main():
                                       num_workers=16, pin_memory=False, persistent_workers=True)
         total_steps = args.epochs * len(train_dataloader)
         train(model, train_dataloader, optimizer, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
-
     elif args.infer:
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
