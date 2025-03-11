@@ -60,9 +60,9 @@ class MultiScaleAttention(nn.Module):
 
         return output
 
-class NeuralOperatorModel(nn.Module):
+class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, hidden_channels=128, n_modes=(16, 16), num_layers=1):
-        super(NeuralOperatorModel, self).__init__()
+        super(NeuralModel, self).__init__()
         self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
         
         self.multi_scale_attention = MultiScaleAttention(hidden_channels, hidden_channels)
@@ -83,12 +83,9 @@ class NeuralOperatorModel(nn.Module):
         )
 
     def forward(self, x):
-        # x: shape (B, in_channels, H, W)
         x = self.projection(x)
-        # Use checkpointing on the first multi-scale attention block.
         x = checkpoint(self.multi_scale_attention, x, use_reentrant=False)
         
-        # Wrap the operator (FNO) with checkpointing.
         x = checkpoint(self.operator, x, use_reentrant=False)
         
         B, C, F, T = x.shape
@@ -102,7 +99,6 @@ class NeuralOperatorModel(nn.Module):
         x = x.reshape(B, F, T, C)
         x = x.permute(0, 3, 1, 2)
         
-        # Use checkpointing on the post multi-scale attention block.
         x = checkpoint(self.post_msa, x, use_reentrant=False)
         mask = self.mask_predictor(x)
         vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
@@ -154,7 +150,7 @@ def loss_fn(pred_inst_mask, pred_vocal_mask, target_inst_mag, target_vocal_mag, 
 
 # Custom Dataset class
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=264600, segment=True):
+    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True):
         self.root_dir = root_dir
         self.preprocess_dir = preprocess_dir
         self.sample_rate = sample_rate
@@ -401,7 +397,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralOperatorModel(in_channels=2, out_channels=2, hidden_channels=48, n_modes=(86, 86), num_layers=6)
+    model = NeuralModel(in_channels=2, out_channels=2, hidden_channels=48, n_modes=(86, 86), num_layers=6)
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
