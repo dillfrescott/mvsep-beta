@@ -84,7 +84,7 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
         audio_length=pred_inst_audio.shape[-1] / 44100,
         sample_rate=44100,
         return_as_loss=True,
-        bypass_filter=True
+        bypass_filter=False
     )
 
     # Compute loss
