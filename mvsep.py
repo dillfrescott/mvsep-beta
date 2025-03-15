@@ -268,7 +268,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=88200, overlap=44100, device='cpu', output_residuals=False):
+              chunk_size=88200, overlap=44100, device='cpu', output_standalone_residuals=False):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
@@ -358,7 +358,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     torchaudio.save(output_vocal_path, vocals.cpu(), sr)
 
     # Save residual-only outputs if the flag is enabled
-    if output_residuals:
+    if output_standalone_residuals:
         torchaudio.save("residual_instrumental.wav", inst_residuals.cpu(), sr)
         torchaudio.save("residual_vocals.wav", vocal_residuals.cpu(), sr)
 
@@ -396,7 +396,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, output_residuals=False)
+        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, output_standalone_residuals=True)
     else:
         print("Please specify either --train or --infer")
 
