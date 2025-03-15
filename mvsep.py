@@ -268,7 +268,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=88200, overlap=44100, device='cpu'):
+              chunk_size=88200, overlap=44100, device='cpu', output_residuals=False):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
@@ -305,13 +305,10 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
             pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
 
-            # --- Time-Domain Conversion (Corrected Section) ---
             inst_chunk = torch.istft(pred_inst_spec, n_fft=4096, hop_length=1024, window=window, length=chunk_size)
             vocal_chunk = torch.istft(pred_vocal_spec, n_fft=4096, hop_length=1024, window=window, length=chunk_size)
             inst_residual_chunk = torch.istft(inst_residual.squeeze(0) * torch.exp(1j * chunk_phase), n_fft=4096, hop_length=1024, window=window, length=chunk_size)
             vocal_residual_chunk = torch.istft(vocal_residual.squeeze(0) * torch.exp(1j * chunk_phase), n_fft=4096, hop_length=1024, window=window, length=chunk_size)
-            # --- End of Corrected Section ---
-
 
             # Cross-fade and combine chunks
             if i == 0:
@@ -350,16 +347,20 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                 vocal_residuals[:, i + cross_fade_length:i+chunk_size] = vocal_residual_chunk[:, cross_fade_length:]
             pbar.update(1)
 
-
     # Clamp and save outputs
     instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
     vocals = torch.clamp(vocals, -1.0, 1.0)
     inst_residuals = torch.clamp(inst_residuals, -1.0, 1.0)
     vocal_residuals = torch.clamp(vocal_residuals, -1.0, 1.0)
+
+    # Save the main outputs (always include residual + mask)
     torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
     torchaudio.save(output_vocal_path, vocals.cpu(), sr)
-    torchaudio.save("residual_instrumental.wav", inst_residuals.cpu(), sr)
-    torchaudio.save("residual_vocals.wav", vocal_residuals.cpu(), sr)
+
+    # Save residual-only outputs if the flag is enabled
+    if output_residuals:
+        torchaudio.save("residual_instrumental.wav", inst_residuals.cpu(), sr)
+        torchaudio.save("residual_vocals.wav", vocal_residuals.cpu(), sr)
 
 def main():
     parser = argparse.ArgumentParser(description='Train a model for instrumental separation')
@@ -395,7 +396,7 @@ def main():
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device)
+        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device, output_residuals=False)
     else:
         print("Please specify either --train or --infer")
 
