@@ -280,72 +280,86 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     total_length = input_audio.shape[1]
     instrumentals = torch.zeros_like(input_audio)
     vocals = torch.zeros_like(input_audio)
+    inst_residuals = torch.zeros_like(input_audio)
+    vocal_residuals = torch.zeros_like(input_audio)
     cross_fade_length = overlap // 2
     window = torch.hann_window(4096).to(device)
     num_chunks = (total_length - overlap) // (chunk_size - overlap)
+
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
             chunk = input_audio[:, i:i + chunk_size]
             chunk_spec = torch.stft(chunk, n_fft=4096, hop_length=1024, window=window, return_complex=True)
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
-            chunk_mag = chunk_mag.unsqueeze(0).to(device)
+            chunk_mag = chunk_mag.unsqueeze(0).to(device)  # Add batch dimension
+
             with torch.no_grad():
-                # Handle all four outputs from the model
                 pred_inst_mask, pred_vocal_mask, inst_residual, vocal_residual = model(chunk_mag)
 
-            # Apply masks and residuals
-            pred_inst_mag = chunk_mag.squeeze(0) * pred_inst_mask + inst_residual
-            pred_vocal_mag = chunk_mag.squeeze(0) * pred_vocal_mask + vocal_residual
+            # Process outputs (apply masks and residuals)
+            pred_inst_mag = chunk_mag.squeeze(0) * pred_inst_mask.squeeze(0) + inst_residual.squeeze(0)
+            pred_vocal_mag = chunk_mag.squeeze(0) * pred_vocal_mask.squeeze(0) + vocal_residual.squeeze(0)
 
             # Reconstruct complex spectrograms
             pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
             pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
 
-            # Convert to time-domain audio
-            inst_chunk = torch.zeros_like(chunk)
-            vocal_chunk = torch.zeros_like(chunk)
-            for channel in range(2):
-                # Ensure the input to istft has the correct shape: [F, T]
-                inst_chunk[channel] = torch.istft(
-                    pred_inst_spec[:, channel],  # Shape: [F, T]
-                    n_fft=4096,
-                    hop_length=1024,
-                    window=window,
-                    length=chunk_size,
-                    return_complex=False
-                )
-                vocal_chunk[channel] = torch.istft(
-                    pred_vocal_spec[:, channel],  # Shape: [F, T]
-                    n_fft=4096,
-                    hop_length=1024,
-                    window=window,
-                    length=chunk_size,
-                    return_complex=False
-                )
+            # --- Time-Domain Conversion (Corrected Section) ---
+            inst_chunk = torch.istft(pred_inst_spec, n_fft=4096, hop_length=1024, window=window, length=chunk_size)
+            vocal_chunk = torch.istft(pred_vocal_spec, n_fft=4096, hop_length=1024, window=window, length=chunk_size)
+            inst_residual_chunk = torch.istft(inst_residual.squeeze(0) * torch.exp(1j * chunk_phase), n_fft=4096, hop_length=1024, window=window, length=chunk_size)
+            vocal_residual_chunk = torch.istft(vocal_residual.squeeze(0) * torch.exp(1j * chunk_phase), n_fft=4096, hop_length=1024, window=window, length=chunk_size)
+            # --- End of Corrected Section ---
 
-            # Cross-fade overlapping chunks
+
+            # Cross-fade and combine chunks
             if i == 0:
                 instrumentals[:, i:i + chunk_size] = inst_chunk
                 vocals[:, i:i + chunk_size] = vocal_chunk
+                inst_residuals[:, i:i+chunk_size] = inst_residual_chunk
+                vocal_residuals[:, i:i + chunk_size] = vocal_residual_chunk
+
             else:
-                fade_in = torch.linspace(0, 1, cross_fade_length).to(device)
-                fade_out = torch.linspace(1, 0, cross_fade_length).to(device)
-                inst_chunk[:, :cross_fade_length] *= fade_in
-                instrumentals[:, i:i + cross_fade_length] *= fade_out
-                instrumentals[:, i:i + cross_fade_length] += inst_chunk[:, :cross_fade_length]
-                vocal_chunk[:, :cross_fade_length] *= fade_in
-                vocals[:, i:i + cross_fade_length] *= fade_out
-                vocals[:, i:i + cross_fade_length] += vocal_chunk[:, :cross_fade_length]
-            instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
-            vocals[:, i + cross_fade_length:i + chunk_size] = vocal_chunk[:, cross_fade_length:]
+                # Create fade-in/fade-out windows
+                fade_in = torch.linspace(0, 1, cross_fade_length, device=device)
+                fade_out = torch.linspace(1, 0, cross_fade_length, device=device)
+
+                # Apply cross-fading
+                instrumentals[:, i:i + cross_fade_length] = (
+                    instrumentals[:, i:i + cross_fade_length] * fade_out
+                    + inst_chunk[:, :cross_fade_length] * fade_in
+                )
+                vocals[:, i:i + cross_fade_length] = (
+                    vocals[:, i:i + cross_fade_length] * fade_out
+                    + vocal_chunk[:, :cross_fade_length] * fade_in
+                )
+                inst_residuals[:, i:i + cross_fade_length] = (
+                    inst_residuals[:, i:i + cross_fade_length] * fade_out
+                    + inst_residual_chunk[:, :cross_fade_length] * fade_in
+                )
+                vocal_residuals[:, i:i + cross_fade_length] = (
+                    vocal_residuals[:, i:i + cross_fade_length] * fade_out
+                    + vocal_residual_chunk[:, :cross_fade_length] * fade_in
+                )
+
+                # Add the non-overlapping part of the chunk
+                instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
+                vocals[:, i + cross_fade_length:i + chunk_size] = vocal_chunk[:, cross_fade_length:]
+                inst_residuals[:, i + cross_fade_length:i+chunk_size] = inst_residual_chunk[:, cross_fade_length:]
+                vocal_residuals[:, i + cross_fade_length:i+chunk_size] = vocal_residual_chunk[:, cross_fade_length:]
             pbar.update(1)
 
-    # Clamp and save the output audio
+
+    # Clamp and save outputs
     instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
     vocals = torch.clamp(vocals, -1.0, 1.0)
+    inst_residuals = torch.clamp(inst_residuals, -1.0, 1.0)
+    vocal_residuals = torch.clamp(vocal_residuals, -1.0, 1.0)
     torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
     torchaudio.save(output_vocal_path, vocals.cpu(), sr)
+    torchaudio.save("residual_instrumental.wav", inst_residuals.cpu(), sr)
+    torchaudio.save("residual_vocals.wav", vocal_residuals.cpu(), sr)
 
 def main():
     parser = argparse.ArgumentParser(description='Train a model for instrumental separation')
