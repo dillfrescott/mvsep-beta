@@ -95,18 +95,8 @@ def loss_fn(pred_inst_mask, pred_vocal_mask, inst_residual, vocal_residual,
         return_as_loss=True,
         bypass_filter=False
     )
-    separation_loss = log_wmse(mixture_audio, processed_audio, target_audio)
 
-    # 2. Frequency Reconstruction Loss (for inpainting new frequencies)
-    def frequency_reconstruction_loss(pred_mag, target_mag):
-        # Use L1 loss in the magnitude domain to encourage frequency matching
-        return F.l1_loss(pred_mag, target_mag)
-
-    # Compute frequency reconstruction loss for both stems
-    freq_recon_loss = frequency_reconstruction_loss(pred_inst_mag, target_inst_mag) \
-                    + frequency_reconstruction_loss(pred_vocal_mag, target_vocal_mag)
-
-    total_loss = separation_loss + freq_recon_loss
+    total_loss = log_wmse(mixture_audio, processed_audio, target_audio)
 
     return total_loss
 
