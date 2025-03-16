@@ -10,6 +10,7 @@ from tqdm import tqdm
 from neuralop.models import FNO
 from torch_log_wmse import LogWMSE
 import numpy as np
+import auraloss
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
@@ -60,11 +61,8 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     def istft_channels(spec):
         # spec shape: [B, C, F, T]
         batch_size, channels, F, T = spec.shape
-        # Combine batch and channels for processing
         spec_combined = spec.reshape(batch_size * channels, F, T)
-        # Apply ISTFT
         audio = torch.istft(spec_combined, n_fft=n_fft, hop_length=hop_length, window=window)
-        # Reshape back to [B, C, L]
         audio = audio.reshape(batch_size, channels, -1)
         return audio
 
@@ -75,7 +73,7 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     target_vocal_audio = istft_channels(target_vocal_spec)
     mixture_audio = istft_channels(mixture_spec)       # [B, 2, L]
 
-    # Stack stems (instrumental and vocal) along dim=1
+    # Stack stems (instrumental and vocal) along dim=1 for LogWMSE loss
     processed_audio = torch.stack([pred_inst_audio, pred_vocal_audio], dim=1)  # [B, 2, 2, L]
     target_audio = torch.stack([target_inst_audio, target_vocal_audio], dim=1) # [B, 2, 2, L]
 
@@ -93,8 +91,23 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
     # Compute L1 loss between predicted and target magnitudes for both stems
     l1_loss = F.l1_loss(pred_inst_mag, target_inst_mag) + F.l1_loss(pred_vocal_mag, target_vocal_mag)
 
-    # Final loss is the sum of LogWMSE loss and the L1 loss
-    total_loss = logwmse_loss + l1_loss
+    # Compute auraloss
+    stft_loss_fn = auraloss.freq.MultiResolutionSTFTLoss(
+        fft_sizes=[1024, 2048, 8192],
+        hop_sizes=[256, 512, 2048],
+        win_lengths=[1024, 2048, 8192],
+        scale="mel",
+        n_bins=128,
+        sample_rate=44100,
+        device="cuda"
+    )
+
+    stft_loss_inst = stft_loss_fn(pred_inst_audio, target_inst_audio)
+    stft_loss_vocal = stft_loss_fn(pred_vocal_audio, target_vocal_audio)
+    stft_loss = stft_loss_inst + stft_loss_vocal
+
+    # Final loss is the sum of LogWMSE loss, L1 loss, and auraloss
+    total_loss = logwmse_loss + l1_loss + stft_loss
 
     return total_loss
 
