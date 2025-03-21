@@ -16,9 +16,8 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, hidden_channels=256):
+    def __init__(self, in_channels=2, hidden_channels=256):
         super(NeuralModel, self).__init__()
-
         self.projection = nn.Conv2d(in_channels, 3, kernel_size=1)
         
         seg_dims = (32, 64, 160, 256)
@@ -35,7 +34,7 @@ class NeuralModel(nn.Module):
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
             nn.Sigmoid()
         )
         
@@ -44,7 +43,7 @@ class NeuralModel(nn.Module):
         x = self.projection(x)  # [B, 3, H, W]
         
         B, C, H, W = x.shape
-        # Pad to be divisible by 64 instead of 4
+        # Pad to be divisible by 64
         pad_H = (64 - H % 64) % 64
         pad_W = (64 - W % 64) % 64
         x_padded = F.pad(x, (0, pad_W, 0, pad_H), mode='reflect')
@@ -54,32 +53,30 @@ class NeuralModel(nn.Module):
         x_upsampled = F.interpolate(x_seg, size=(H + pad_H, W + pad_W), mode='bilinear', align_corners=False)
         x_cropped = x_upsampled[:, :, :H, :W]
         
-        mask = self.mask_predictor(x_cropped)
-        vocal_mask, inst_mask = torch.split(mask, 1, dim=1)
-        return inst_mask, vocal_mask
+        # Compute vocal mask and expand it to match the two channels of the input magnitude.
+        vocal_mask = self.mask_predictor(x_cropped)  # [B, 1, H, W]
+        vocal_mask_expanded = vocal_mask.expand(-1, 2, -1, -1)  # now [B, 2, H, W]
+        return vocal_mask_expanded
 
-def loss_fn(pred_inst_mask, pred_vocal_mask,
-            target_inst_mag, target_vocal_mag,
+def loss_fn(pred_vocal_mask,
+            target_vocal_mag,
             mixture_mag, mixture_phase,
             window, n_fft, hop_length):
 
     mrstft = auraloss.freq.MultiResolutionSTFTLoss()
     
-    # Apply predicted masks to the mixture magnitude
-    pred_inst_mag = mixture_mag * pred_inst_mask  # [B, 2, F, T]
+    # Apply the predicted mask to the mixture magnitude.
     pred_vocal_mag = mixture_mag * pred_vocal_mask  # [B, 2, F, T]
 
-    # Function to convert magnitude to a complex spectrogram using the mixture phase
+    # Helper to form a complex spectrogram.
     def make_complex(mag):
         return mag * torch.exp(1j * mixture_phase)
 
-    # Create complex spectrograms for predicted and target signals
-    pred_inst_spec = make_complex(pred_inst_mag)
+    # Convert predicted and target magnitudes to complex spectrograms.
     pred_vocal_spec = make_complex(pred_vocal_mag)
-    target_inst_spec = make_complex(target_inst_mag)
     target_vocal_spec = make_complex(target_vocal_mag)
 
-    # ISTFT helper function for a batch of channels
+    # ISTFT helper for batched channels.
     def istft_channels(spec):
         batch_size, channels, F, T = spec.shape
         spec_combined = spec.reshape(batch_size * channels, F, T)
@@ -87,17 +84,12 @@ def loss_fn(pred_inst_mask, pred_vocal_mask,
         audio = audio.reshape(batch_size, channels, -1)
         return audio
 
-    # Convert the spectrograms back to time-domain audio
-    pred_inst_audio = istft_channels(pred_inst_spec)  # [B, 2, L]
-    pred_vocal_audio = istft_channels(pred_vocal_spec)
-    target_inst_audio = istft_channels(target_inst_spec)
+    pred_vocal_audio = istft_channels(pred_vocal_spec)  # [B, 2, L]
     target_vocal_audio = istft_channels(target_vocal_spec)
-
-    # Compute the MRSTFT loss for each source and sum the losses
-    loss_inst = mrstft(pred_inst_audio, target_inst_audio)
+    
+    # Compute the MRSTFT loss
     loss_vocal = mrstft(pred_vocal_audio, target_vocal_audio)
-    total_loss = loss_inst + loss_vocal
-
+    total_loss = loss_vocal
     return total_loss
 
 # Custom Dataset class
@@ -128,25 +120,18 @@ class MUSDBDataset(Dataset):
                          vocal_mag=vocal_mag, vocal_phase=vocal_phase)
 
     def _process_track(self, track_path):
-        instrumental, _ = torchaudio.load(os.path.join(track_path, 'other.wav'))
         vocal, _ = torchaudio.load(os.path.join(track_path, 'vocals.wav'))
 
-        if instrumental.shape[0] != 2 or vocal.shape[0] != 2:
-            raise ValueError("Audio files must have 2 channels.")
-
-        min_length = min(instrumental.shape[1], vocal.shape[1])
-        instrumental = instrumental[:, :min_length]
-        vocal = vocal[:, :min_length]
-        mixture = instrumental + vocal
-
+        if vocal.shape[0] != 2:
+            raise ValueError("Audio file must have 2 channels.")
+        
+        mixture = vocal.clone()
+        
         mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
-        instrumental_spec = torch.stft(instrumental, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
         vocal_spec = torch.stft(vocal, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=True)
 
         mixture_mag = torch.abs(mixture_spec)
         mixture_phase = torch.angle(mixture_spec)
-        instrumental_mag = torch.abs(instrumental_spec)
-        instrumental_phase = torch.angle(instrumental_spec)
         vocal_mag = torch.abs(vocal_spec)
         vocal_phase = torch.angle(vocal_spec)
 
@@ -155,23 +140,17 @@ class MUSDBDataset(Dataset):
                 start = torch.randint(0, mixture_mag.shape[2] - self.segment_length // self.hop_length, (1,))
                 mixture_mag = mixture_mag[:, :, start:start + self.segment_length // self.hop_length]
                 mixture_phase = mixture_phase[:, :, start:start + self.segment_length // self.hop_length]
-                instrumental_mag = instrumental_mag[:, :, start:start + self.segment_length // self.hop_length]
-                instrumental_phase = instrumental_phase[:, :, start:start + self.segment_length // self.hop_length]
                 vocal_mag = vocal_mag[:, :, start:start + self.segment_length // self.hop_length]
                 vocal_phase = vocal_phase[:, :, start:start + self.segment_length // self.hop_length]
             else:
                 pad_amount = self.segment_length // self.hop_length - mixture_mag.shape[2]
                 mixture_mag = F.pad(mixture_mag, (0, pad_amount))
                 mixture_phase = F.pad(mixture_phase, (0, pad_amount))
-                instrumental_mag = F.pad(instrumental_mag, (0, pad_amount))
-                instrumental_phase = F.pad(instrumental_phase, (0, pad_amount))
                 vocal_mag = F.pad(vocal_mag, (0, pad_amount))
                 vocal_phase = F.pad(vocal_phase, (0, pad_amount))
 
         return (mixture_mag.numpy(), mixture_phase.numpy(),
-                instrumental_mag.numpy(), instrumental_phase.numpy(),
-                vocal_mag.numpy(), vocal_phase.numpy(),
-                mixture.numpy(), instrumental.numpy(), vocal.numpy())
+                vocal_mag.numpy(), vocal_phase.numpy())
 
     def __len__(self):
         return len(self.tracks)
@@ -182,14 +161,11 @@ class MUSDBDataset(Dataset):
             data = np.load(preprocess_path)
             mixture_mag = torch.from_numpy(data['mixture_mag'])
             mixture_phase = torch.from_numpy(data['mixture_phase'])
-            instrumental_mag = torch.from_numpy(data['instrumental_mag'])
-            instrumental_phase = torch.from_numpy(data['instrumental_phase'])
             vocal_mag = torch.from_numpy(data['vocal_mag'])
             vocal_phase = torch.from_numpy(data['vocal_phase'])
-            return mixture_mag, mixture_phase, instrumental_mag, instrumental_phase, vocal_mag, vocal_phase
+            return mixture_mag, mixture_phase, vocal_mag, vocal_phase
         else:
-            track_path = self.tracks[idx]
-            return self._process_track(track_path)
+            return self._process_track(self.tracks[idx])
 
 def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
     model.to(device)
@@ -208,23 +184,23 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     model.train()
     for epoch in range(epochs):
         for batch in dataloader:
-            mixture_mag, mixture_phase, instrumental_mag, _, vocal_mag, _ = batch
+            mixture_mag, mixture_phase, vocal_mag, vocal_phase = batch
             mixture_mag = mixture_mag.to(device)
             mixture_phase = mixture_phase.to(device)
-            instrumental_mag = instrumental_mag.to(device)
             vocal_mag = vocal_mag.to(device)
 
             optimizer.zero_grad()
-            pred_inst_mask, pred_vocal_mask = model(mixture_mag)
-            loss = loss_fn(pred_inst_mask, pred_vocal_mask, instrumental_mag, vocal_mag, mixture_mag, mixture_phase, window, 4096, 1024)
+            # Predict the vocal mask from the mixture magnitude.
+            pred_vocal_mask = model(mixture_mag)
+            loss = loss_fn(pred_vocal_mask, vocal_mag, mixture_mag, mixture_phase, window, 4096, 1024)
             
-            # Replace NaN loss with zero
+            # Replace NaN loss with zero.
             if torch.isnan(loss).any():
                 print("NaN loss detected, replacing with 0.")
                 loss = torch.tensor(0.0, device=device)
 
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             avg_loss = (avg_loss * step + loss.item()) / (step + 1)
@@ -259,8 +235,8 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
         raise ValueError("Input audio must have 2 channels.")
     input_audio = input_audio.to(device)
     total_length = input_audio.shape[1]
-    instrumentals = torch.zeros_like(input_audio)
     vocals = torch.zeros_like(input_audio)
+    instrumentals = torch.zeros_like(input_audio)
     cross_fade_length = overlap // 2
     window = torch.hann_window(4096).to(device)
     num_chunks = (total_length - overlap) // (chunk_size - overlap)
@@ -270,26 +246,20 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             chunk_spec = torch.stft(chunk, n_fft=4096, hop_length=1024, window=window, return_complex=True)
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
+            # Add batch dimension and channel dimension if necessary.
             chunk_mag = chunk_mag.unsqueeze(0).to(device)
             with torch.no_grad():
-                pred_inst_mask, pred_vocal_mask = model(chunk_mag)
-            pred_inst_mask = pred_inst_mask.squeeze(0)
+                pred_vocal_mask = model(chunk_mag)  # [1, 2, F, T]
+            # Squeeze batch dimension.
             pred_vocal_mask = pred_vocal_mask.squeeze(0)
-            pred_inst_mag = chunk_mag.squeeze(0) * pred_inst_mask
+            # Multiply with chunk magnitude.
             pred_vocal_mag = chunk_mag.squeeze(0) * pred_vocal_mask
-            pred_inst_spec = pred_inst_mag * torch.exp(1j * chunk_phase)
+            # Reconstruct vocal spectrogram.
             pred_vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
-            inst_chunk = torch.zeros_like(chunk)
+            
+            # Reconstruct vocal and then compute instrumental = mixture - vocals.
             vocal_chunk = torch.zeros_like(chunk)
             for channel in range(2):
-                inst_chunk[channel] = torch.istft(
-                    pred_inst_spec[channel].unsqueeze(0),
-                    n_fft=4096,
-                    hop_length=1024,
-                    window=window,
-                    length=chunk_size,
-                    return_complex=False
-                ).squeeze(0)
                 vocal_chunk[channel] = torch.istft(
                     pred_vocal_spec[channel].unsqueeze(0),
                     n_fft=4096,
@@ -298,25 +268,30 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                     length=chunk_size,
                     return_complex=False
                 ).squeeze(0)
+            inst_chunk = chunk - vocal_chunk
+
+            # Apply cross-fading for smooth overlap-add.
             if i == 0:
-                instrumentals[:, i:i + chunk_size] = inst_chunk
                 vocals[:, i:i + chunk_size] = vocal_chunk
+                instrumentals[:, i:i + chunk_size] = inst_chunk
             else:
                 fade_in = torch.linspace(0, 1, cross_fade_length).to(device)
                 fade_out = torch.linspace(1, 0, cross_fade_length).to(device)
-                inst_chunk[:, :cross_fade_length] *= fade_in
-                instrumentals[:, i:i + cross_fade_length] *= fade_out
-                instrumentals[:, i:i + cross_fade_length] += inst_chunk[:, :cross_fade_length]
                 vocal_chunk[:, :cross_fade_length] *= fade_in
                 vocals[:, i:i + cross_fade_length] *= fade_out
                 vocals[:, i:i + cross_fade_length] += vocal_chunk[:, :cross_fade_length]
-            instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
-            vocals[:, i + cross_fade_length:i + chunk_size] = vocal_chunk[:, cross_fade_length:]
+                
+                inst_chunk[:, :cross_fade_length] *= fade_in
+                instrumentals[:, i:i + cross_fade_length] *= fade_out
+                instrumentals[:, i:i + cross_fade_length] += inst_chunk[:, :cross_fade_length]
+                
+                vocals[:, i + cross_fade_length:i + chunk_size] = vocal_chunk[:, cross_fade_length:]
+                instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
             pbar.update(1)
-    instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
     vocals = torch.clamp(vocals, -1.0, 1.0)
-    torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
+    instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
     torchaudio.save(output_vocal_path, vocals.cpu(), sr)
+    torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
 
 def main():
     parser = argparse.ArgumentParser(description='Train a model for instrumental separation')
@@ -326,7 +301,7 @@ def main():
     parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
+    parser.add_argument('--checkpoint_steps', type=int, default=400, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
@@ -336,7 +311,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2, out_channels=2)
+    model = NeuralModel(in_channels=2)
     optimizer = Prodigy(model.parameters(), lr=1.0, decouple=False)
 
     if args.train:
