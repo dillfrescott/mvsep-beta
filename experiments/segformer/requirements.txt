@@ -1,7 +1,0 @@
-auraloss
-librosa
-numpy
-prodigyopt
-segformer-pytorch
-soundfile
-tqdm
