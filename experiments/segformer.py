@@ -22,7 +22,7 @@ class NeuralModel(nn.Module):
         self.projection = nn.Conv2d(in_channels, 3, kernel_size=1)
         
         seg_dims = (32, 64, 160, 256)
-        self.operator = Segformer(
+        self.segformer = Segformer(
             dims=seg_dims,
             heads=(1, 2, 5, 8),
             ff_expansion=(8, 8, 4, 4),
@@ -49,7 +49,7 @@ class NeuralModel(nn.Module):
         pad_W = (64 - W % 64) % 64
         x_padded = F.pad(x, (0, pad_W, 0, pad_H), mode='reflect')
         
-        x_seg = self.operator(x_padded)
+        x_seg = self.segformer(x_padded)
         
         x_upsampled = F.interpolate(x_seg, size=(H + pad_H, W + pad_W), mode='bilinear', align_corners=False)
         x_cropped = x_upsampled[:, :, :H, :W]
