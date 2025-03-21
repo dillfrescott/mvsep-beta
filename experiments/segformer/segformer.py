@@ -92,7 +92,6 @@ def loss_fn(pred_vocal_mask,
     total_loss = loss_vocal
     return total_loss
 
-# Custom Dataset class
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True):
         self.root_dir = root_dir
@@ -113,10 +112,8 @@ class MUSDBDataset(Dataset):
         for idx, track_path in enumerate(tqdm(self.tracks, desc="Preprocessing data")):
             preprocess_path = os.path.join(self.preprocess_dir, f'track_{idx}.npz')
             if not os.path.exists(preprocess_path):
-                (mixture_mag, mixture_phase, instrumental_mag, instrumental_phase,
-                 vocal_mag, vocal_phase, _, _, _) = self._process_track(track_path)
+                mixture_mag, mixture_phase, vocal_mag, vocal_phase = self._process_track(track_path)
                 np.savez(preprocess_path, mixture_mag=mixture_mag, mixture_phase=mixture_phase,
-                         instrumental_mag=instrumental_mag, instrumental_phase=instrumental_phase,
                          vocal_mag=vocal_mag, vocal_phase=vocal_phase)
 
     def _process_track(self, track_path):
@@ -136,14 +133,16 @@ class MUSDBDataset(Dataset):
         vocal_phase = torch.angle(vocal_spec)
 
         if self.segment and self.segment_length:
-            if mixture_mag.shape[2] >= self.segment_length // self.hop_length:
-                start = torch.randint(0, mixture_mag.shape[2] - self.segment_length // self.hop_length, (1,))
-                mixture_mag = mixture_mag[:, :, start:start + self.segment_length // self.hop_length]
-                mixture_phase = mixture_phase[:, :, start:start + self.segment_length // self.hop_length]
-                vocal_mag = vocal_mag[:, :, start:start + self.segment_length // self.hop_length]
-                vocal_phase = vocal_phase[:, :, start:start + self.segment_length // self.hop_length]
+            # Calculate number of time frames corresponding to the segment length.
+            num_frames = self.segment_length // self.hop_length
+            if mixture_mag.shape[2] >= num_frames:
+                start = torch.randint(0, mixture_mag.shape[2] - num_frames, (1,))
+                mixture_mag = mixture_mag[:, :, start:start + num_frames]
+                mixture_phase = mixture_phase[:, :, start:start + num_frames]
+                vocal_mag = vocal_mag[:, :, start:start + num_frames]
+                vocal_phase = vocal_phase[:, :, start:start + num_frames]
             else:
-                pad_amount = self.segment_length // self.hop_length - mixture_mag.shape[2]
+                pad_amount = num_frames - mixture_mag.shape[2]
                 mixture_mag = F.pad(mixture_mag, (0, pad_amount))
                 mixture_phase = F.pad(mixture_phase, (0, pad_amount))
                 vocal_mag = F.pad(vocal_mag, (0, pad_amount))
