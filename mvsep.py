@@ -71,7 +71,12 @@ def loss_fn(pred_vocal_mask,
     
     # Compute the MRSTFT loss
     loss_vocal = mrstft(pred_vocal_audio, target_vocal_audio)
-    total_loss = loss_vocal
+    
+    # Compute L1 loss between the predicted and target vocal magnitudes.
+    loss_l1 = F.l1_loss(pred_vocal_mag, target_vocal_mag)
+    
+    # Total loss is the sum of both losses.
+    total_loss = loss_vocal + loss_l1
     return total_loss
 
 class MUSDBDataset(Dataset):
