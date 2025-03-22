@@ -301,7 +301,7 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
-    parser.add_argument('--learning_rate', type=float, default=2e-4, help='Learning rate for the optimizer')
+    parser.add_argument('--learning_rate', type=float, default=4e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
