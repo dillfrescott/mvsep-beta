@@ -2,5 +2,5 @@ librosa
 neuraloperator
 numpy
 soundfile
-torch-log-wmse
+auraloss
 tqdm
