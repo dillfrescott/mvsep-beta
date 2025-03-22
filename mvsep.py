@@ -17,13 +17,19 @@ from torch.utils.checkpoint import checkpoint
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=128, n_modes=(32, 32)):
         super(NeuralModel, self).__init__()
-
-        self.projection = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
+        
+        self.projection = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
+        )
         
         self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
                             in_channels=hidden_channels, out_channels=hidden_channels)
         
         self.mask_predictor = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
@@ -32,12 +38,15 @@ class NeuralModel(nn.Module):
         
     def forward(self, x):
         original_H, original_W = x.shape[-2:]
-        x = self.projection(x)  # Now [B, hidden_channels, H, W]
+        # Project input features
+        x = self.projection(x)
         
+        # Apply FNO operator
         x = checkpoint(self.operator, x, use_reentrant=False)
         
-        vocal_mask = self.mask_predictor(x)  # [B, 1, H, W]
-        vocal_mask_expanded = vocal_mask.expand(-1, 2, -1, -1)  # Now [B, 2, H, W]
+        # Predict mask with residual connection
+        vocal_mask = self.mask_predictor(x)
+        vocal_mask_expanded = vocal_mask.expand(-1, 2, -1, -1)
         return vocal_mask_expanded
 
 def loss_fn(pred_vocal_mask,
