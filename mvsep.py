@@ -15,15 +15,11 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=106, n_modes=(32, 32)):
+    def __init__(self, in_channels=2, hidden_channels=128, n_modes=(32, 32)):
         super(NeuralModel, self).__init__()
         
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
@@ -32,10 +28,6 @@ class NeuralModel(nn.Module):
                             in_channels=hidden_channels, out_channels=hidden_channels)
         
         self.mask_predictor = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
