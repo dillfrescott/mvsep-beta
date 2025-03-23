@@ -44,7 +44,7 @@ class NeuralModel(nn.Module):
         # Apply FNO operator
         x = checkpoint(self.operator, x, use_reentrant=False)
         
-        # Predict mask with residual connection
+        # Predict mask
         vocal_mask = self.mask_predictor(x)
         vocal_mask_expanded = vocal_mask.expand(-1, 2, -1, -1)
         return vocal_mask_expanded
