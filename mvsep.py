@@ -315,7 +315,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(in_channels=2)
+    model = NeuralModel()
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
