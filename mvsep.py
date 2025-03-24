@@ -62,12 +62,21 @@ def loss_fn(pred_vocal_mask,
             mixture_mag, mixture_phase,
             window, n_fft, hop_length):
 
-    mrstft = auraloss.freq.MultiResolutionSTFTLoss()
+    mrstft = auraloss.freq.SumAndDifferenceSTFTLoss(
+        fft_sizes=[1024, 2048, 8192],
+        hop_sizes=[256, 512, 2048],
+        win_lengths=[1024, 2048, 8192],
+        perceptual_weighting=True,
+        sample_rate=44100,
+        scale="mel",
+        n_bins=128,
+        device="cuda"
+    )
     
     # Apply the predicted mask to the mixture magnitude.
     pred_vocal_mag = mixture_mag * pred_vocal_mask  # [B, 2, F, T]
 
-    # Helper to form a complex spectrogram.
+    # Helper function to create a complex spectrogram.
     def make_complex(mag):
         return mag * torch.exp(1j * mixture_phase)
 
@@ -86,14 +95,7 @@ def loss_fn(pred_vocal_mask,
     pred_vocal_audio = istft_channels(pred_vocal_spec)  # [B, 2, L]
     target_vocal_audio = istft_channels(target_vocal_spec)
     
-    # Compute the MRSTFT loss
-    loss_vocal = mrstft(pred_vocal_audio, target_vocal_audio)
-    
-    # Compute L1 loss between the predicted and target vocal magnitudes.
-    loss_l1 = F.l1_loss(pred_vocal_mag, target_vocal_mag)
-    
-    # Total loss is the sum of both losses.
-    total_loss = loss_vocal + loss_l1
+    total_loss = mrstft(pred_vocal_audio, target_vocal_audio)
     return total_loss
 
 class MUSDBDataset(Dataset):
