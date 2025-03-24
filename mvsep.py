@@ -62,7 +62,7 @@ def loss_fn(pred_vocal_mask,
             mixture_mag, mixture_phase,
             window, n_fft, hop_length):
 
-    mrstft = auraloss.freq.SumAndDifferenceSTFTLoss(
+    auraloss = auraloss.freq.SumAndDifferenceSTFTLoss(
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
         win_lengths=[1024, 2048, 8192],
@@ -95,7 +95,7 @@ def loss_fn(pred_vocal_mask,
     pred_vocal_audio = istft_channels(pred_vocal_spec)  # [B, 2, L]
     target_vocal_audio = istft_channels(target_vocal_spec)
     
-    total_loss = mrstft(pred_vocal_audio, target_vocal_audio)
+    total_loss = auraloss(pred_vocal_audio, target_vocal_audio)
     return total_loss
 
 class MUSDBDataset(Dataset):
