@@ -1,7 +1,7 @@
 librosa
 museval
 neuraloperator
-numpy
+numpy==1.26.4
 soundfile
 auraloss
 tqdm
