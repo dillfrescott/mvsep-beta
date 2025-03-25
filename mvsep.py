@@ -243,9 +243,14 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
     model.to(device)
+    
+    # Load audio and check sample rate
     input_audio, sr = torchaudio.load(input_wav_path)
+    if sr != 44100:
+        raise ValueError(f"Input audio must be 44100Hz, but got {sr}Hz. Please resample the audio first.")
     if input_audio.shape[0] != 2:
         raise ValueError("Input audio must have 2 channels.")
+        
     input_audio = input_audio.to(device)
     total_length = input_audio.shape[1]
     vocals = torch.zeros_like(input_audio)
@@ -253,6 +258,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     cross_fade_length = overlap // 2
     window = torch.hann_window(4096).to(device)
     num_chunks = (total_length - overlap) // (chunk_size - overlap)
+    
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
             chunk = input_audio[:, i:i + chunk_size]
