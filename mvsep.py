@@ -13,6 +13,9 @@ import numpy as np
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
+import museval
+import pandas as pd
+from collections import defaultdict
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=106, n_modes=(32, 32)):
@@ -172,13 +175,155 @@ class MUSDBDataset(Dataset):
         else:
             return self._process_track(self.tracks[idx])
 
+class MUSDBTestDataset(Dataset):
+    def __init__(self, root_dir, sample_rate=44100):
+        self.root_dir = root_dir
+        self.sample_rate = sample_rate
+        self.n_fft = 4096
+        self.hop_length = 1024
+        self.window = torch.hann_window(self.n_fft)
+        self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
+        
+    def __len__(self):
+        return len(self.tracks)
+    
+    def __getitem__(self, idx):
+        track_path = self.tracks[idx]
+        
+        # Load all stems
+        mixture, _ = torchaudio.load(os.path.join(track_path, 'mixture.wav'))
+        vocals, _ = torchaudio.load(os.path.join(track_path, 'vocals.wav'))
+        bass, _ = torchaudio.load(os.path.join(track_path, 'bass.wav'))
+        drums, _ = torchaudio.load(os.path.join(track_path, 'drums.wav'))
+        other, _ = torchaudio.load(os.path.join(track_path, 'other.wav'))
+        
+        # Create instrumental by summing bass, drums, and other
+        instrumental = bass + drums + other
+        
+        # Convert to spectrograms
+        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, 
+                                 window=self.window, return_complex=True)
+        vocal_spec = torch.stft(vocals, n_fft=self.n_fft, hop_length=self.hop_length,
+                               window=self.window, return_complex=True)
+        instrumental_spec = torch.stft(instrumental, n_fft=self.n_fft, hop_length=self.hop_length,
+                                     window=self.window, return_complex=True)
+        
+        mixture_mag = torch.abs(mixture_spec)
+        mixture_phase = torch.angle(mixture_spec)
+        vocal_mag = torch.abs(vocal_spec)
+        instrumental_mag = torch.abs(instrumental_spec)
+        
+        return {
+            'mixture_mag': mixture_mag,
+            'mixture_phase': mixture_phase,
+            'vocal_mag': vocal_mag,
+            'instrumental_mag': instrumental_mag,
+            'mixture_audio': mixture,
+            'vocal_audio': vocals,
+            'instrumental_audio': instrumental,
+            'track_name': os.path.basename(track_path)
+        }
+
+def compute_sdr(estimates, references):
+    """Compute SDR using museval"""
+    sdr, isr, sir, sar = museval.evaluate(
+        references,
+        estimates,
+        win=self.n_fft,
+        hop=self.hop_length,
+        mode='v4'
+    )
+    return sdr
+
+def validate(model, dataloader, device, window):
+    model.eval()
+    vocal_sdrs = []
+    instrumental_sdrs = []
+    track_results = {}
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Validating"):
+            mixture_mag = batch['mixture_mag'].to(device)
+            mixture_phase = batch['mixture_phase'].to(device)
+            true_vocal = batch['vocal_audio'].to(device)
+            true_instrumental = batch['instrumental_audio'].to(device)
+            track_name = batch['track_name'][0]
+            
+            # Predict vocal mask
+            pred_vocal_mask = model(mixture_mag.unsqueeze(0)).squeeze(0)
+            
+            # Get predicted vocal magnitude
+            pred_vocal_mag = mixture_mag * pred_vocal_mask
+            
+            # Convert back to audio
+            pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)
+            pred_instrumental_spec = (mixture_mag - pred_vocal_mag) * torch.exp(1j * mixture_phase)
+            
+            # ISTFT for both channels
+            pred_vocal = torch.zeros_like(true_vocal)
+            pred_instrumental = torch.zeros_like(true_instrumental)
+            for channel in range(2):
+                pred_vocal[channel] = torch.istft(
+                    pred_vocal_spec[channel].unsqueeze(0),
+                    n_fft=4096,
+                    hop_length=1024,
+                    window=window,
+                    length=true_vocal.shape[1],
+                    return_complex=False
+                ).squeeze(0)
+                
+                pred_instrumental[channel] = torch.istft(
+                    pred_instrumental_spec[channel].unsqueeze(0),
+                    n_fft=4096,
+                    hop_length=1024,
+                    window=window,
+                    length=true_instrumental.shape[1],
+                    return_complex=False
+                ).squeeze(0)
+            
+            # Compute SDRs
+            vocal_sdr = compute_sdr(
+                pred_vocal.cpu().numpy(),
+                true_vocal.cpu().numpy()
+            )
+            
+            instrumental_sdr = compute_sdr(
+                pred_instrumental.cpu().numpy(),
+                true_instrumental.cpu().numpy()
+            )
+            
+            vocal_sdrs.append(np.nanmedian(vocal_sdr))
+            instrumental_sdrs.append(np.nanmedian(instrumental_sdr))
+            
+            track_results[track_name] = {
+                'vocal_sdr': np.nanmedian(vocal_sdr),
+                'instrumental_sdr': np.nanmedian(instrumental_sdr)
+            }
+    
+    avg_vocal_sdr = np.nanmean(vocal_sdrs)
+    avg_instrumental_sdr = np.nanmean(instrumental_sdrs)
+    
+    # Print detailed results
+    print("\nValidation Results:")
+    print("{:<30} {:<15} {:<15}".format("Track", "Vocal SDR", "Instr. SDR"))
+    print("-" * 60)
+    for track, scores in track_results.items():
+        print("{:<30} {:<15.2f} {:<15.2f}".format(
+            track, scores['vocal_sdr'], scores['instrumental_sdr']))
+    
+    print("\nAverage Scores:")
+    print(f"Vocal SDR: {avg_vocal_sdr:.2f}")
+    print(f"Instrumental SDR: {avg_instrumental_sdr:.2f}")
+    
+    return avg_vocal_sdr, avg_instrumental_sdr
+
 def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
     grad_norm = max(grad_norm, eps)
     lr = base_lr * (1.0 / (1.0 + grad_norm / scale))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
+def train(model, train_dataloader, val_dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
     model.to(device)
     step = 0
     avg_loss = 0.0
@@ -191,11 +336,11 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
         avg_loss = checkpoint_data['avg_loss']
         print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
 
-    progress_bar = tqdm(total=epochs * len(dataloader))
+    progress_bar = tqdm(total=epochs * len(train_dataloader))
     model.train()
     for epoch in range(epochs):
-        for batch in dataloader:
-            mixture_mag, mixture_phase, vocal_mag, vocal_phase = batch
+        for batch in train_dataloader:
+            mixture_mag, mixture_phase, vocal_mag, _ = batch
             mixture_mag = mixture_mag.to(device)
             mixture_phase = mixture_phase.to(device)
             vocal_mag = vocal_mag.to(device)
@@ -231,10 +376,23 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
                     'avg_loss': avg_loss,
                 }, checkpoint_filename)
                 checkpoint_files.append(checkpoint_filename)
+                
+                # Perform validation
+                vocal_sdr, instrumental_sdr = validate(model, val_dataloader, device, window)
+                
+                # Save validation results
+                with open(f"validation_results_step_{step}.txt", "w") as f:
+                    f.write(f"Step: {step}\n")
+                    f.write(f"Vocal SDR: {vocal_sdr:.2f}\n")
+                    f.write(f"Instrumental SDR: {instrumental_sdr:.2f}\n")
+                
                 if len(checkpoint_files) > 3:
                     oldest_checkpoint = checkpoint_files.pop(0)
                     if os.path.exists(oldest_checkpoint):
                         os.remove(oldest_checkpoint)
+                
+                # Put model back in training mode
+                model.train()
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
@@ -317,10 +475,11 @@ def main():
     parser.add_argument('--train', action='store_true', help='Train the model')
     parser.add_argument('--infer', action='store_true', help='Inference mode')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
+    parser.add_argument('--test_dir', type=str, default='test', help='Path to test dataset for validation')
     parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
+    parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint and validate every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
@@ -339,8 +498,15 @@ def main():
                                      segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                       num_workers=16, pin_memory=False, persistent_workers=True)
+        
+        # Create validation dataset
+        val_dataset = MUSDBTestDataset(root_dir=args.test_dir)
+        val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False,
+                                   num_workers=4, pin_memory=True)
+        
         total_steps = args.epochs * len(train_dataloader)
-        train(model, train_dataloader, optimizer, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
+        train(model, train_dataloader, val_dataloader, optimizer, loss_fn, device, 
+              args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
