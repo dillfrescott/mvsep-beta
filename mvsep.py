@@ -15,47 +15,173 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=106, n_modes=(32, 32)):
+    def __init__(self, in_channels=2, hidden_channels=64, n_modes=(32, 32)):
         super(NeuralModel, self).__init__()
         
+        # Projection with skip connection
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
+        )
+        self.proj_skip = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
+        
+        # Multi-scale processing branches
+        self.low_band = nn.Sequential(
+            nn.AvgPool2d((8, 1)),
+            *[ResBlock(hidden_channels) for _ in range(2)],
+            nn.Upsample(scale_factor=(8, 1), mode='bilinear', align_corners=False)
         )
         
-        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels,
-                            in_channels=hidden_channels, out_channels=hidden_channels)
+        self.mid_band = nn.Sequential(
+            *[ResBlock(hidden_channels) for _ in range(3)]
+        )
         
+        self.high_band = nn.Sequential(
+            nn.MaxPool2d((1, 4)),
+            *[ResBlock(hidden_channels) for _ in range(2)],
+            nn.Upsample(scale_factor=(1, 4), mode='bilinear', align_corners=False)
+        )
+        
+        # Sub-band processing
+        self.sub_bands = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden_channels, hidden_channels//4, 3, padding=1),
+                nn.GELU()
+            ) for _ in range(4)
+        ])
+        
+        # Frequency attention mechanism
+        self.freq_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, None)),  # Pool along frequency
+            nn.Conv2d(hidden_channels, hidden_channels//4, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels//4, hidden_channels, 1),
+            nn.Sigmoid()
+        )
+        
+        # Time-scale processing
+        self.slow_path = nn.Sequential(
+            nn.AvgPool2d((1, 8)),  # Slow temporal processing
+            *[ResBlock(hidden_channels) for _ in range(2)],
+            nn.Upsample(scale_factor=(1, 8), mode='bilinear', align_corners=False)
+        )
+        
+        # Phase-aware processing
+        self.phase_aware = nn.Sequential(
+            nn.Conv2d(1, hidden_channels//4, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels//4, hidden_channels, 3, padding=1)
+        )
+        
+        # Feature combiner with dynamic weighting
+        self.combiner = nn.Sequential(
+            nn.Conv2d(hidden_channels*6, hidden_channels*2, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels*2, hidden_channels, 1)
+        )
+        self.branch_weights = nn.Parameter(torch.ones(6))
+        
+        # Enhanced FNO
+        self.operator = FNO(n_modes=n_modes, 
+                           hidden_channels=hidden_channels,
+                           in_channels=hidden_channels, 
+                           out_channels=hidden_channels)
+        
+        # Mask predictor
         self.mask_predictor = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(hidden_channels, hidden_channels*2, 3, padding=1),
+            nn.GroupNorm(8, hidden_channels*2),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(hidden_channels*2, hidden_channels, 3, padding=1),
+            nn.GroupNorm(8, hidden_channels),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(hidden_channels, hidden_channels//2, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+            nn.Conv2d(hidden_channels//2, 1, 1),
             nn.Sigmoid()
         )
         
     def forward(self, x):
-        original_H, original_W = x.shape[-2:]
-        # Project input features
-        x = self.projection(x)
+        # Projection with skip
+        x_proj = self.projection(x) + self.proj_skip(x)
         
-        # Apply FNO operator
+        # Get target size from mid band (reference size)
+        x_mid = self.mid_band(x_proj)
+        target_size = x_mid.shape[2:]
+        
+        # Multi-scale processing with size adjustment
+        x_low = self.low_band(x_proj)
+        x_low = F.interpolate(x_low, size=target_size, mode='bilinear', align_corners=False)
+        
+        x_high = self.high_band(x_proj)
+        x_high = F.interpolate(x_high, size=target_size, mode='bilinear', align_corners=False)
+        
+        # Sub-band processing with size adjustment
+        sub_outs = []
+        chunk_size = x_proj.shape[2] // 4
+        for i, sub_conv in enumerate(self.sub_bands):
+            start = i * chunk_size
+            end = (i+1) * chunk_size if i < 3 else x_proj.shape[2]
+            sub = x_proj[:, :, start:end, :]
+            sub_out = sub_conv(sub)
+            sub_out = F.interpolate(sub_out, size=target_size, mode='bilinear', align_corners=False)
+            sub_outs.append(sub_out)
+        x_sub = torch.cat(sub_outs, dim=1)
+        x_sub = F.interpolate(x_sub, size=target_size, mode='bilinear', align_corners=False)
+        
+        # Time-scale processing with size adjustment
+        x_slow = self.slow_path(x_proj)
+        x_slow = F.interpolate(x_slow, size=target_size, mode='bilinear', align_corners=False)
+        
+        # Phase-aware processing
+        if x.dim() == 4 and x.shape[1] == 2:  # If we have phase info
+            phase = torch.angle(torch.view_as_complex(x.permute(0,2,3,1).contiguous()))
+            phase_feat = self.phase_aware(phase.unsqueeze(1))
+            phase_feat = F.interpolate(phase_feat, size=target_size, mode='bilinear', align_corners=False)
+        else:
+            phase_feat = 0
+        
+        # Frequency attention with size adjustment
+        x_attn = self.freq_attention(x_proj)
+        x_attn = F.interpolate(x_attn, size=target_size, mode='bilinear', align_corners=False)
+        
+        # Combine all branches with learned weights
+        branches = [x_low, x_mid, x_high, x_sub, x_slow, x_attn]
+        
+        # Ensure all branches have exactly the same size
+        for i in range(len(branches)):
+            if branches[i].shape[2:] != target_size:
+                branches[i] = F.interpolate(branches[i], size=target_size, 
+                                          mode='bilinear', align_corners=False)
+        
+        weights = F.softmax(self.branch_weights, dim=0)
+        x_combined = sum(w*b for w,b in zip(weights, branches)) + phase_feat
+        
+        # Final combination
+        x = self.combiner(torch.cat(branches, dim=1))
+        
+        # FNO processing
         x = checkpoint(self.operator, x, use_reentrant=False)
         
-        # Predict mask
-        vocal_mask = self.mask_predictor(x)
-        vocal_mask_expanded = vocal_mask.expand(-1, 2, -1, -1)
-        return vocal_mask_expanded
+        # Final mask prediction
+        vocal_mask = self.mask_predictor(x + phase_feat)
+        return vocal_mask.expand(-1, 2, -1, -1)
+
+class ResBlock(nn.Module):
+    """Helper residual block for better gradient flow"""
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm1 = nn.GroupNorm(8, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(8, channels)
+        
+    def forward(self, x):
+        residual = x
+        x = F.gelu(self.norm1(self.conv1(x)))
+        x = self.norm2(self.conv2(x))
+        return x + residual
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
