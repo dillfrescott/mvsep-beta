@@ -15,61 +15,76 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=64, n_modes=(32, 32)):
+    def __init__(self, in_channels=2, hidden_channels=40, n_modes=(32, 32)):
         super(NeuralModel, self).__init__()
         
-        # Projection with skip connection
+        # Enhanced projection with harmonic awareness
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
+            HarmonicAwareBlock(hidden_channels),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
         )
         self.proj_skip = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
         
-        # Multi-scale processing branches
+        # Harmonic suppression branch
+        self.harmonic_suppressor = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
+            HarmonicSuppression(hidden_channels),
+            nn.GELU()
+        )
+        
+        # Multi-scale processing with better frequency discrimination
         self.low_band = nn.Sequential(
             nn.AvgPool2d((8, 1)),
             *[ResBlock(hidden_channels) for _ in range(2)],
+            SpectralDiscriminationBlock(hidden_channels),
             nn.Upsample(scale_factor=(8, 1), mode='bilinear', align_corners=False)
         )
         
         self.mid_band = nn.Sequential(
-            *[ResBlock(hidden_channels) for _ in range(3)]
+            *[ResBlock(hidden_channels) for _ in range(3)],
+            VocalCharacteristicAttention(hidden_channels)  # Added attention
         )
         
         self.high_band = nn.Sequential(
             nn.MaxPool2d((1, 4)),
             *[ResBlock(hidden_channels) for _ in range(2)],
+            SpectralDiscriminationBlock(hidden_channels),  # Added discrimination
             nn.Upsample(scale_factor=(1, 4), mode='bilinear', align_corners=False)
         )
         
-        # Sub-band processing
+        # Sub-band processing with harmonic suppression
         self.sub_bands = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(hidden_channels, hidden_channels//4, 3, padding=1),
+                HarmonicSuppression(hidden_channels//4),  # Added suppression
                 nn.GELU()
             ) for _ in range(4)
         ])
         
-        # Frequency attention mechanism
+        # Enhanced frequency attention
         self.freq_attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, None)),  # Pool along frequency
+            nn.AdaptiveAvgPool2d((1, None)),
             nn.Conv2d(hidden_channels, hidden_channels//4, 1),
             nn.GELU(),
+            VocalCharacteristicAttention(hidden_channels//4),  # Added vocal attention
             nn.Conv2d(hidden_channels//4, hidden_channels, 1),
             nn.Sigmoid()
         )
         
-        # Time-scale processing
+        # Time-scale processing with vocal characteristics
         self.slow_path = nn.Sequential(
-            nn.AvgPool2d((1, 8)),  # Slow temporal processing
+            nn.AvgPool2d((1, 8)),
             *[ResBlock(hidden_channels) for _ in range(2)],
+            VocalCharacteristicAttention(hidden_channels),  # Added attention
             nn.Upsample(scale_factor=(1, 8), mode='bilinear', align_corners=False)
         )
         
-        # Phase-aware processing
+        # Enhanced phase-aware processing
         self.phase_aware = nn.Sequential(
             nn.Conv2d(1, hidden_channels//4, 3, padding=1),
+            HarmonicAwareBlock(hidden_channels//4),  # Added harmonic processing
             nn.GELU(),
             nn.Conv2d(hidden_channels//4, hidden_channels, 3, padding=1)
         )
@@ -78,33 +93,38 @@ class NeuralModel(nn.Module):
         self.combiner = nn.Sequential(
             nn.Conv2d(hidden_channels*6, hidden_channels*2, 1),
             nn.GELU(),
+            VocalCharacteristicEnhancement(hidden_channels*2),
             nn.Conv2d(hidden_channels*2, hidden_channels, 1)
         )
         self.branch_weights = nn.Parameter(torch.ones(6))
         
-        # Enhanced FNO
+        # Enhanced FNO with residual connection
         self.operator = FNO(n_modes=n_modes, 
-                           hidden_channels=hidden_channels,
-                           in_channels=hidden_channels, 
-                           out_channels=hidden_channels)
+                          hidden_channels=hidden_channels,
+                          in_channels=hidden_channels, 
+                          out_channels=hidden_channels)
+        self.operator_residual = nn.Conv2d(hidden_channels, hidden_channels, 1)
         
-        # Mask predictor
+        # Enhanced mask predictor
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels*2, 3, padding=1),
             nn.GroupNorm(8, hidden_channels*2),
             nn.GELU(),
+            VocalCharacteristicAttention(hidden_channels*2),  # Added attention
             nn.Conv2d(hidden_channels*2, hidden_channels, 3, padding=1),
             nn.GroupNorm(8, hidden_channels),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels//2, 3, padding=1),
+            SpectralDiscriminationBlock(hidden_channels//2),  # Added discrimination
             nn.GELU(),
             nn.Conv2d(hidden_channels//2, 1, 1),
             nn.Sigmoid()
         )
         
     def forward(self, x):
-        # Projection with skip
+        # Projection with skip and harmonic suppression
         x_proj = self.projection(x) + self.proj_skip(x)
+        x_proj = self.harmonic_suppressor(x_proj)
         
         # Get target size from mid band (reference size)
         x_mid = self.mid_band(x_proj)
@@ -161,12 +181,97 @@ class NeuralModel(nn.Module):
         # Final combination
         x = self.combiner(torch.cat(branches, dim=1))
         
-        # FNO processing
-        x = checkpoint(self.operator, x, use_reentrant=False)
+        # FNO processing with residual
+        x_operator = checkpoint(self.operator, x, use_reentrant=False)
+        x = x + self.operator_residual(x_operator)
         
         # Final mask prediction
         vocal_mask = self.mask_predictor(x + phase_feat)
         return vocal_mask.expand(-1, 2, -1, -1)
+
+
+class HarmonicAwareBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, (5, 1), padding=(2, 0))
+        self.conv2 = nn.Conv2d(channels, channels, (1, 3), padding=(0, 1))
+        # Dynamically pick the largest possible num_groups ≤ 8 that divides channels
+        possible_groups = [g for g in range(8, 0, -1) if channels % g == 0]
+        num_groups = possible_groups[0] if possible_groups else 1  # fallback to 1
+        self.norm = nn.GroupNorm(num_groups, channels)
+    def forward(self, x):
+        x = F.gelu(self.norm(self.conv1(x)))
+        x = F.gelu(self.norm(self.conv2(x)))
+        return x
+
+class HarmonicSuppression(nn.Module):
+    """Helps suppress harmonic instruments while preserving vocals"""
+    def __init__(self, channels):
+        super().__init__()
+        self.freq_conv = nn.Conv2d(channels, channels, (7, 1), padding=(3, 0))
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, None)),
+            nn.Conv2d(channels, channels//4, 1),
+            nn.GELU(),
+            nn.Conv2d(channels//4, channels, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        h = self.freq_conv(x)
+        gate = self.gate(x)
+        return x * (1 - gate) + h * gate  # Adaptive suppression
+
+class VocalCharacteristicAttention(nn.Module):
+    """Focuses on vocal characteristics like vibrato and formants"""
+    def __init__(self, channels):
+        super().__init__()
+        self.temporal_attn = nn.Sequential(
+            nn.Conv2d(channels, channels//4, (1, 5), padding=(0, 2)),
+            nn.GELU(),
+            nn.Conv2d(channels//4, channels, (1, 5), padding=(0, 2)),
+            nn.Sigmoid()
+        )
+        self.freq_attn = nn.Sequential(
+            nn.Conv2d(channels, channels//4, (5, 1), padding=(2, 0)),
+            nn.GELU(),
+            nn.Conv2d(channels//4, channels, (5, 1), padding=(2, 0)),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        t_attn = self.temporal_attn(x)  # Capture vibrato/amplitude modulation
+        f_attn = self.freq_attn(x)      # Capture formant structure
+        return x * t_attn * f_attn
+
+class SpectralDiscriminationBlock(nn.Module):
+    """Helps discriminate between vocal and instrumental spectra"""
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+        self.spectral_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d((None, 1)),
+            nn.Conv2d(channels, channels//4, 1),
+            nn.GELU(),
+            nn.Conv2d(channels//4, channels, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        x = F.gelu(self.conv(x))
+        gate = self.spectral_gate(x)
+        return x * gate
+
+class VocalCharacteristicEnhancement(nn.Module):
+    """Enhances vocal characteristics in combined features"""
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+        self.attn = VocalCharacteristicAttention(channels)
+        
+    def forward(self, x):
+        x = F.gelu(self.conv(x))
+        return self.attn(x)
 
 class ResBlock(nn.Module):
     """Helper residual block for better gradient flow"""
@@ -334,7 +439,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
             # Replace NaN loss with zero.
             if torch.isnan(loss).any():
                 print("NaN loss detected, replacing with 0.")
-                loss = torch.tensor(0.0, device=device)
+                loss = torch.zeros_like(loss)
 
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
