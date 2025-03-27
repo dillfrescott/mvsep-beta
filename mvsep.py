@@ -18,7 +18,7 @@ class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=40, n_modes=(32, 32)):
         super(NeuralModel, self).__init__()
         
-        # Projection with harmonic awareness
+        # Enhanced projection with harmonic awareness
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
@@ -34,10 +34,7 @@ class NeuralModel(nn.Module):
             nn.GELU()
         )
         
-        # Quiet vocal enhancement right after initial processing
-        self.quiet_vocal_enhancer = QuietVocalEnhancer(hidden_channels)
-        
-        # Multi-scale processing with frequency discrimination
+        # Multi-scale processing with better frequency discrimination
         self.low_band = nn.Sequential(
             nn.AvgPool2d((8, 1)),
             *[ResBlock(hidden_channels) for _ in range(2)],
@@ -47,14 +44,13 @@ class NeuralModel(nn.Module):
         
         self.mid_band = nn.Sequential(
             *[ResBlock(hidden_channels) for _ in range(3)],
-            VocalCharacteristicAttention(hidden_channels),
-            QuietVocalEnhancer(hidden_channels)
+            VocalCharacteristicAttention(hidden_channels)  # Added attention
         )
         
         self.high_band = nn.Sequential(
             nn.MaxPool2d((1, 4)),
             *[ResBlock(hidden_channels) for _ in range(2)],
-            SpectralDiscriminationBlock(hidden_channels),
+            SpectralDiscriminationBlock(hidden_channels),  # Added discrimination
             nn.Upsample(scale_factor=(1, 4), mode='bilinear', align_corners=False)
         )
         
@@ -62,18 +58,17 @@ class NeuralModel(nn.Module):
         self.sub_bands = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(hidden_channels, hidden_channels//4, 3, padding=1),
-                HarmonicSuppression(hidden_channels//4),
-                QuietVocalEnhancer(hidden_channels//4),
+                HarmonicSuppression(hidden_channels//4),  # Added suppression
                 nn.GELU()
             ) for _ in range(4)
         ])
         
-        # Frequency attention
+        # Enhanced frequency attention
         self.freq_attention = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, None)),
             nn.Conv2d(hidden_channels, hidden_channels//4, 1),
             nn.GELU(),
-            VocalCharacteristicAttention(hidden_channels//4),
+            VocalCharacteristicAttention(hidden_channels//4),  # Added vocal attention
             nn.Conv2d(hidden_channels//4, hidden_channels, 1),
             nn.Sigmoid()
         )
@@ -82,15 +77,14 @@ class NeuralModel(nn.Module):
         self.slow_path = nn.Sequential(
             nn.AvgPool2d((1, 8)),
             *[ResBlock(hidden_channels) for _ in range(2)],
-            VocalCharacteristicAttention(hidden_channels),
-            QuietVocalEnhancer(hidden_channels),
+            VocalCharacteristicAttention(hidden_channels),  # Added attention
             nn.Upsample(scale_factor=(1, 8), mode='bilinear', align_corners=False)
         )
         
-        # Phase-aware processing
+        # Enhanced phase-aware processing
         self.phase_aware = nn.Sequential(
             nn.Conv2d(1, hidden_channels//4, 3, padding=1),
-            HarmonicAwareBlock(hidden_channels//4),
+            HarmonicAwareBlock(hidden_channels//4),  # Added harmonic processing
             nn.GELU(),
             nn.Conv2d(hidden_channels//4, hidden_channels, 3, padding=1)
         )
@@ -100,39 +94,37 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels*6, hidden_channels*2, 1),
             nn.GELU(),
             VocalCharacteristicEnhancement(hidden_channels*2),
-            QuietVocalEnhancer(hidden_channels*2),
             nn.Conv2d(hidden_channels*2, hidden_channels, 1)
         )
-        
         self.branch_weights = nn.Parameter(torch.ones(6))
+        
+        # Enhanced FNO with residual connection
         self.operator = FNO(n_modes=n_modes, 
                           hidden_channels=hidden_channels,
                           in_channels=hidden_channels, 
                           out_channels=hidden_channels)
         self.operator_residual = nn.Conv2d(hidden_channels, hidden_channels, 1)
         
+        # Enhanced mask predictor
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels*2, 3, padding=1),
             nn.GroupNorm(8, hidden_channels*2),
             nn.GELU(),
-            VocalCharacteristicAttention(hidden_channels*2),
+            VocalCharacteristicAttention(hidden_channels*2),  # Added attention
             nn.Conv2d(hidden_channels*2, hidden_channels, 3, padding=1),
             nn.GroupNorm(8, hidden_channels),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels//2, 3, padding=1),
-            SpectralDiscriminationBlock(hidden_channels//2),
+            SpectralDiscriminationBlock(hidden_channels//2),  # Added discrimination
             nn.GELU(),
             nn.Conv2d(hidden_channels//2, 1, 1),
             nn.Sigmoid()
         )
-
+        
     def forward(self, x):
         # Projection with skip and harmonic suppression
         x_proj = self.projection(x) + self.proj_skip(x)
         x_proj = self.harmonic_suppressor(x_proj)
-        
-        # Apply quiet vocal enhancement early in the network
-        x_proj = self.quiet_vocal_enhancer(x_proj)
         
         # Get target size from mid band (reference size)
         x_mid = self.mid_band(x_proj)
@@ -196,38 +188,6 @@ class NeuralModel(nn.Module):
         # Final mask prediction
         vocal_mask = self.mask_predictor(x + phase_feat)
         return vocal_mask.expand(-1, 2, -1, -1)
-
-class QuietVocalEnhancer(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.low_gain_path = nn.Sequential(
-            nn.AvgPool2d((4, 4)),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GELU(),
-            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
-        )
-        
-        self.attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels//4, 1),
-            nn.GELU(),
-            nn.Conv2d(channels//4, channels, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        # Process low-energy components
-        low_gain = self.low_gain_path(x)
-        
-        # Ensure sizes match exactly
-        if low_gain.shape != x.shape:
-            low_gain = F.interpolate(low_gain, size=x.shape[2:], mode='bilinear', align_corners=False)
-        
-        # Calculate attention based on energy
-        energy = torch.mean(x**2, dim=(2,3), keepdim=True)
-        attn = self.attention(energy)
-        
-        return x + low_gain * (1 - attn)
 
 class HarmonicAwareBlock(nn.Module):
     def __init__(self, channels):
