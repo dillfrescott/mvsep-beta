@@ -18,7 +18,7 @@ class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=40, n_modes=(32, 32)):
         super(NeuralModel, self).__init__()
         
-        # Enhanced projection with harmonic awareness
+        # Projection with harmonic awareness
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
@@ -34,7 +34,7 @@ class NeuralModel(nn.Module):
             nn.GELU()
         )
         
-        # Multi-scale processing with better frequency discrimination
+        # Multi-scale processing with frequency discrimination
         self.low_band = nn.Sequential(
             nn.AvgPool2d((8, 1)),
             *[ResBlock(hidden_channels) for _ in range(2)],
@@ -50,7 +50,7 @@ class NeuralModel(nn.Module):
         self.high_band = nn.Sequential(
             nn.MaxPool2d((1, 4)),
             *[ResBlock(hidden_channels) for _ in range(2)],
-            SpectralDiscriminationBlock(hidden_channels),  # Added discrimination
+            SpectralDiscriminationBlock(hidden_channels),
             nn.Upsample(scale_factor=(1, 4), mode='bilinear', align_corners=False)
         )
         
@@ -58,17 +58,17 @@ class NeuralModel(nn.Module):
         self.sub_bands = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(hidden_channels, hidden_channels//4, 3, padding=1),
-                HarmonicSuppression(hidden_channels//4),  # Added suppression
+                HarmonicSuppression(hidden_channels//4),
                 nn.GELU()
             ) for _ in range(4)
         ])
         
-        # Enhanced frequency attention
+        # Frequency attention
         self.freq_attention = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, None)),
             nn.Conv2d(hidden_channels, hidden_channels//4, 1),
             nn.GELU(),
-            VocalCharacteristicAttention(hidden_channels//4),  # Added vocal attention
+            VocalCharacteristicAttention(hidden_channels//4),
             nn.Conv2d(hidden_channels//4, hidden_channels, 1),
             nn.Sigmoid()
         )
@@ -77,14 +77,14 @@ class NeuralModel(nn.Module):
         self.slow_path = nn.Sequential(
             nn.AvgPool2d((1, 8)),
             *[ResBlock(hidden_channels) for _ in range(2)],
-            VocalCharacteristicAttention(hidden_channels),  # Added attention
+            VocalCharacteristicAttention(hidden_channels),
             nn.Upsample(scale_factor=(1, 8), mode='bilinear', align_corners=False)
         )
         
-        # Enhanced phase-aware processing
+        # Phase-aware processing
         self.phase_aware = nn.Sequential(
             nn.Conv2d(1, hidden_channels//4, 3, padding=1),
-            HarmonicAwareBlock(hidden_channels//4),  # Added harmonic processing
+            HarmonicAwareBlock(hidden_channels//4),
             nn.GELU(),
             nn.Conv2d(hidden_channels//4, hidden_channels, 3, padding=1)
         )
@@ -98,7 +98,7 @@ class NeuralModel(nn.Module):
         )
         self.branch_weights = nn.Parameter(torch.ones(6))
         
-        # Enhanced FNO with residual connection
+        # FNO with residual connection
         self.operator = FNO(n_modes=n_modes, 
                           hidden_channels=hidden_channels,
                           in_channels=hidden_channels, 
@@ -110,12 +110,12 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels*2, 3, padding=1),
             nn.GroupNorm(8, hidden_channels*2),
             nn.GELU(),
-            VocalCharacteristicAttention(hidden_channels*2),  # Added attention
+            VocalCharacteristicAttention(hidden_channels*2),
             nn.Conv2d(hidden_channels*2, hidden_channels, 3, padding=1),
             nn.GroupNorm(8, hidden_channels),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels//2, 3, padding=1),
-            SpectralDiscriminationBlock(hidden_channels//2),  # Added discrimination
+            SpectralDiscriminationBlock(hidden_channels//2),
             nn.GELU(),
             nn.Conv2d(hidden_channels//2, 1, 1),
             nn.Sigmoid()
