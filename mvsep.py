@@ -189,7 +189,6 @@ class NeuralModel(nn.Module):
         vocal_mask = self.mask_predictor(x + phase_feat)
         return vocal_mask.expand(-1, 2, -1, -1)
 
-
 class HarmonicAwareBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
