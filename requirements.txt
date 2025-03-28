@@ -1,5 +1,4 @@
 librosa
-museval
 neuraloperator
 numpy
 soundfile
