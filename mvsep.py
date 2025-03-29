@@ -68,6 +68,8 @@ def loss_fn(pred_vocal_mask,
         win_lengths=[1024, 2048, 8192],
         perceptual_weighting=False,
         sample_rate=44100,
+        scale="mel",
+        n_bins=128,
         device="cuda"
     )
     
