@@ -15,7 +15,7 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=136, n_modes=(32, 32), n_layers=2):
+    def __init__(self, in_channels=2, hidden_channels=106, n_modes=(32, 32), n_layers=4):
         super(NeuralModel, self).__init__()
         
         self.projection = nn.Sequential(
@@ -62,7 +62,8 @@ def loss_fn(pred_vocal_mask,
             mixture_mag, mixture_phase,
             window, n_fft, hop_length):
 
-    auraloss1 = auraloss.freq.SumAndDifferenceSTFTLoss(
+    # Initialize STFT loss
+    stft_loss = auraloss.freq.SumAndDifferenceSTFTLoss(
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
         win_lengths=[1024, 2048, 8192],
@@ -73,18 +74,21 @@ def loss_fn(pred_vocal_mask,
         device="cuda"
     )
     
-    # Apply the predicted mask to the mixture magnitude.
+    # Apply the predicted mask to the mixture magnitude
     pred_vocal_mag = mixture_mag * pred_vocal_mask  # [B, 2, F, T]
 
-    # Helper function to create a complex spectrogram.
+    # L1 loss between predicted and target magnitudes
+    l1_mag_loss = F.l1_loss(pred_vocal_mag, target_vocal_mag)
+
+    # Helper function to create a complex spectrogram
     def make_complex(mag):
         return mag * torch.exp(1j * mixture_phase)
 
-    # Convert predicted and target magnitudes to complex spectrograms.
+    # Convert predicted and target magnitudes to complex spectrograms
     pred_vocal_spec = make_complex(pred_vocal_mag)
     target_vocal_spec = make_complex(target_vocal_mag)
 
-    # ISTFT helper for batched channels.
+    # ISTFT helper for batched channels
     def istft_channels(spec):
         batch_size, channels, F, T = spec.shape
         spec_combined = spec.reshape(batch_size * channels, F, T)
@@ -95,7 +99,12 @@ def loss_fn(pred_vocal_mask,
     pred_vocal_audio = istft_channels(pred_vocal_spec)  # [B, 2, L]
     target_vocal_audio = istft_channels(target_vocal_spec)
     
-    total_loss = auraloss1(pred_vocal_audio, target_vocal_audio)
+    # Calculate STFT loss
+    stft_loss = stft_loss(pred_vocal_audio, target_vocal_audio)
+    
+    # Combine losses
+    total_loss = stft_loss + l1_mag_loss
+    
     return total_loss
 
 class MUSDBDataset(Dataset):
