@@ -63,7 +63,7 @@ def loss_fn(pred_vocal_mask,
             window, n_fft, hop_length):
 
     # Initialize STFT loss
-    stft_loss = auraloss.freq.SumAndDifferenceSTFTLoss(
+    sad_loss = auraloss.freq.SumAndDifferenceSTFTLoss(
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
         win_lengths=[1024, 2048, 8192],
@@ -100,10 +100,10 @@ def loss_fn(pred_vocal_mask,
     target_vocal_audio = istft_channels(target_vocal_spec)
     
     # Calculate STFT loss
-    stft_loss = stft_loss(pred_vocal_audio, target_vocal_audio)
+    sad_loss1 = sad_loss(pred_vocal_audio, target_vocal_audio)
     
     # Combine losses
-    total_loss = stft_loss + l1_mag_loss
+    total_loss = sad_loss1 + l1_mag_loss
     
     return total_loss
 
