@@ -15,24 +15,47 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=48, n_modes=(32, 32), n_layers=16):
+    def __init__(self, in_channels=2, hidden_channels=48, n_modes=(32, 32), n_layers=14):
         super(NeuralModel, self).__init__()
         
-        self.fno = FNO(
-            n_modes=n_modes,
-            hidden_channels=hidden_channels,
-            n_layers=n_layers,
-            in_channels=in_channels,
-            out_channels=1
+        self.projection = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         
-        self.sigmoid = nn.Sigmoid()
+        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, n_layers=n_layers,
+                            in_channels=hidden_channels, out_channels=hidden_channels)
+        
+        self.mask_predictor = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
         
     def forward(self, x):
-        mask = self.fno(x)
-        mask = self.sigmoid(mask)
-        mask_expanded = mask.expand(-1, 2, -1, -1)
-        return mask_expanded
+        original_H, original_W = x.shape[-2:]
+        # Project input features
+        x = self.projection(x)
+        
+        # Apply FNO operator
+        x = checkpoint(self.operator, x, use_reentrant=False)
+        
+        # Predict mask
+        vocal_mask = self.mask_predictor(x)
+        vocal_mask_expanded = vocal_mask.expand(-1, 2, -1, -1)
+        return vocal_mask_expanded
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
