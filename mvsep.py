@@ -13,54 +13,8 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class MultiHeadGRU(nn.Module):
-    def __init__(self, input_size, hidden_size, num_heads=8, dropout=0.1):
-        super(MultiHeadGRU, self).__init__()
-        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
-        
-        self.num_heads = num_heads
-        self.head_size = hidden_size // num_heads
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        
-        # Create GRU cells for each head
-        self.grus = nn.ModuleList([
-            nn.GRU(input_size // num_heads, self.head_size, batch_first=True)
-            for _ in range(num_heads)
-        ])
-        
-        # Output projection
-        self.proj = nn.Linear(hidden_size, hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        # x shape: [batch*features, time_steps, channels]
-        batch_features, time_steps, channels = x.shape
-        
-        # Split channels into heads
-        x = x.view(batch_features, time_steps, self.num_heads, -1)  # [BF, T, H, C/H]
-        x = x.permute(2, 0, 1, 3)  # [H, BF, T, C/H]
-        
-        # Process each head independently
-        outputs = []
-        for i, gru in enumerate(self.grus):
-            head_x = x[i].contiguous()  # [BF, T, C/H]
-            output, _ = gru(head_x)
-            outputs.append(output)
-        
-        # Combine head outputs
-        outputs = torch.stack(outputs)  # [H, BF, T, C/H]
-        outputs = outputs.permute(1, 2, 0, 3)  # [BF, T, H, C/H]
-        outputs = outputs.reshape(batch_features, time_steps, -1)  # [BF, T, C]
-        
-        # Project and apply dropout
-        outputs = self.proj(outputs)
-        outputs = self.dropout(outputs)
-        
-        return outputs
-
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=512, num_heads=16):
+    def __init__(self, in_channels=2, hidden_channels=512):
         super(NeuralModel, self).__init__()
         
         self.projection = nn.Sequential(
@@ -73,10 +27,9 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         
-        self.multi_head_gru = MultiHeadGRU(
+        self.gru = nn.GRU(
             input_size=hidden_channels,
-            hidden_size=hidden_channels,
-            num_heads=num_heads
+            hidden_size=hidden_channels
         )
         
         self.mask_predictor = nn.Sequential(
@@ -96,13 +49,13 @@ class NeuralModel(nn.Module):
         # Project input features
         x = self.projection(x)
         
-        # Reshape for multi-head GRU processing
+        # Reshape for GRU processing
         batch_size, channels, freq, time = x.shape
         x = x.permute(0, 2, 3, 1)  # [B, F, T, C]
         x = x.reshape(batch_size * freq, time, channels)  # [B*F, T, C]
         
-        # Process through multi-head GRU
-        x = checkpoint(self.multi_head_gru, x, use_reentrant=False)
+        # Process through GRU - we only need the output, not the hidden state
+        x, _ = self.gru(x)  # Unpack the tuple
         
         # Reshape back to original dimensions
         x = x.view(batch_size, freq, time, channels)
