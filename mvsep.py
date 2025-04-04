@@ -7,15 +7,60 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from neuralop.models import FNO
 import auraloss
 import numpy as np
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
+class MultiHeadGRU(nn.Module):
+    def __init__(self, input_size, hidden_size, num_heads=8, dropout=0.1):
+        super(MultiHeadGRU, self).__init__()
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        
+        self.num_heads = num_heads
+        self.head_size = hidden_size // num_heads
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        
+        # Create GRU cells for each head
+        self.grus = nn.ModuleList([
+            nn.GRU(input_size // num_heads, self.head_size, batch_first=True)
+            for _ in range(num_heads)
+        ])
+        
+        # Output projection
+        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        # x shape: [batch*features, time_steps, channels]
+        batch_features, time_steps, channels = x.shape
+        
+        # Split channels into heads
+        x = x.view(batch_features, time_steps, self.num_heads, -1)  # [BF, T, H, C/H]
+        x = x.permute(2, 0, 1, 3)  # [H, BF, T, C/H]
+        
+        # Process each head independently
+        outputs = []
+        for i, gru in enumerate(self.grus):
+            head_x = x[i].contiguous()  # [BF, T, C/H]
+            output, _ = gru(head_x)
+            outputs.append(output)
+        
+        # Combine head outputs
+        outputs = torch.stack(outputs)  # [H, BF, T, C/H]
+        outputs = outputs.permute(1, 2, 0, 3)  # [BF, T, H, C/H]
+        outputs = outputs.reshape(batch_features, time_steps, -1)  # [BF, T, C]
+        
+        # Project and apply dropout
+        outputs = self.proj(outputs)
+        outputs = self.dropout(outputs)
+        
+        return outputs
+
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=48, n_modes=(32, 32), n_layers=14):
+    def __init__(self, in_channels=2, hidden_channels=512, num_heads=16):
         super(NeuralModel, self).__init__()
         
         self.projection = nn.Sequential(
@@ -28,8 +73,11 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         
-        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, n_layers=n_layers,
-                            in_channels=hidden_channels, out_channels=hidden_channels)
+        self.multi_head_gru = MultiHeadGRU(
+            input_size=hidden_channels,
+            hidden_size=hidden_channels,
+            num_heads=num_heads
+        )
         
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
@@ -45,17 +93,24 @@ class NeuralModel(nn.Module):
         )
         
     def forward(self, x):
-        original_H, original_W = x.shape[-2:]
         # Project input features
         x = self.projection(x)
         
-        # Apply FNO operator
-        x = checkpoint(self.operator, x, use_reentrant=False)
+        # Reshape for multi-head GRU processing
+        batch_size, channels, freq, time = x.shape
+        x = x.permute(0, 2, 3, 1)  # [B, F, T, C]
+        x = x.reshape(batch_size * freq, time, channels)  # [B*F, T, C]
+        
+        # Process through multi-head GRU
+        x = checkpoint(self.multi_head_gru, x, use_reentrant=False)
+        
+        # Reshape back to original dimensions
+        x = x.view(batch_size, freq, time, channels)
+        x = x.permute(0, 3, 1, 2)  # [B, C, F, T]
         
         # Predict mask
         vocal_mask = self.mask_predictor(x)
-        vocal_mask_expanded = vocal_mask.expand(-1, 2, -1, -1)
-        return vocal_mask_expanded
+        return vocal_mask.expand(-1, 2, -1, -1)
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
@@ -429,8 +484,8 @@ def main():
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
-    parser.add_argument('--learning_rate', type=float, default=4e-4, help='Learning rate for the optimizer')
+    parser.add_argument('--segment_length', type=int, default=176400, help='Segment length for training')
+    parser.add_argument('--learning_rate', type=float, default=2e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
