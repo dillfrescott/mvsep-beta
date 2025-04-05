@@ -14,7 +14,7 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=884):
+    def __init__(self, in_channels=2, hidden_channels=1024):
         super(NeuralModel, self).__init__()
         
         self.projection = nn.Sequential(
@@ -290,7 +290,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=88200, overlap=44100, device='cpu'):
+              chunk_size=44100, overlap=22050, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
@@ -437,7 +437,7 @@ def main():
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=88200, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=44100, help='Segment length for training')
     parser.add_argument('--learning_rate', type=float, default=2e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
