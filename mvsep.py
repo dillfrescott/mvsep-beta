@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+from neuralop.models import FNO
 import auraloss
 import numpy as np
 import math
@@ -14,7 +15,7 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=884):
+    def __init__(self, in_channels=2, hidden_channels=512, n_modes=(16, 16), n_layers=2):
         super(NeuralModel, self).__init__()
         
         self.projection = nn.Sequential(
@@ -27,10 +28,8 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         
-        self.gru = nn.GRU(
-            input_size=hidden_channels,
-            hidden_size=hidden_channels
-        )
+        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, n_layers=n_layers,
+                            in_channels=hidden_channels, out_channels=hidden_channels)
         
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
@@ -46,24 +45,17 @@ class NeuralModel(nn.Module):
         )
         
     def forward(self, x):
+        original_H, original_W = x.shape[-2:]
         # Project input features
         x = self.projection(x)
         
-        # Reshape for GRU processing
-        batch_size, channels, freq, time = x.shape
-        x = x.permute(0, 2, 3, 1)  # [B, F, T, C]
-        x = x.reshape(batch_size * freq, time, channels)  # [B*F, T, C]
-        
-        # Process through GRU - we only need the output, not the hidden state
-        x, _ = self.gru(x)  # Unpack the tuple
-        
-        # Reshape back to original dimensions
-        x = x.view(batch_size, freq, time, channels)
-        x = x.permute(0, 3, 1, 2)  # [B, C, F, T]
+        # Apply FNO operator
+        x = checkpoint(self.operator, x, use_reentrant=False)
         
         # Predict mask
         vocal_mask = self.mask_predictor(x)
-        return vocal_mask.expand(-1, 2, -1, -1)
+        vocal_mask_expanded = vocal_mask.expand(-1, 2, -1, -1)
+        return vocal_mask_expanded
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
@@ -290,7 +282,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=88200, overlap=44100, device='cpu'):
+              chunk_size=22050, overlap=11025, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
