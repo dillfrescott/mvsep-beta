@@ -7,7 +7,6 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from neuralop.models import FNO
 import auraloss
 import numpy as np
 import math
@@ -15,8 +14,8 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=512, n_modes=(16, 16), n_layers=2):
-        super(NeuralModel, self).__init__()
+    def __init__(self, in_channels=2, hidden_channels=384, num_tasks=6):
+        super().__init__()
         
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
@@ -25,37 +24,58 @@ class NeuralModel(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
         )
         
-        self.operator = FNO(n_modes=n_modes, hidden_channels=hidden_channels, n_layers=n_layers,
-                            in_channels=hidden_channels, out_channels=hidden_channels)
+        self.gru = nn.GRU(
+            input_size=hidden_channels,
+            hidden_size=hidden_channels,
+            bidirectional=True
+        )
         
-        self.mask_predictor = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+        self.task_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_channels * 2, hidden_channels),
+                nn.GELU(),
+                nn.Linear(hidden_channels, 1),
+            ) for _ in range(num_tasks)
+        ])
+        
+        self.mask_fusion = nn.Sequential(
+            nn.Conv2d(hidden_channels * 2 + num_tasks, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
-        
+
     def forward(self, x):
-        original_H, original_W = x.shape[-2:]
-        # Project input features
-        x = self.projection(x)
+        # Project input
+        x = self.projection(x)  # [B, hidden_channels, F, T]
+        B, C, F, T = x.shape
         
-        # Apply FNO operator
-        x = checkpoint(self.operator, x, use_reentrant=False)
+        # Reshape for GRU
+        x = x.permute(0, 2, 3, 1).reshape(B * F, T, C)  # [B*F, T, hidden_channels]
         
-        # Predict mask
-        vocal_mask = self.mask_predictor(x)
-        vocal_mask_expanded = vocal_mask.expand(-1, 2, -1, -1)
-        return vocal_mask_expanded
+        # Process through GRU (bidirectional doubles output channels)
+        gru_out, _ = self.gru(x)  # [B*F, T, hidden_channels * 2]
+        
+        # Predict auxiliary tasks
+        task_preds = [head(gru_out) for head in self.task_heads]  # Each [B*F, T, 1]
+        task_preds = torch.cat(task_preds, dim=-1)  # [B*F, T, num_tasks]
+        
+        # Combine GRU output + task predictions
+        combined = torch.cat([gru_out, task_preds], dim=-1)  # [B*F, T, hidden*2 + num_tasks]
+        
+        # Reshape back to [B, C, F, T]
+        combined = combined.view(B, F, T, -1).permute(0, 3, 1, 2)  # [B, hidden*2 + num_tasks, F, T]
+        
+        # Predict final mask
+        mask = self.mask_fusion(combined)  # [B, 1, F, T]
+        return mask.expand(-1, 2, -1, -1)
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
@@ -282,7 +302,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=22050, overlap=11025, device='cpu'):
+              chunk_size=88200, overlap=44100, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
