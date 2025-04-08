@@ -14,8 +14,8 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=384, num_tasks=6):
-        super().__init__()
+    def __init__(self, in_channels=2, hidden_channels=884):
+        super(NeuralModel, self).__init__()
         
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
@@ -24,58 +24,46 @@ class NeuralModel(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         
         self.gru = nn.GRU(
             input_size=hidden_channels,
-            hidden_size=hidden_channels,
-            bidirectional=True
+            hidden_size=hidden_channels
         )
         
-        self.task_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_channels * 2, hidden_channels),
-                nn.GELU(),
-                nn.Linear(hidden_channels, 1),
-            ) for _ in range(num_tasks)
-        ])
-        
-        self.mask_fusion = nn.Sequential(
-            nn.Conv2d(hidden_channels * 2 + num_tasks, hidden_channels, kernel_size=3, padding=1),
+        self.mask_predictor = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
-            nn.Sigmoid(),
+            nn.Sigmoid()
         )
-
+        
     def forward(self, x):
-        # Project input
-        x = self.projection(x)  # [B, hidden_channels, F, T]
-        B, C, F, T = x.shape
+        # Project input features
+        x = self.projection(x)
         
-        # Reshape for GRU
-        x = x.permute(0, 2, 3, 1).reshape(B * F, T, C)  # [B*F, T, hidden_channels]
+        # Reshape for GRU processing
+        batch_size, channels, freq, time = x.shape
+        x = x.permute(0, 2, 3, 1)  # [B, F, T, C]
+        x = x.reshape(batch_size * freq, time, channels)  # [B*F, T, C]
         
-        # Process through GRU (bidirectional doubles output channels)
-        gru_out, _ = self.gru(x)  # [B*F, T, hidden_channels * 2]
+        # Process through GRU - we only need the output, not the hidden state
+        x, _ = self.gru(x)  # Unpack the tuple
         
-        # Predict auxiliary tasks
-        task_preds = [head(gru_out) for head in self.task_heads]  # Each [B*F, T, 1]
-        task_preds = torch.cat(task_preds, dim=-1)  # [B*F, T, num_tasks]
+        # Reshape back to original dimensions
+        x = x.view(batch_size, freq, time, channels)
+        x = x.permute(0, 3, 1, 2)  # [B, C, F, T]
         
-        # Combine GRU output + task predictions
-        combined = torch.cat([gru_out, task_preds], dim=-1)  # [B*F, T, hidden*2 + num_tasks]
-        
-        # Reshape back to [B, C, F, T]
-        combined = combined.view(B, F, T, -1).permute(0, 3, 1, 2)  # [B, hidden*2 + num_tasks, F, T]
-        
-        # Predict final mask
-        mask = self.mask_fusion(combined)  # [B, 1, F, T]
-        return mask.expand(-1, 2, -1, -1)
+        # Predict mask
+        vocal_mask = self.mask_predictor(x)
+        return vocal_mask.expand(-1, 2, -1, -1)
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
