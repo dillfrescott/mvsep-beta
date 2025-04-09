@@ -13,9 +13,92 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
+def apply_rotary_emb(x, freqs):
+    batch, channels, freq, time = x.shape
+    
+    # Reshape x into [batch * freq * time, channels] assuming we want to rotate each channel
+    x_reshaped = x.permute(0, 2, 3, 1).reshape(batch * freq * time, channels)
+    
+    if freqs.shape[-1] != channels:
+        # Repeat the freq embeddings along the channel dimension
+        repeats = channels // freqs.shape[-1]
+        freqs = freqs.repeat(1, 1, repeats)
+    
+    freqs = freqs.reshape(-1, channels)
+    
+    # Ensure channels is even (needed for forming complex pairs)
+    if channels % 2 != 0:
+        channels_adjusted = channels - 1
+        x_reshaped = x_reshaped[:, :channels_adjusted]
+        freqs = freqs[:, :channels_adjusted]
+    else:
+        channels_adjusted = channels
+    
+    # Reshape into pairs along the channel dimension for complex arithmetic
+    x_pairs = x_reshaped.float().reshape(-1, channels_adjusted // 2, 2)
+    freqs_pairs = freqs.float().reshape(-1, channels_adjusted // 2, 2)
+    
+    # Convert to complex numbers and perform rotation
+    x_complex = torch.view_as_complex(x_pairs.contiguous())
+    freqs_complex = torch.view_as_complex(freqs_pairs.contiguous())
+    x_rotated = x_complex * torch.exp(1j * freqs_complex)
+    
+    # Convert back to real and reshape back
+    x_rotated = torch.view_as_real(x_rotated).flatten(1)
+    # If channels were odd, we need to pad back the last channel (or handle separately)
+    if channels % 2 != 0:
+        # For example, append the unrotated last channel back
+        x_remaining = x[:, -1:, :, :].reshape(batch * freq * time, 1)
+        x_rotated = torch.cat([x_rotated, x_remaining.float()], dim=-1)
+        
+    x_rotated = x_rotated.reshape(batch, freq, time, channels).permute(0, 3, 1, 2)
+    return x_rotated
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_freq=10000):
+        super().__init__()
+        # Ensure dim is even
+        self.dim = dim if dim % 2 == 0 else dim - 1
+        self.max_freq = max_freq
+        
+    def get_freqs(self, h, w):
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Create position indices
+        h_pos = torch.arange(h, device=device).float()
+        w_pos = torch.arange(w, device=device).float()
+        
+        # Create frequency bands for each dimension
+        freqs_h = self._get_1d_freqs(h_pos, h)
+        freqs_w = self._get_1d_freqs(w_pos, w)
+        
+        # Combine frequencies (interleave h and w)
+        freqs = torch.zeros(h, w, self.dim, device=device)
+        freqs[..., 0::2] = freqs_h.unsqueeze(1).expand(-1, w, -1)
+        freqs[..., 1::2] = freqs_w.unsqueeze(0).expand(h, -1, -1)
+        
+        return freqs
+    
+    def _get_1d_freqs(self, pos, scale):
+        half_dim = self.dim // 2
+        dim_t = torch.arange(half_dim, dtype=torch.float32, 
+                            device=pos.device)
+        dim_t = self.max_freq ** (2 * dim_t / (half_dim))
+        
+        pos = pos.unsqueeze(-1) / scale
+        freqs = pos * dim_t.unsqueeze(0)
+        return freqs
+    
+    def forward(self, x):
+        _, _, h, w = x.shape
+        freqs = self.get_freqs(h, w)
+        return apply_rotary_emb(x, freqs)
+
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=884):
+    def __init__(self, in_channels=2, hidden_channels=768):
         super(NeuralModel, self).__init__()
+        
+        self.rotary_emb = RotaryEmbedding(dim=hidden_channels//2)
         
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
@@ -48,6 +131,8 @@ class NeuralModel(nn.Module):
     def forward(self, x):
         # Project input features
         x = self.projection(x)
+        
+        x = self.rotary_emb(x)
         
         # Reshape for GRU processing
         batch_size, channels, freq, time = x.shape
