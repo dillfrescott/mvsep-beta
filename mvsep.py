@@ -15,17 +15,18 @@ from torch.utils.checkpoint import checkpoint
 
 def apply_rotary_emb(x, freqs):
     batch, channels, freq, time = x.shape
-    
-    # Reshape x into [batch * freq * time, channels] assuming we want to rotate each channel
+
+    # Reshape x into [batch * freq * time, channels]
     x_reshaped = x.permute(0, 2, 3, 1).reshape(batch * freq * time, channels)
-    
-    if freqs.shape[-1] != channels:
-        # Repeat the freq embeddings along the channel dimension
-        repeats = channels // freqs.shape[-1]
-        freqs = freqs.repeat(1, 1, repeats)
-    
+
+    # Ensure the frequency tensor’s channel dimension matches 'channels'
+    if freqs.shape[1] != channels:
+        repeats = channels // freqs.shape[1]
+        freqs = freqs.repeat(1, repeats, 1, 1)  # repeat along the channel dimension
+
+    # Reshape freqs to [batch * freq * time, channels] for pairing
     freqs = freqs.reshape(-1, channels)
-    
+
     # Ensure channels is even (needed for forming complex pairs)
     if channels % 2 != 0:
         channels_adjusted = channels - 1
@@ -33,72 +34,84 @@ def apply_rotary_emb(x, freqs):
         freqs = freqs[:, :channels_adjusted]
     else:
         channels_adjusted = channels
-    
-    # Reshape into pairs along the channel dimension for complex arithmetic
+
+    # Reshape into pairs for complex arithmetic
     x_pairs = x_reshaped.float().reshape(-1, channels_adjusted // 2, 2)
     freqs_pairs = freqs.float().reshape(-1, channels_adjusted // 2, 2)
-    
-    # Convert to complex numbers and perform rotation
+
+    # Convert pairs to complex numbers and apply rotation
     x_complex = torch.view_as_complex(x_pairs.contiguous())
     freqs_complex = torch.view_as_complex(freqs_pairs.contiguous())
     x_rotated = x_complex * torch.exp(1j * freqs_complex)
-    
-    # Convert back to real and reshape back
+
+    # Convert back to real and flatten the pairs
     x_rotated = torch.view_as_real(x_rotated).flatten(1)
-    # If channels were odd, we need to pad back the last channel (or handle separately)
+    # If channels were odd, append the unrotated last channel back
     if channels % 2 != 0:
-        # For example, append the unrotated last channel back
         x_remaining = x[:, -1:, :, :].reshape(batch * freq * time, 1)
         x_rotated = torch.cat([x_rotated, x_remaining.float()], dim=-1)
-        
+
+    # Reshape back to [batch, channels, freq, time]
     x_rotated = x_rotated.reshape(batch, freq, time, channels).permute(0, 3, 1, 2)
     return x_rotated
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_freq=10000):
+class XPOS_RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_freq=10000, init_scale=1.0):
         super().__init__()
         # Ensure dim is even
         self.dim = dim if dim % 2 == 0 else dim - 1
         self.max_freq = max_freq
-        
-    def get_freqs(self, h, w):
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-        # Create position indices
-        h_pos = torch.arange(h, device=device).float()
-        w_pos = torch.arange(w, device=device).float()
-        
-        # Create frequency bands for each dimension
-        freqs_h = self._get_1d_freqs(h_pos, h)
-        freqs_w = self._get_1d_freqs(w_pos, w)
-        
-        # Combine frequencies (interleave h and w)
-        freqs = torch.zeros(h, w, self.dim, device=device)
-        freqs[..., 0::2] = freqs_h.unsqueeze(1).expand(-1, w, -1)
-        freqs[..., 1::2] = freqs_w.unsqueeze(0).expand(h, -1, -1)
-        
-        return freqs
-    
+        # xPos-style learnable scaling: a single scalar
+        self.xpos_scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
+
     def _get_1d_freqs(self, pos, scale):
         half_dim = self.dim // 2
-        dim_t = torch.arange(half_dim, dtype=torch.float32, 
-                            device=pos.device)
+        # Create a frequency schedule based on the maximum frequency
+        dim_t = torch.arange(half_dim, dtype=torch.float32, device=pos.device)
         dim_t = self.max_freq ** (2 * dim_t / (half_dim))
-        
         pos = pos.unsqueeze(-1) / scale
         freqs = pos * dim_t.unsqueeze(0)
         return freqs
-    
+
+    def get_freqs(self, h, w):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Create position indices for both axes
+        h_pos = torch.arange(h, device=device).float()
+        w_pos = torch.arange(w, device=device).float()
+
+        freqs_h = self._get_1d_freqs(h_pos, h)
+        freqs_w = self._get_1d_freqs(w_pos, w)
+
+        # Combine frequencies by interleaving: even dims get h and odd dims get w
+        freqs = torch.zeros(h, w, self.dim, device=device)
+        freqs[..., 0::2] = freqs_h.unsqueeze(1).expand(-1, w, -1)
+        freqs[..., 1::2] = freqs_w.unsqueeze(0).expand(h, -1, -1)
+        return freqs
+
     def forward(self, x):
-        _, _, h, w = x.shape
-        freqs = self.get_freqs(h, w)
-        return apply_rotary_emb(x, freqs)
+        # x is expected to be [B, channels, F, T] where channels >= self.dim.
+        B, channels, F, T = x.shape
+        # Compute the rotary angles for spatial dimensions.
+        freqs = self.get_freqs(F, T)  # [F, T, self.dim]
+        # Apply xPos-style scaling
+        freqs = freqs * self.xpos_scale  # scaled rotary angles
+
+        # Permute the angles to match the channel-first format
+        freqs = freqs.permute(2, 0, 1).unsqueeze(0)  # [1, self.dim, F, T]
+
+        # Apply rotary embedding only to the first self.dim channels
+        x_rotated = apply_rotary_emb(x[:, :self.dim, :, :], freqs)
+        # For any remaining channels, just keep them unchanged.
+        if channels > self.dim:
+            x_remaining = x[:, self.dim:, :, :]
+            return torch.cat([x_rotated, x_remaining], dim=1)
+        return x_rotated
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=768):
         super(NeuralModel, self).__init__()
         
-        self.rotary_emb = RotaryEmbedding(dim=hidden_channels//2)
+        self.rotary_emb = XPOS_RotaryEmbedding(dim=hidden_channels//2, init_scale=1.0)
         
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
