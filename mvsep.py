@@ -204,7 +204,7 @@ def loss_fn(pred_vocal_mask,
     def istft_channels(spec, n_fft, hop_length, window):
         batch_size, channels, F_dim, T_dim = spec.shape
         spec_combined = spec.reshape(batch_size * channels, F_dim, T_dim)
-        # Remove the explicit length calculation and argument
+
         audio = torch.istft(
             spec_combined,
             n_fft=n_fft,
@@ -212,8 +212,7 @@ def loss_fn(pred_vocal_mask,
             win_length=window.shape[0], # Should be n_fft
             window=window,
             return_complex=False,
-            center=True # Keep center=True (default, matches stft default)
-            # length=expected_len # REMOVED THIS ARGUMENT
+            center=True
         )
         audio = audio.reshape(batch_size, channels, -1)
         return audio
