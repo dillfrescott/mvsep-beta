@@ -165,6 +165,7 @@ class NeuralModel(nn.Module):
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
+            target_instrumental_mag,
             mixture_mag, mixture_phase,
             window, n_fft, hop_length,
             penalty_scale=1.0):
@@ -172,6 +173,7 @@ def loss_fn(pred_vocal_mask,
     device = mixture_mag.device
     pred_vocal_mask = pred_vocal_mask.to(device)
     target_vocal_mag = target_vocal_mag.to(device)
+    target_instrumental_mag = target_instrumental_mag.to(device)
     mixture_mag = mixture_mag.to(device)
     mixture_phase = mixture_phase.to(device)
     window = window.to(device)
@@ -187,6 +189,7 @@ def loss_fn(pred_vocal_mask,
         device=device
     )
 
+    # Clamp the vocal mask and compute predicted magnitude spectra
     pred_vocal_mask = torch.clamp(pred_vocal_mask, 0.0, 1.0)
     pred_vocal_mag = mixture_mag * pred_vocal_mask
     pred_instrumental_mag = mixture_mag * (1.0 - pred_vocal_mask)
@@ -196,11 +199,7 @@ def loss_fn(pred_vocal_mask,
     def make_complex(mag, phase):
         mag = torch.clamp(mag, min=1e-8)
         return torch.polar(mag, phase)
-
-    pred_vocal_spec = make_complex(pred_vocal_mag, mixture_phase)
-    target_vocal_spec = make_complex(target_vocal_mag, mixture_phase)
-    pred_instrumental_spec = make_complex(pred_instrumental_mag, mixture_phase)
-
+        
     def istft_channels(spec, n_fft, hop_length, window):
         batch_size, channels, F_dim, T_dim = spec.shape
         spec_combined = spec.reshape(batch_size * channels, F_dim, T_dim)
@@ -217,20 +216,33 @@ def loss_fn(pred_vocal_mask,
         audio = audio.reshape(batch_size, channels, -1)
         return audio
 
+    # Create complex spectra for the vocal target and predicted vocal output
+    pred_vocal_spec = make_complex(pred_vocal_mag, mixture_phase)
+    target_vocal_spec = make_complex(target_vocal_mag, mixture_phase)
+    
+    # Create complex spectra for the instrumental target
+    target_instrumental_spec = make_complex(target_instrumental_mag, mixture_phase)
+    pred_instrumental_spec = make_complex(pred_instrumental_mag, mixture_phase)
+
+    # Convert complex spectra back to waveforms using the provided helper function
     pred_vocal_audio = istft_channels(pred_vocal_spec, n_fft, hop_length, window)
     target_vocal_audio = istft_channels(target_vocal_spec, n_fft, hop_length, window)
+    # Compute target instrumental audio from the target instrumental spectrogram
+    target_instrumental_audio = istft_channels(target_instrumental_spec, n_fft, hop_length, window)
     pred_instrumental_audio = istft_channels(pred_instrumental_spec, n_fft, hop_length, window)
 
-    # Trimming is still important as lengths might differ slightly
-    min_len = min(pred_vocal_audio.shape[-1], target_vocal_audio.shape[-1], pred_instrumental_audio.shape[-1])
+    # Trimming to ensure same length across computations
+    min_len = min(pred_vocal_audio.shape[-1], target_vocal_audio.shape[-1],
+                  pred_instrumental_audio.shape[-1], target_instrumental_audio.shape[-1])
     pred_vocal_audio = pred_vocal_audio[..., :min_len]
     target_vocal_audio = target_vocal_audio[..., :min_len]
     pred_instrumental_audio = pred_instrumental_audio[..., :min_len]
+    target_instrumental_audio = target_instrumental_audio[..., :min_len]
 
     vocal_reconstruction_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
 
-    raw_dissimilarity_score = stft_loss_calculator(pred_instrumental_audio, target_vocal_audio)
-    # Ensure penalty_scale is applied correctly
+    # Use predicted vocals and target instrumentals for dissimilarity measurement.
+    raw_dissimilarity_score = stft_loss_calculator(pred_vocal_audio, target_instrumental_audio)
     dissimilarity_penalty = torch.exp(-penalty_scale * raw_dissimilarity_score)
 
     total_loss = l1_vocal_loss + vocal_reconstruction_loss + dissimilarity_penalty
@@ -377,7 +389,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
 
             optimizer.zero_grad()
             pred_vocal_mask = model(mixture_mag)
-            loss = loss_fn(pred_vocal_mask, vocal_mag, mixture_mag, mixture_phase, window, 4096, 1024)
+            loss = loss_fn(pred_vocal_mask, vocal_mag, instrumental_mag, mixture_mag, mixture_phase, window, 4096, 1024)
             
             if torch.isnan(loss).any():
                 print("NaN loss detected, skipping batch")
