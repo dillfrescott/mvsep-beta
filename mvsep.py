@@ -116,7 +116,7 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         
-        self.lstm = nn.LSTM(
+        self.gru = nn.GRU(
             input_size=hidden_channels,
             hidden_size=hidden_channels,
             num_layers=num_layers
@@ -147,7 +147,7 @@ class NeuralModel(nn.Module):
         x = x.reshape(batch_size * freq, time, channels)  # [B*F, T, C]
         
         # Process
-        x, _ = self.lstm(x)
+        x, _ = self.gru(x)
         
         # Reshape back to original dimensions
         x = x.view(batch_size, freq, time, channels)
