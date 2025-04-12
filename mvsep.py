@@ -101,7 +101,7 @@ class XPOS_RotaryEmbedding(nn.Module):
         return x_rotated
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=348, num_layers=6):
+    def __init__(self, in_channels=2, hidden_channels=512, num_layers=3):
         super(NeuralModel, self).__init__()
         
         self.rotary_emb = XPOS_RotaryEmbedding(dim=hidden_channels, init_scale=1.0)
