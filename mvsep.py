@@ -19,10 +19,10 @@ def apply_rotary_emb(x, freqs):
     # Reshape x into [batch * freq * time, channels]
     x_reshaped = x.permute(0, 2, 3, 1).reshape(batch * freq * time, channels)
 
-    # Ensure the frequency tensor’s channel dimension matches 'channels'
+    # Ensure the frequency tensor's channel dimension matches 'channels'
     if freqs.shape[1] != channels:
-        repeats = channels // freqs.shape[1]
-        freqs = freqs.repeat(1, repeats, 1, 1)  # repeat along the channel dimension
+        repeat_times = math.ceil(channels / freqs.shape[1])
+        freqs = freqs.repeat(1, repeat_times, 1, 1)[:, :channels, :, :]
 
     # Reshape freqs to [batch * freq * time, channels] for pairing
     freqs = freqs.reshape(-1, channels)
@@ -46,6 +46,7 @@ def apply_rotary_emb(x, freqs):
 
     # Convert back to real and flatten the pairs
     x_rotated = torch.view_as_real(x_rotated).flatten(1)
+    
     # If channels were odd, append the unrotated last channel back
     if channels % 2 != 0:
         x_remaining = x[:, -1:, :, :].reshape(batch * freq * time, 1)
@@ -58,15 +59,12 @@ def apply_rotary_emb(x, freqs):
 class XPOS_RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_freq=10000, init_scale=1.0):
         super().__init__()
-        # Ensure dim is even
-        self.dim = dim if dim % 2 == 0 else dim - 1
+        self.dim = dim
         self.max_freq = max_freq
-        # xPos-style learnable scaling: a single scalar
         self.xpos_scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
 
     def _get_1d_freqs(self, pos, scale):
         half_dim = self.dim // 2
-        # Create a frequency schedule based on the maximum frequency
         dim_t = torch.arange(half_dim, dtype=torch.float32, device=pos.device)
         dim_t = self.max_freq ** (2 * dim_t / (half_dim))
         pos = pos.unsqueeze(-1) / scale
@@ -75,40 +73,35 @@ class XPOS_RotaryEmbedding(nn.Module):
 
     def get_freqs(self, h, w):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # Create position indices for both axes
         h_pos = torch.arange(h, device=device).float()
         w_pos = torch.arange(w, device=device).float()
 
         freqs_h = self._get_1d_freqs(h_pos, h)
         freqs_w = self._get_1d_freqs(w_pos, w)
 
-        # Combine frequencies by interleaving: even dims get h and odd dims get w
         freqs = torch.zeros(h, w, self.dim, device=device)
         freqs[..., 0::2] = freqs_h.unsqueeze(1).expand(-1, w, -1)
         freqs[..., 1::2] = freqs_w.unsqueeze(0).expand(h, -1, -1)
         return freqs
 
     def forward(self, x):
-        # x is expected to be [B, channels, F, T] where channels >= self.dim.
         B, channels, F, T = x.shape
-        # Compute the rotary angles for spatial dimensions.
-        freqs = self.get_freqs(F, T)  # [F, T, self.dim]
-        # Apply xPos-style scaling
+        freqs = self.get_freqs(F, T)  # [F, T, dim]
         freqs = freqs * self.xpos_scale  # scaled rotary angles
-
+        
         # Permute the angles to match the channel-first format
-        freqs = freqs.permute(2, 0, 1).unsqueeze(0)  # [1, self.dim, F, T]
-
-        # Apply rotary embedding only to the first self.dim channels
-        x_rotated = apply_rotary_emb(x[:, :self.dim, :, :], freqs)
-        # For any remaining channels, just keep them unchanged.
+        freqs = freqs.permute(2, 0, 1).unsqueeze(0)  # [1, dim, F, T]
+        
+        # Apply rotary embedding to all channels
         if channels > self.dim:
-            x_remaining = x[:, self.dim:, :, :]
-            return torch.cat([x_rotated, x_remaining], dim=1)
+            repeat_times = math.ceil(channels / self.dim)
+            freqs = freqs.repeat(1, repeat_times, 1, 1)[:, :channels, :, :]
+        
+        x_rotated = apply_rotary_emb(x, freqs)
         return x_rotated
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=512):
+    def __init__(self, in_channels=2, hidden_channels=512, num_layers=3):
         super(NeuralModel, self).__init__()
         
         self.rotary_emb = XPOS_RotaryEmbedding(dim=hidden_channels, init_scale=1.0)
@@ -123,9 +116,10 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         
-        self.gru = nn.GRU(
+        self.lstm = nn.LSTM(
             input_size=hidden_channels,
-            hidden_size=hidden_channels
+            hidden_size=hidden_channels,
+            num_layers=num_layers
         )
         
         self.mask_predictor = nn.Sequential(
@@ -147,13 +141,13 @@ class NeuralModel(nn.Module):
         
         x = self.rotary_emb(x)
         
-        # Reshape for GRU processing
+        # Reshape for processing
         batch_size, channels, freq, time = x.shape
         x = x.permute(0, 2, 3, 1)  # [B, F, T, C]
         x = x.reshape(batch_size * freq, time, channels)  # [B*F, T, C]
         
-        # Process through GRU - we only need the output, not the hidden state
-        x, _ = self.gru(x)  # Unpack the tuple
+        # Process
+        x, _ = self.lstm(x)
         
         # Reshape back to original dimensions
         x = x.view(batch_size, freq, time, channels)
