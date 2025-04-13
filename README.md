@@ -4,7 +4,7 @@
 
 ---
 
-#### The current implimentation uses a GRU with DARPE (Data-Adaptive Rotary Position Embedding) and the ability to adjust its amount of compute time (ponder) per step/section (a form of Adaptive Computation Time or "ACT").
+#### The current implimentation uses a GRU with DARPE (Data-Adaptive Rotary Position Embedding).
 
 #### The loss consists of L1 magnitude, Sum and difference mel perceptual, and L1 dissimilarity loss added together.
 
