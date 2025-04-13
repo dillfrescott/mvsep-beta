@@ -567,7 +567,6 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                     chunk = F.pad(chunk, (0, pad_amount))
                     chunk_length = chunk.shape[1]
                 else:
-                    # For other small chunks, just skip them
                     pbar.update(1)
                     continue
             
@@ -584,7 +583,12 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             chunk_phase = torch.angle(chunk_spec)
             
             with torch.no_grad():
-                pred_vocal_mask = model(chunk_mag.unsqueeze(0)).squeeze(0)
+                # Request ponder steps here during inference.
+                pred_vocal_mask, ponder_steps = model(chunk_mag.unsqueeze(0), return_ponder=True)
+                pred_vocal_mask = pred_vocal_mask.squeeze(0)
+            
+            # Update tqdm description with current ponder steps
+            pbar.set_description(f"Processing audio - Ponder Steps: {ponder_steps:.2f}")
             
             pred_vocal_mag = chunk_mag * pred_vocal_mask
             pred_instrumental_mag = chunk_mag * (1 - pred_vocal_mask)
