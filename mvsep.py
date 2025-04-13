@@ -162,8 +162,7 @@ def loss_fn(pred_vocal_mask,
             target_vocal_mag,
             target_instrumental_mag,
             mixture_mag, mixture_phase,
-            window, n_fft, hop_length,
-            penalty_scale=1.0):
+            window, n_fft, hop_length):
 
     device = mixture_mag.device
     pred_vocal_mask = pred_vocal_mask.to(device)
@@ -238,7 +237,7 @@ def loss_fn(pred_vocal_mask,
 
     # Use predicted vocals and target instrumentals for dissimilarity measurement.
     raw_dissimilarity_score = F.l1_loss(pred_vocal_audio, target_instrumental_audio)
-    dissimilarity_penalty = torch.exp(-penalty_scale * raw_dissimilarity_score)
+    dissimilarity_penalty = torch.exp(-raw_dissimilarity_score)
 
     total_loss = l1_vocal_loss + vocal_reconstruction_loss + dissimilarity_penalty
 
