@@ -101,7 +101,7 @@ class XPOS_RotaryEmbedding(nn.Module):
         return x_rotated
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=512, num_layers=3):
+    def __init__(self, in_channels=2, hidden_channels=512, num_layers=2):
         super(NeuralModel, self).__init__()
         
         self.rotary_emb = XPOS_RotaryEmbedding(dim=hidden_channels, init_scale=1.0)
@@ -237,7 +237,7 @@ def loss_fn(pred_vocal_mask,
     vocal_reconstruction_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
 
     # Use predicted vocals and target instrumentals for dissimilarity measurement.
-    raw_dissimilarity_score = stft_loss_calculator(pred_vocal_audio, target_instrumental_audio)
+    raw_dissimilarity_score = F.l1_loss(pred_vocal_audio, target_instrumental_audio)
     dissimilarity_penalty = torch.exp(-penalty_scale * raw_dissimilarity_score)
 
     total_loss = l1_vocal_loss + vocal_reconstruction_loss + dissimilarity_penalty
