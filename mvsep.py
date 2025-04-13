@@ -73,7 +73,8 @@ class Rotary_DAPE(nn.Module):
         self.adaptive_mlp = nn.Sequential(
             nn.Conv2d(dim, mlp_hidden, kernel_size=1),
             nn.ReLU(),
-            nn.Conv2d(mlp_hidden, dim, kernel_size=1)
+            nn.Conv2d(mlp_hidden, dim, kernel_size=1),
+            nn.Tanh()  # Constrain output to [-1, 1] range
         )
     
     def _get_1d_freqs(self, pos, scale):
@@ -115,10 +116,17 @@ class Rotary_DAPE(nn.Module):
         x_proj = self.proj(x)
         adaptive = self.adaptive_mlp(x_proj)  # [B, dim, F, T]
         
+        # Clamp the adaptive scaling factor to prevent extreme values
+        adaptive = torch.clamp(adaptive, min=-1.0, max=1.0)
+        
         freqs = freqs.expand(B, -1, -1, -1)
         adapted_freqs = freqs * (1 + adaptive)
         
+        # Safe complex operations
         x_rotated = apply_rotary_emb(x, adapted_freqs)
+        
+        # Add a small epsilon to prevent NaN in gradients
+        x_rotated = x_rotated + 1e-8
         return x_rotated
 
 class NeuralModel(nn.Module):
