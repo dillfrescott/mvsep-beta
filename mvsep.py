@@ -54,7 +54,7 @@ def apply_rotary_emb(x, freqs):
     x_rotated = x_rotated.reshape(batch, freq, time, channels).permute(0, 3, 1, 2)
     return x_rotated
 
-class Rotary_DAPE(nn.Module):
+class DARPE(nn.Module):
     def __init__(self, dim, in_channels=None, max_freq=10000, init_scale=1.0, mlp_hidden=128):
         super().__init__()
         self.dim = dim
@@ -74,7 +74,7 @@ class Rotary_DAPE(nn.Module):
             nn.Conv2d(dim, mlp_hidden, kernel_size=1),
             nn.ReLU(),
             nn.Conv2d(mlp_hidden, dim, kernel_size=1),
-            nn.Tanh()  # Constrain output to [-1, 1] range
+            nn.Tanh()
         )
     
     def _get_1d_freqs(self, pos, scale):
@@ -133,7 +133,7 @@ class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=512, num_layers=2):
         super(NeuralModel, self).__init__()
         
-        self.rotary_dape = Rotary_DAPE(dim=hidden_channels)
+        self.darpe = DARPE(dim=hidden_channels)
         
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
@@ -168,7 +168,7 @@ class NeuralModel(nn.Module):
     def forward(self, x):
         x = self.projection(x)
         
-        x = self.rotary_dape(x)
+        x = self.darpe(x)
         
         batch_size, channels, freq, time = x.shape
         x = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
