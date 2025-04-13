@@ -13,79 +13,6 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class AdaptiveGRU(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers=1, epsilon=0.0001):
-        super().__init__()
-        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
-        self.halting_linear = nn.Linear(hidden_size, 1)
-        self.halting_scale = nn.Parameter(torch.tensor(1.0))
-        self.epsilon = epsilon
-        self.hidden_size = hidden_size
-        self.max_steps = 10
-
-    def forward(self, x):
-        batch_size, seq_len, _ = x.shape
-        device = x.device
-        
-        # Initialize hidden state.
-        h = torch.zeros(self.gru.num_layers, batch_size, self.hidden_size, device=device)
-        
-        # Preallocate accumulators.
-        output_accum = torch.zeros_like(x)
-        running = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
-        remainders = torch.zeros(batch_size, seq_len, device=device)
-        n_updates = torch.zeros(batch_size, seq_len, device=device)
-        
-        # First GRU step.
-        gru_out, h = self.gru(x, h)
-        # Compute halting probability with learnable scale.
-        p = torch.sigmoid(self.halting_linear(gru_out) * self.halting_scale).squeeze(-1)
-        h = h.detach()
-        
-        # Use gradient tracking for the first few iterations.
-        max_grad_steps = 5
-
-        for step in range(self.max_steps):
-            grad_mode = torch.enable_grad() if step < max_grad_steps else torch.no_grad()
-            with grad_mode:
-                running_mask = running.unsqueeze(-1)
-                output_accum.add_(gru_out * running_mask.float())
-                n_updates.add_(running.float())
-                remainders.add_(p * running.float())
-                
-                # Determine which elements should halt.
-                halt = (remainders >= (1.0 - self.epsilon)) & running
-                if halt.any():
-                    remainder = (1.0 - remainders) * halt.float()
-                    output_accum.add_(gru_out * remainder.unsqueeze(-1))
-                    n_updates.add_(halt.float())
-                    running = running & ~halt
-                
-                if not running.any():
-                    break
-                
-                if step < self.max_steps - 1:
-                    # Compute next step only for active elements.
-                    active_mask = running.unsqueeze(-1)
-                    masked_x = x * active_mask.float()
-                    
-                    # Use checkpointing for steps beyond the first.
-                    if step >= 1:
-                        gru_out, h = checkpoint(self._gru_forward, masked_x, h, use_reentrant=False)
-                    else:
-                        gru_out, h = self._gru_forward(masked_x, h)
-                    
-                    p = torch.sigmoid(self.halting_linear(gru_out) * self.halting_scale).squeeze(-1)
-                    
-                    # Detach hidden states less frequently to allow for longer propagation.
-                    if step % 5 == 0:
-                        h = h.detach()
-        
-        return output_accum, n_updates.mean()
-
-    def _gru_forward(self, x, h):
-        return self.gru(x, h)
-
 def apply_rotary_emb(x, freqs):
     batch, channels, freq, time = x.shape
 
@@ -203,7 +130,7 @@ class DARPE(nn.Module):
         return x_rotated
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=384, num_layers=1):
+    def __init__(self, in_channels=2, hidden_channels=512, num_layers=2):
         super(NeuralModel, self).__init__()
         
         self.darpe = DARPE(dim=hidden_channels)
@@ -218,10 +145,11 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         
-        self.adaptive_gru = AdaptiveGRU(
+        self.gru = nn.GRU(
             input_size=hidden_channels,
             hidden_size=hidden_channels,
-            num_layers=num_layers
+            num_layers=num_layers,
+            batch_first=True
         )
         
         self.mask_predictor = nn.Sequential(
@@ -236,27 +164,19 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
             nn.Sigmoid()
         )
-    
-    def forward(self, x, return_ponder=False):
+        
+    def forward(self, x):
         x = self.projection(x)
         
         x = self.darpe(x)
         
         batch_size, channels, freq, time = x.shape
-        # Reshape to [batch * freq, time, channels] for GRU processing
         x = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
-        
-        # Get both the transformed sequence and the average ponder steps
-        x, ponder_steps = self.adaptive_gru(x)
+        x, _ = self.gru(x)
         x = x.view(batch_size, freq, time, channels).permute(0, 3, 1, 2)
         
         vocal_mask = self.mask_predictor(x)
-        vocal_mask = vocal_mask.expand(-1, 2, -1, -1)
-        
-        if return_ponder:
-            return vocal_mask, ponder_steps
-        else:
-            return vocal_mask
+        return vocal_mask.expand(-1, 2, -1, -1)
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
@@ -482,10 +402,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
             vocal_mag = vocal_mag.to(device)
 
             optimizer.zero_grad()
-            
-            # Request ponder steps from the model during training.
-            pred_vocal_mask, ponder_steps = model(mixture_mag, return_ponder=True)
-            
+            pred_vocal_mask = model(mixture_mag)
             loss = loss_fn(pred_vocal_mask, vocal_mag, instrumental_mag, mixture_mag, mixture_phase, window, 4096, 1024)
             
             if torch.isnan(loss).any():
@@ -501,10 +418,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
             step += 1
             progress_bar.update(1)
             current_lr = optimizer.param_groups[0]['lr']
-            
-            # Update progress bar to include the ponder steps info.
-            desc = (f"Epoch {epoch+1}/{epochs} - Ponder Steps: {ponder_steps:.2f} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - "
-                    f"LR: {current_lr:.8f}")
+            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
             progress_bar.set_description(desc)
 
             if step % checkpoint_steps == 0:
@@ -523,7 +437,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=44100, overlap=22050, device='cpu'):
+              chunk_size=88200, overlap=44100, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
@@ -567,6 +481,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                     chunk = F.pad(chunk, (0, pad_amount))
                     chunk_length = chunk.shape[1]
                 else:
+                    # For other small chunks, just skip them
                     pbar.update(1)
                     continue
             
@@ -583,12 +498,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             chunk_phase = torch.angle(chunk_spec)
             
             with torch.no_grad():
-                # Request ponder steps here during inference.
-                pred_vocal_mask, ponder_steps = model(chunk_mag.unsqueeze(0), return_ponder=True)
-                pred_vocal_mask = pred_vocal_mask.squeeze(0)
-            
-            # Update tqdm description with current ponder steps
-            pbar.set_description(f"Processing audio - Ponder Steps: {ponder_steps:.2f}")
+                pred_vocal_mask = model(chunk_mag.unsqueeze(0)).squeeze(0)
             
             pred_vocal_mag = chunk_mag * pred_vocal_mask
             pred_instrumental_mag = chunk_mag * (1 - pred_vocal_mask)
