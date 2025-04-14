@@ -149,7 +149,7 @@ class DualMaskPredictor(nn.Module):
         logits = self.out_conv(x)  # shape: [B, 2, F, T]
         # Softmax produces a probability distribution between the two classes per bin.
         masks = torch.softmax(logits, dim=1)
-        # Extract vocal mask (assuming index 0 corresponds to vocals).
+        # Extract vocal mask
         vocal_mask = masks[:, 0:1, :, :]
         return vocal_mask
 
