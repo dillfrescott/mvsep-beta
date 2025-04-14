@@ -55,7 +55,7 @@ def apply_rotary_emb(x, freqs):
     return x_rotated
 
 class DARPE(nn.Module):
-    def __init__(self, dim, in_channels=None, max_freq=10000, init_scale=1.0, mlp_hidden=128):
+    def __init__(self, dim, in_channels=None, max_freq=10000, init_scale=1.0, mlp_hidden=256):
         super().__init__()
         self.dim = dim
         self.max_freq = max_freq
