@@ -129,6 +129,30 @@ class DARPE(nn.Module):
         x_rotated = x_rotated + 1e-8
         return x_rotated
 
+class DualMaskPredictor(nn.Module):
+    def __init__(self, hidden_channels):
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU()
+        )
+        # Output two channels: one for vocals and one for instrumentals.
+        self.out_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
+    
+    def forward(self, x):
+        # x is expected to have shape [B, hidden_channels, F, T].
+        x = self.conv_block(x)
+        logits = self.out_conv(x)  # shape: [B, 2, F, T]
+        # Softmax produces a probability distribution between the two classes per bin.
+        masks = torch.softmax(logits, dim=1)
+        # Extract vocal mask (assuming index 0 corresponds to vocals).
+        vocal_mask = masks[:, 0:1, :, :]
+        return vocal_mask
+
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=512, num_layers=2):
         super(NeuralModel, self).__init__()
@@ -152,18 +176,7 @@ class NeuralModel(nn.Module):
             batch_first=True
         )
         
-        self.mask_predictor = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
+        self.mask_predictor = DualMaskPredictor(hidden_channels)
         
     def forward(self, x):
         x = self.projection(x)
