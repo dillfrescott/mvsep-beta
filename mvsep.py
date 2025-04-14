@@ -72,7 +72,7 @@ class DARPE(nn.Module):
             
         self.adaptive_mlp = nn.Sequential(
             nn.Conv2d(dim, mlp_hidden, kernel_size=1),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Conv2d(mlp_hidden, dim, kernel_size=1),
             nn.Tanh()
         )
