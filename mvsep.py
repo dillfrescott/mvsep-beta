@@ -13,162 +13,59 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-def apply_rotary_emb(x, freqs):
-    batch, channels, freq, time = x.shape
-
-    # Permute to [batch, freq, time, channels] and flatten spatial dims.
-    x_reshaped = x.permute(0, 2, 3, 1).reshape(-1, channels)
-
-    # Make sure freqs is broadcastable over batch, freq, time.
-    if freqs.shape[1] != channels:
-        repeat_times = math.ceil(channels / freqs.shape[1])
-        freqs = freqs.repeat(1, repeat_times, 1, 1)[:, :channels, :, :]
-    freqs = freqs.reshape(-1, channels)
-
-    # Ensure channels is even for complex representation.
-    if channels % 2 != 0:
-        channels_adjusted = channels - 1
-        x_reshaped = x_reshaped[:, :channels_adjusted]
-        freqs = freqs[:, :channels_adjusted]
-    else:
-        channels_adjusted = channels
-
-    # Reshape into pairs for complex arithmetic.
-    x_pairs = x_reshaped.float().reshape(-1, channels_adjusted // 2, 2)
-    freqs_pairs = freqs.float().reshape(-1, channels_adjusted // 2, 2)
-
-    # Convert pairs to complex numbers and apply rotation.
-    x_complex = torch.view_as_complex(x_pairs.contiguous())
-    freqs_complex = torch.view_as_complex(freqs_pairs.contiguous())
-    x_rotated = x_complex * torch.exp(1j * freqs_complex)
-
-    # Convert back to real and flatten the pairs.
-    x_rotated = torch.view_as_real(x_rotated).flatten(1)
-    
-    # If channels were odd, append the unrotated last channel.
-    if channels % 2 != 0:
-        x_remaining = x[:, -1:, :, :].reshape(batch * freq * time, 1)
-        x_rotated = torch.cat([x_rotated, x_remaining.float()], dim=-1)
-
-    # Reshape back to [batch, channels, freq, time].
-    x_rotated = x_rotated.reshape(batch, freq, time, channels).permute(0, 3, 1, 2)
-    return x_rotated
-
-class DARPE(nn.Module):
-    def __init__(self, dim, in_channels=None, max_freq=10000, init_scale=1.0, mlp_hidden=256):
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
         super().__init__()
-        self.dim = dim
-        self.max_freq = max_freq
-        self.base_scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
-        
-        # If in_channels is not provided, default to using 'dim'
-        in_channels = in_channels if in_channels is not None else dim
-        
-        # Register projection if needed.
-        if in_channels != dim:
-            self.proj = nn.Conv2d(in_channels, dim, kernel_size=1)
-        else:
-            self.proj = nn.Identity()
-            
-        self.adaptive_mlp = nn.Sequential(
-            nn.Conv2d(dim, mlp_hidden, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mlp_hidden, dim, kernel_size=1),
-            nn.Tanh()
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Sigmoid()
         )
-    
-    def _get_1d_freqs(self, pos, scale):
-        half_dim = self.dim // 2
-        dim_t = torch.arange(half_dim, dtype=torch.float32, device=pos.device)
-        # Compute frequencies as in standard sinusoidal PE.
-        dim_t = self.max_freq ** (-2 * dim_t / half_dim)
-        pos = pos.unsqueeze(-1) / scale
-        freqs = pos * dim_t.unsqueeze(0)
-        return freqs
 
-    def get_freqs(self, F_dim, T_dim):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # Create positional indices for frequency and time axes.
-        h_pos = torch.arange(F_dim, device=device).float()
-        t_pos = torch.arange(T_dim, device=device).float()
-        # Get 1D frequencies for each axis.
-        freqs_h = self._get_1d_freqs(h_pos, F_dim)
-        freqs_t = self._get_1d_freqs(t_pos, T_dim)
-        # Create a 2D grid of frequencies.
-        freqs = torch.zeros(F_dim, T_dim, self.dim, device=device)
-        freqs[..., 0::2] = freqs_h.unsqueeze(1).expand(-1, T_dim, -1)
-        freqs[..., 1::2] = freqs_t.unsqueeze(0).expand(F_dim, -1, -1)
-        return freqs  # Shape: [F_dim, T_dim, dim]
-    
     def forward(self, x):
-        B, channels, F_dim, T_dim = x.shape
-            
-        # Compute frequencies.
-        freqs = self.get_freqs(F_dim, T_dim)  # shape [F_dim, T_dim, dim]
-        freqs = freqs * self.base_scale
-        freqs = freqs.permute(2, 0, 1).unsqueeze(0)  # [1, dim, F, T]
-        
-        if channels > self.dim:
-            repeat_times = math.ceil(channels / self.dim)
-            freqs = freqs.repeat(1, repeat_times, 1, 1)[:, :channels, :, :]
-        
-        # Use the registered projection.
-        x_proj = self.proj(x)
-        adaptive = self.adaptive_mlp(x_proj)  # [B, dim, F, T]
-        
-        # Clamp the adaptive scaling factor to prevent extreme values
-        adaptive = torch.clamp(adaptive, min=-1.0, max=1.0)
-        
-        freqs = freqs.expand(B, -1, -1, -1)
-        adapted_freqs = freqs * (1 + adaptive)
-        
-        # Safe complex operations
-        x_rotated = apply_rotary_emb(x, adapted_freqs)
-        
-        # Add a small epsilon to prevent NaN in gradients
-        x_rotated = x_rotated + 1e-8
-        return x_rotated
+        scale = self.se(x)
+        return x * scale
 
-class DualMaskPredictor(nn.Module):
+class DualSpectrogramPredictor(nn.Module):
     def __init__(self, hidden_channels):
         super().__init__()
-        self.conv_block = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_channels),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_channels),
-            nn.GELU()
-        )
-        # Output two channels: one for vocals and one for instrumentals.
-        self.out_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
-    
+        self.conv1 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(hidden_channels // 16, hidden_channels)
+        self.act1 = nn.GELU()
+
+        self.conv2 = nn.Conv2d(hidden_channels, hidden_channels, 3, padding=2, dilation=2)
+        self.norm2 = nn.GroupNorm(hidden_channels // 16, hidden_channels)
+        self.act2 = nn.GELU()
+        
+        self.se = SEBlock(hidden_channels)
+
+        self.out_conv = nn.Conv2d(hidden_channels, 4, 1)
+        self.out_act = nn.GELU()
+
     def forward(self, x):
-        # x is expected to have shape [B, hidden_channels, F, T].
-        x = self.conv_block(x)
-        logits = self.out_conv(x)  # shape: [B, 2, F, T]
-        # Softmax produces a probability distribution between the two classes per bin.
-        masks = torch.softmax(logits, dim=1)
-        # Extract vocal mask
-        vocal_mask = masks[:, 0:1, :, :]
-        return vocal_mask
+        identity = x
+        out = self.act1(self.norm1(self.conv1(x)))
+        out = self.act2(self.norm2(self.conv2(out)))
+        out = self.se(out)
+        out = out + identity
+        mags = self.out_act(self.out_conv(out))
+        return mags
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=512, num_layers=2):
         super(NeuralModel, self).__init__()
-        
-        self.darpe = DARPE(dim=hidden_channels)
-        
         self.projection = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
+            nn.Conv2d(in_channels, hidden_channels, 1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
+            nn.Conv2d(hidden_channels, hidden_channels, 1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
+            nn.Conv2d(hidden_channels, hidden_channels, 1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
+            nn.Conv2d(hidden_channels, hidden_channels, 1)
         )
-        
+
         self.gru = nn.GRU(
             input_size=hidden_channels,
             hidden_size=hidden_channels,
@@ -176,35 +73,30 @@ class NeuralModel(nn.Module):
             batch_first=True
         )
         
-        self.mask_predictor = DualMaskPredictor(hidden_channels)
+        self.spectrogram_predictor = DualSpectrogramPredictor(hidden_channels)
         
     def forward(self, x):
         x = self.projection(x)
-        
-        x = self.darpe(x)
-        
         batch_size, channels, freq, time = x.shape
         x = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
         x, _ = self.gru(x)
         x = x.view(batch_size, freq, time, channels).permute(0, 3, 1, 2)
-        
-        vocal_mask = self.mask_predictor(x)
-        return vocal_mask.expand(-1, 2, -1, -1)
+        out_mags = self.spectrogram_predictor(x)  # [B, 4, F, T]
+        vocal_mag = out_mags[:, 0:2]   # [B, 2, F, T]
+        instr_mag = out_mags[:, 2:4]   # [B, 2, F, T]
+        mask_vocal = vocal_mag / (vocal_mag + instr_mag + 1e-8)   # [B, 2, F, T]
+        mask_instr = instr_mag / (vocal_mag + instr_mag + 1e-8)
+        return vocal_mag, instr_mag, mask_vocal, mask_instr
 
-def loss_fn(pred_vocal_mask,
+def loss_fn(pred_vocal_mag,
+            pred_instrumental_mag,
             target_vocal_mag,
             target_instrumental_mag,
-            mixture_mag, mixture_phase,
-            window, n_fft, hop_length):
+            mixture_phase,
+            window, n_fft, hop_length,
+            alpha=1.0, beta=1.0, gamma=1.0, delta=0.01):
 
-    device = mixture_mag.device
-    pred_vocal_mask = pred_vocal_mask.to(device)
-    target_vocal_mag = target_vocal_mag.to(device)
-    target_instrumental_mag = target_instrumental_mag.to(device)
-    mixture_mag = mixture_mag.to(device)
-    mixture_phase = mixture_phase.to(device)
-    window = window.to(device)
-
+    device = target_vocal_mag.device
     stft_loss_calculator = auraloss.freq.SumAndDifferenceSTFTLoss(
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
@@ -216,26 +108,26 @@ def loss_fn(pred_vocal_mask,
         device=device
     )
 
-    # Clamp the vocal mask and compute predicted magnitude spectra
-    pred_vocal_mask = torch.clamp(pred_vocal_mask, 0.0, 1.0)
-    pred_vocal_mag = mixture_mag * pred_vocal_mask
-    pred_instrumental_mag = mixture_mag * (1.0 - pred_vocal_mask)
+    pred_vocal_mag = torch.clamp(pred_vocal_mag, min=1e-8)
+    pred_instrumental_mag = torch.clamp(pred_instrumental_mag, min=1e-8)
+    target_vocal_mag = torch.clamp(target_vocal_mag, min=1e-8)
+    target_instrumental_mag = torch.clamp(target_instrumental_mag, min=1e-8)
 
+    # L1 loss on mags
     l1_vocal_loss = F.l1_loss(pred_vocal_mag, target_vocal_mag)
+    l1_instrumental_loss = F.l1_loss(pred_instrumental_mag, target_instrumental_mag)
 
     def make_complex(mag, phase):
-        mag = torch.clamp(mag, min=1e-8)
         return torch.polar(mag, phase)
         
     def istft_channels(spec, n_fft, hop_length, window):
         batch_size, channels, F_dim, T_dim = spec.shape
         spec_combined = spec.reshape(batch_size * channels, F_dim, T_dim)
-
         audio = torch.istft(
             spec_combined,
             n_fft=n_fft,
             hop_length=hop_length,
-            win_length=window.shape[0], # Should be n_fft
+            win_length=window.shape[0],
             window=window,
             return_complex=False,
             center=True
@@ -243,22 +135,18 @@ def loss_fn(pred_vocal_mask,
         audio = audio.reshape(batch_size, channels, -1)
         return audio
 
-    # Create complex spectra for the vocal target and predicted vocal output
+    # *Use mixture phase for consistency if not estimating phase
     pred_vocal_spec = make_complex(pred_vocal_mag, mixture_phase)
     target_vocal_spec = make_complex(target_vocal_mag, mixture_phase)
-    
-    # Create complex spectra for the instrumental target
-    target_instrumental_spec = make_complex(target_instrumental_mag, mixture_phase)
     pred_instrumental_spec = make_complex(pred_instrumental_mag, mixture_phase)
+    target_instrumental_spec = make_complex(target_instrumental_mag, mixture_phase)
 
-    # Convert complex spectra back to waveforms using the provided helper function
     pred_vocal_audio = istft_channels(pred_vocal_spec, n_fft, hop_length, window)
     target_vocal_audio = istft_channels(target_vocal_spec, n_fft, hop_length, window)
-    # Compute target instrumental audio from the target instrumental spectrogram
-    target_instrumental_audio = istft_channels(target_instrumental_spec, n_fft, hop_length, window)
     pred_instrumental_audio = istft_channels(pred_instrumental_spec, n_fft, hop_length, window)
+    target_instrumental_audio = istft_channels(target_instrumental_spec, n_fft, hop_length, window)
 
-    # Trimming to ensure same length across computations
+    # Trimming to same length
     min_len = min(pred_vocal_audio.shape[-1], target_vocal_audio.shape[-1],
                   pred_instrumental_audio.shape[-1], target_instrumental_audio.shape[-1])
     pred_vocal_audio = pred_vocal_audio[..., :min_len]
@@ -267,14 +155,20 @@ def loss_fn(pred_vocal_mask,
     target_instrumental_audio = target_instrumental_audio[..., :min_len]
 
     vocal_reconstruction_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
+    instrumental_reconstruction_loss = stft_loss_calculator(pred_instrumental_audio, target_instrumental_audio)
 
-    # Use predicted vocals and target instrumentals for dissimilarity measurement.
-    raw_dissimilarity_score = F.l1_loss(pred_vocal_audio, target_instrumental_audio)
-    dissimilarity_penalty = torch.exp(-raw_dissimilarity_score)
+    # Dissimilarity (maximize L1 distance)
+    dissimilarity_score = F.l1_loss(pred_vocal_audio, pred_instrumental_audio)
 
-    total_loss = l1_vocal_loss + vocal_reconstruction_loss + dissimilarity_penalty
+    total_loss = (
+        alpha * l1_vocal_loss +
+        beta * l1_instrumental_loss +
+        gamma * (vocal_reconstruction_loss + instrumental_reconstruction_loss) -
+        delta * dissimilarity_score
+    )
 
     return total_loss
+
 
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True):
@@ -413,11 +307,12 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
             mixture_mag = mixture_mag.to(device)
             mixture_phase = mixture_phase.to(device)
             vocal_mag = vocal_mag.to(device)
+            instrumental_mag = instrumental_mag.to(device)
 
             optimizer.zero_grad()
-            pred_vocal_mask = model(mixture_mag)
-            loss = loss_fn(pred_vocal_mask, vocal_mag, instrumental_mag, mixture_mag, mixture_phase, window, 4096, 1024)
-            
+            pred_vocal_mag, pred_instrumental_mag, _, _ = model(mixture_mag)
+            loss = loss_fn(pred_vocal_mag, pred_instrumental_mag, vocal_mag, instrumental_mag, mixture_phase, window, 4096, 1024)
+
             if torch.isnan(loss).any():
                 print("NaN loss detected, skipping batch")
                 continue
@@ -511,10 +406,9 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             chunk_phase = torch.angle(chunk_spec)
             
             with torch.no_grad():
-                pred_vocal_mask = model(chunk_mag.unsqueeze(0)).squeeze(0)
-            
-            pred_vocal_mag = chunk_mag * pred_vocal_mask
-            pred_instrumental_mag = chunk_mag * (1 - pred_vocal_mask)
+                pred_vocal_mag, pred_instrumental_mag, _, _ = model(chunk_mag.unsqueeze(0))
+            pred_vocal_mag = pred_vocal_mag.squeeze(0)
+            pred_instrumental_mag = pred_instrumental_mag.squeeze(0)
 
             vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
             instrumental_spec = pred_instrumental_mag * torch.exp(1j * chunk_phase)
