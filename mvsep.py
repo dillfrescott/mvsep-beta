@@ -292,172 +292,137 @@ def loss_fn(pred_vocal_mag,
     return total_loss
 
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, preprocess_dir=None, sample_rate=44100, segment_length=485100, segment=True):
+    def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
+        """
+        Args:
+            root_dir (str): Path to the directory containing individual track folders.
+            sample_rate (int): Sampling rate to use for all audio.
+            segment_length (int): Desired segment length in raw audio samples (e.g. 88200 samples ≈ 2 seconds).
+            segment (bool): Whether to randomly select a segment or use the whole audio.
+        """
         self.root_dir = root_dir
-        self.preprocess_dir = preprocess_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
+        self.segment = segment
+
+        # STFT parameters
         self.n_fft = 4096
         self.hop_length = 1024
-        self.segment = segment
         self.window = torch.hann_window(self.n_fft)
-        
-        # Get lists of all available stems
-        self.track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
-        
-        # Preprocess and cache individual stems
-        self.preprocessed_stems = []
-        if self.preprocess_dir:
-            os.makedirs(self.preprocess_dir, exist_ok=True)
-            
-        # Process all tracks
-        for track_idx, td in enumerate(tqdm(self.track_dirs, desc="Preprocessing stems")):
-            # Process vocals if available
-            vocal_path = os.path.join(td, 'vocals.wav')
-            if os.path.exists(vocal_path):
-                vocal_cache = self._preprocess_stem(vocal_path, track_idx, 'vocals')
-                self.preprocessed_stems.append(vocal_cache)
-            
-            # Process instrumentals (sum of drums, bass, other)
-            instr_paths = [os.path.join(td, f'{s}.wav') for s in ['drums', 'bass', 'other']]
-            if all(os.path.exists(p) for p in instr_paths):
-                instr_cache = self._preprocess_instrumental(instr_paths, track_idx)
-                self.preprocessed_stems.append(instr_cache)
-        
-        # Create indices for valid vocal/instrumental pairs
-        self.vocal_indices = [i for i, stem in enumerate(self.preprocessed_stems) if stem['type'] == 'vocals']
-        self.instr_indices = [i for i, stem in enumerate(self.preprocessed_stems) if stem['type'] == 'instrumental']
-        
-        # Ensure we have at least some pairs
-        if not self.vocal_indices or not self.instr_indices:
-            raise ValueError("Dataset must contain both vocal and instrumental stems")
-        
-        self.size = 50000  # Large number for random pairing
 
-    def _preprocess_stem(self, stem_path, track_idx, stem_type):
-        """Preprocess and cache a single stem"""
-        if self.preprocess_dir:
-            cache_path = os.path.join(self.preprocess_dir, f"{track_idx}_{stem_type}.npz")
-            if os.path.exists(cache_path):
-                return {'path': cache_path, 'type': stem_type}
+        # Gather lists of available vocal and instrumental stems.
+        # We assume each track is in its own folder under root_dir.
+        self.track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
+        self.vocal_paths = []   # List of file paths for vocals.
+        self.instr_paths = []   # List of tuples for instrumental components (drums, bass, other).
+
+        print("Scanning track folders for stems...")
+        for td in tqdm(self.track_dirs, desc="Scanning tracks"):
+            vocal_path = os.path.join(td, 'vocals.wav')
+            drum_path = os.path.join(td, 'drums.wav')
+            bass_path = os.path.join(td, 'bass.wav')
+            other_path = os.path.join(td, 'other.wav')
+            
+            if os.path.exists(vocal_path):
+                self.vocal_paths.append(vocal_path)
+            # For instrumentals, require all three components to be present.
+            if os.path.exists(drum_path) and os.path.exists(bass_path) and os.path.exists(other_path):
+                self.instr_paths.append((drum_path, bass_path, other_path))
+                
+        # Ensure we have at least some pairs.
+        if not self.vocal_paths or not self.instr_paths:
+            raise ValueError("Dataset must contain both vocal and instrumental stems.")
         
-        # Load and process audio
-        audio, sr = torchaudio.load(stem_path)
+        # For random pairing during training, set an arbitrary large dataset size.
+        self.size = 50000
+
+    def _preprocess_audio(self, audio, sr):
+        """
+        Resamples and ensures stereo audio.
+        """
         if sr != self.sample_rate:
             resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
             audio = resampler(audio)
-        
-        # Ensure stereo
+        # Ensure stereo: if mono then duplicate; if more than 2 channels then take first two.
         if audio.shape[0] == 1:
             audio = audio.repeat(2, 1)
         elif audio.shape[0] > 2:
             audio = audio[:2, :]
-        
-        # Compute STFT
-        spec = torch.stft(audio, n_fft=self.n_fft, hop_length=self.hop_length,
-                         window=self.window, return_complex=True)
-        mag = torch.abs(spec)
-        phase = torch.angle(spec)
-        
-        if self.preprocess_dir:
-            np.savez(cache_path,
-                    mag=mag.numpy(),
-                    phase=phase.numpy(),
-                    audio_length=audio.shape[1])
-            return {'path': cache_path, 'type': stem_type}
-        else:
-            return {'mag': mag, 'phase': phase, 'audio_length': audio.shape[1], 'type': stem_type}
+        return audio
 
-    def _preprocess_instrumental(self, stem_paths, track_idx):
-        """Preprocess and cache instrumental (sum of components)"""
-        if self.preprocess_dir:
-            cache_path = os.path.join(self.preprocess_dir, f"{track_idx}_instrumental.npz")
-            if os.path.exists(cache_path):
-                return {'path': cache_path, 'type': 'instrumental'}
-        
-        # Load and sum all components
-        instrumental = None
-        min_length = float('inf')
-        
-        for path in stem_paths:
-            audio, sr = torchaudio.load(path)
-            if sr != self.sample_rate:
-                resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-                audio = resampler(audio)
-            
-            # Ensure stereo and track min length
-            if audio.shape[0] == 1:
-                audio = audio.repeat(2, 1)
-            elif audio.shape[0] > 2:
-                audio = audio[:2, :]
-            
+    def _load_audio(self, filepath):
+        """
+        Loads raw audio from a given file path and preprocesses it.
+        """
+        audio, sr = torchaudio.load(filepath)
+        audio = self._preprocess_audio(audio, sr)
+        return audio
+
+    def _load_vocal(self, path):
+        """
+        Loads and returns the raw vocal audio.
+        """
+        return self._load_audio(path)
+
+    def _load_instrumental(self, paths):
+        """
+        Loads instrumental stems, sums them (truncating to the minimum length among components),
+        and returns the summed audio.
+        """
+        audios = []
+        min_length = float("inf")
+        for p in paths:
+            audio = self._load_audio(p)
+            audios.append(audio)
             min_length = min(min_length, audio.shape[1])
-            if instrumental is None:
-                instrumental = audio[:, :min_length]
-            else:
-                instrumental += audio[:, :min_length]
-        
-        # Compute STFT
-        spec = torch.stft(instrumental, n_fft=self.n_fft, hop_length=self.hop_length,
-                         window=self.window, return_complex=True)
-        mag = torch.abs(spec)
-        phase = torch.angle(spec)
-        
-        if self.preprocess_dir:
-            np.savez(cache_path,
-                    mag=mag.numpy(),
-                    phase=phase.numpy(),
-                    audio_length=instrumental.shape[1])
-            return {'path': cache_path, 'type': 'instrumental'}
-        else:
-            return {'mag': mag, 'phase': phase, 'audio_length': instrumental.shape[1], 'type': 'instrumental'}
+        # Truncate and sum the components
+        summed_audio = sum([audio[:, :min_length] for audio in audios])
+        return summed_audio
 
     def __len__(self):
         return self.size
 
     def __getitem__(self, idx):
-        # Randomly select a vocal and instrumental stem (can be from different songs)
-        vocal_idx = random.choice(self.vocal_indices)
-        instr_idx = random.choice(self.instr_indices)
+        # Randomly choose a vocal track and an instrumental track (they may be from different songs)
+        vocal_path = random.choice(self.vocal_paths)
+        instr_tuple = random.choice(self.instr_paths)
         
-        # Load the stems
-        vocal_data = self._load_stem(vocal_idx)
-        instr_data = self._load_stem(instr_idx)
+        # Load raw audio
+        vocal_audio = self._load_vocal(vocal_path)      # Shape: [2, num_samples]
+        instr_audio = self._load_instrumental(instr_tuple)  # Shape: [2, num_samples]
         
-        # Get minimum length
-        min_length = min(vocal_data['audio_length'], instr_data['audio_length'])
+        # Match lengths: use the minimum length available.
+        min_length = min(vocal_audio.shape[1], instr_audio.shape[1])
+        if min_length == 0:
+            raise ValueError("Encountered an audio file with zero length.")
         
-        # Get random segment
-        if self.segment and self.segment_length and min_length > self.segment_length:
+        # Select a segment if needed.
+        if self.segment and self.segment_length < min_length:
             start = random.randint(0, min_length - self.segment_length)
             end = start + self.segment_length
         else:
             start = 0
             end = min_length
         
-        # Prepare mixture
-        vocal_mag = vocal_data['mag'][..., start:end]
-        instr_mag = instr_data['mag'][..., start:end]
-        mixture_mag = vocal_mag + instr_mag
+        vocal_seg = vocal_audio[:, start:end]
+        instr_seg = instr_audio[:, start:end]
+
+        # Compute STFTs for each segment.
+        vocal_spec = torch.stft(vocal_seg, n_fft=self.n_fft, hop_length=self.hop_length,
+                                window=self.window, return_complex=True)
+        instr_spec = torch.stft(instr_seg, n_fft=self.n_fft, hop_length=self.hop_length,
+                                window=self.window, return_complex=True)
         
-        # Use phase from mixture (or could use either stem's phase)
-        mixture_phase = torch.angle(
-            torch.complex(vocal_mag * torch.cos(vocal_data['phase'][..., start:end]) + 
-            torch.complex(instr_mag * torch.cos(instr_data['phase'][..., start:end]))))
+        # Compute magnitudes.
+        vocal_mag = torch.abs(vocal_spec)
+        instr_mag = torch.abs(instr_spec)
+        
+        # Create the mixture: sum the complex spectrograms.
+        mixture_spec = vocal_spec + instr_spec
+        mixture_mag = torch.abs(mixture_spec)
+        mixture_phase = torch.angle(mixture_spec)
         
         return mixture_mag, mixture_phase, vocal_mag, instr_mag
-
-    def _load_stem(self, idx):
-        if self.preprocess_dir:
-            data = np.load(self.preprocessed_stems[idx]['path'])
-            return {
-                'mag': torch.from_numpy(data['mag']),
-                'phase': torch.from_numpy(data['phase']),
-                'audio_length': int(data['audio_length']),
-                'type': self.preprocessed_stems[idx]['type']
-            }
-        else:
-            return self.preprocessed_stems[idx]
 
 def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
     grad_norm = max(grad_norm, eps)
@@ -662,8 +627,7 @@ def main():
     parser.add_argument('--train', action='store_true', help='Train the model')
     parser.add_argument('--infer', action='store_true', help='Inference mode')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
-    parser.add_argument('--preprocess_dir', type=str, default='prep', help='Path to save/load preprocessed data')
-    parser.add_argument('--epochs', type=int, default=1000000, help='Number of epochs to train')
+    parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
@@ -680,7 +644,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
-        train_dataset = MUSDBDataset(root_dir=args.data_dir, preprocess_dir=args.preprocess_dir,
+        train_dataset = MUSDBDataset(root_dir=args.data_dir,
                                      segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                       num_workers=16, pin_memory=False, persistent_workers=True)
