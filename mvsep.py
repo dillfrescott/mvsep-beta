@@ -293,13 +293,6 @@ def loss_fn(pred_vocal_mag,
 
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
-        """
-        Args:
-            root_dir (str): Path to the directory containing individual track folders.
-            sample_rate (int): Sampling rate to use for all audio.
-            segment_length (int): Desired segment length in raw audio samples (e.g. 88200 samples ≈ 2 seconds).
-            segment (bool): Whether to randomly select a segment or use the whole audio.
-        """
         self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
@@ -311,7 +304,6 @@ class MUSDBDataset(Dataset):
         self.window = torch.hann_window(self.n_fft)
 
         # Gather lists of available vocal and instrumental stems.
-        # We assume each track is in its own folder under root_dir.
         self.track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
         self.vocal_paths = []   # List of file paths for vocals.
         self.instr_paths = []   # List of tuples for instrumental components (drums, bass, other).
@@ -337,9 +329,6 @@ class MUSDBDataset(Dataset):
         self.size = 50000
 
     def _preprocess_audio(self, audio, sr):
-        """
-        Resamples and ensures stereo audio.
-        """
         if sr != self.sample_rate:
             resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
             audio = resampler(audio)
@@ -351,24 +340,14 @@ class MUSDBDataset(Dataset):
         return audio
 
     def _load_audio(self, filepath):
-        """
-        Loads raw audio from a given file path and preprocesses it.
-        """
         audio, sr = torchaudio.load(filepath)
         audio = self._preprocess_audio(audio, sr)
         return audio
 
     def _load_vocal(self, path):
-        """
-        Loads and returns the raw vocal audio.
-        """
         return self._load_audio(path)
 
     def _load_instrumental(self, paths):
-        """
-        Loads instrumental stems, sums them (truncating to the minimum length among components),
-        and returns the summed audio.
-        """
         audios = []
         min_length = float("inf")
         for p in paths:
