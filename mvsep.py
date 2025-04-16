@@ -10,6 +10,7 @@ from tqdm import tqdm
 import auraloss
 import numpy as np
 import math
+import random
 import glob
 from torch.utils.checkpoint import checkpoint
 
@@ -299,106 +300,164 @@ class MUSDBDataset(Dataset):
         self.n_fft = 4096
         self.hop_length = 1024
         self.segment = segment
-        self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
         self.window = torch.hann_window(self.n_fft)
-
+        
+        # Get lists of all available stems
+        self.track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
+        
+        # Preprocess and cache individual stems
+        self.preprocessed_stems = []
         if self.preprocess_dir:
-            self.preprocess_data()
+            os.makedirs(self.preprocess_dir, exist_ok=True)
+            
+        # Process all tracks
+        for track_idx, td in enumerate(tqdm(self.track_dirs, desc="Preprocessing stems")):
+            # Process vocals if available
+            vocal_path = os.path.join(td, 'vocals.wav')
+            if os.path.exists(vocal_path):
+                vocal_cache = self._preprocess_stem(vocal_path, track_idx, 'vocals')
+                self.preprocessed_stems.append(vocal_cache)
+            
+            # Process instrumentals (sum of drums, bass, other)
+            instr_paths = [os.path.join(td, f'{s}.wav') for s in ['drums', 'bass', 'other']]
+            if all(os.path.exists(p) for p in instr_paths):
+                instr_cache = self._preprocess_instrumental(instr_paths, track_idx)
+                self.preprocessed_stems.append(instr_cache)
+        
+        # Create indices for valid vocal/instrumental pairs
+        self.vocal_indices = [i for i, stem in enumerate(self.preprocessed_stems) if stem['type'] == 'vocals']
+        self.instr_indices = [i for i, stem in enumerate(self.preprocessed_stems) if stem['type'] == 'instrumental']
+        
+        # Ensure we have at least some pairs
+        if not self.vocal_indices or not self.instr_indices:
+            raise ValueError("Dataset must contain both vocal and instrumental stems")
+        
+        self.size = 50000  # Large number for random pairing
 
-    def preprocess_data(self):
-        os.makedirs(self.preprocess_dir, exist_ok=True)
-        for idx, track_path in enumerate(tqdm(self.tracks, desc="Preprocessing data")):
-            preprocess_path = os.path.join(self.preprocess_dir, f'track_{idx}.npz')
-            if not os.path.exists(preprocess_path):
-                mixture_mag, mixture_phase, vocal_mag, instrumental_mag = self._process_track(track_path)
-                np.savez(
-                    preprocess_path,
-                    mixture_mag=mixture_mag,
-                    mixture_phase=mixture_phase,
-                    vocal_mag=vocal_mag,
-                    instrumental_mag=instrumental_mag
-                )
+    def _preprocess_stem(self, stem_path, track_idx, stem_type):
+        """Preprocess and cache a single stem"""
+        if self.preprocess_dir:
+            cache_path = os.path.join(self.preprocess_dir, f"{track_idx}_{stem_type}.npz")
+            if os.path.exists(cache_path):
+                return {'path': cache_path, 'type': stem_type}
+        
+        # Load and process audio
+        audio, sr = torchaudio.load(stem_path)
+        if sr != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+            audio = resampler(audio)
+        
+        # Ensure stereo
+        if audio.shape[0] == 1:
+            audio = audio.repeat(2, 1)
+        elif audio.shape[0] > 2:
+            audio = audio[:2, :]
+        
+        # Compute STFT
+        spec = torch.stft(audio, n_fft=self.n_fft, hop_length=self.hop_length,
+                         window=self.window, return_complex=True)
+        mag = torch.abs(spec)
+        phase = torch.angle(spec)
+        
+        if self.preprocess_dir:
+            np.savez(cache_path,
+                    mag=mag.numpy(),
+                    phase=phase.numpy(),
+                    audio_length=audio.shape[1])
+            return {'path': cache_path, 'type': stem_type}
+        else:
+            return {'mag': mag, 'phase': phase, 'audio_length': audio.shape[1], 'type': stem_type}
 
-    def _load_and_mix_instrumental(self, track_path):
-        # Load all instrumental stems
-        drums, _ = torchaudio.load(os.path.join(track_path, 'drums.wav'))
-        bass, _ = torchaudio.load(os.path.join(track_path, 'bass.wav'))
-        other, _ = torchaudio.load(os.path.join(track_path, 'other.wav'))
+    def _preprocess_instrumental(self, stem_paths, track_idx):
+        """Preprocess and cache instrumental (sum of components)"""
+        if self.preprocess_dir:
+            cache_path = os.path.join(self.preprocess_dir, f"{track_idx}_instrumental.npz")
+            if os.path.exists(cache_path):
+                return {'path': cache_path, 'type': 'instrumental'}
         
-        # Mix them together to create instrumental
-        instrumental = drums + bass + other
+        # Load and sum all components
+        instrumental = None
+        min_length = float('inf')
         
-        # Load vocals
-        vocals, _ = torchaudio.load(os.path.join(track_path, 'vocals.wav'))
-        
-        # Create mixture (should be same as instrumental + vocals)
-        mixture = instrumental + vocals
-        
-        # Ensure all audio is stereo (2 channels)
-        if mixture.shape[0] != 2:
-            if mixture.shape[0] == 1:
-                mixture = mixture.repeat(2, 1)
+        for path in stem_paths:
+            audio, sr = torchaudio.load(path)
+            if sr != self.sample_rate:
+                resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                audio = resampler(audio)
+            
+            # Ensure stereo and track min length
+            if audio.shape[0] == 1:
+                audio = audio.repeat(2, 1)
+            elif audio.shape[0] > 2:
+                audio = audio[:2, :]
+            
+            min_length = min(min_length, audio.shape[1])
+            if instrumental is None:
+                instrumental = audio[:, :min_length]
             else:
-                raise ValueError("Audio must be mono or stereo")
-                
-        if instrumental.shape[0] != 2:
-            if instrumental.shape[0] == 1:
-                instrumental = instrumental.repeat(2, 1)
-                
-        if vocals.shape[0] != 2:
-            if vocals.shape[0] == 1:
-                vocals = vocals.repeat(2, 1)
-                
-        return mixture, instrumental, vocals
-
-    def _process_track(self, track_path):
-        mixture, instrumental, vocals = self._load_and_mix_instrumental(track_path)
+                instrumental += audio[:, :min_length]
         
-        # Compute STFTs
-        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, 
-                                 window=self.window, return_complex=True)
-        vocal_spec = torch.stft(vocals, n_fft=self.n_fft, hop_length=self.hop_length, 
-                               window=self.window, return_complex=True)
-        instrumental_spec = torch.stft(instrumental, n_fft=self.n_fft, hop_length=self.hop_length,
-                                     window=self.window, return_complex=True)
-
-        mixture_mag = torch.abs(mixture_spec)
-        mixture_phase = torch.angle(mixture_spec)
-        vocal_mag = torch.abs(vocal_spec)
-        instrumental_mag = torch.abs(instrumental_spec)
-
-        if self.segment and self.segment_length:
-            num_frames = self.segment_length // self.hop_length
-            if mixture_mag.shape[2] >= num_frames:
-                start = torch.randint(0, mixture_mag.shape[2] - num_frames, (1,))
-                mixture_mag = mixture_mag[:, :, start:start + num_frames]
-                mixture_phase = mixture_phase[:, :, start:start + num_frames]
-                vocal_mag = vocal_mag[:, :, start:start + num_frames]
-                instrumental_mag = instrumental_mag[:, :, start:start + num_frames]
-            else:
-                pad_amount = num_frames - mixture_mag.shape[2]
-                mixture_mag = F.pad(mixture_mag, (0, pad_amount))
-                mixture_phase = F.pad(mixture_phase, (0, pad_amount))
-                vocal_mag = F.pad(vocal_mag, (0, pad_amount))
-                instrumental_mag = F.pad(instrumental_mag, (0, pad_amount))
-
-        return (mixture_mag.numpy(), mixture_phase.numpy(),
-                vocal_mag.numpy(), instrumental_mag.numpy())
+        # Compute STFT
+        spec = torch.stft(instrumental, n_fft=self.n_fft, hop_length=self.hop_length,
+                         window=self.window, return_complex=True)
+        mag = torch.abs(spec)
+        phase = torch.angle(spec)
+        
+        if self.preprocess_dir:
+            np.savez(cache_path,
+                    mag=mag.numpy(),
+                    phase=phase.numpy(),
+                    audio_length=instrumental.shape[1])
+            return {'path': cache_path, 'type': 'instrumental'}
+        else:
+            return {'mag': mag, 'phase': phase, 'audio_length': instrumental.shape[1], 'type': 'instrumental'}
 
     def __len__(self):
-        return len(self.tracks)
+        return self.size
 
     def __getitem__(self, idx):
-        if self.preprocess_dir:
-            preprocess_path = os.path.join(self.preprocess_dir, f'track_{idx}.npz')
-            data = np.load(preprocess_path)
-            mixture_mag = torch.from_numpy(data['mixture_mag'])
-            mixture_phase = torch.from_numpy(data['mixture_phase'])
-            vocal_mag = torch.from_numpy(data['vocal_mag'])
-            instrumental_mag = torch.from_numpy(data['instrumental_mag'])
-            return mixture_mag, mixture_phase, vocal_mag, instrumental_mag
+        # Randomly select a vocal and instrumental stem (can be from different songs)
+        vocal_idx = random.choice(self.vocal_indices)
+        instr_idx = random.choice(self.instr_indices)
+        
+        # Load the stems
+        vocal_data = self._load_stem(vocal_idx)
+        instr_data = self._load_stem(instr_idx)
+        
+        # Get minimum length
+        min_length = min(vocal_data['audio_length'], instr_data['audio_length'])
+        
+        # Get random segment
+        if self.segment and self.segment_length and min_length > self.segment_length:
+            start = random.randint(0, min_length - self.segment_length)
+            end = start + self.segment_length
         else:
-            return self._process_track(self.tracks[idx])
+            start = 0
+            end = min_length
+        
+        # Prepare mixture
+        vocal_mag = vocal_data['mag'][..., start:end]
+        instr_mag = instr_data['mag'][..., start:end]
+        mixture_mag = vocal_mag + instr_mag
+        
+        # Use phase from mixture (or could use either stem's phase)
+        mixture_phase = torch.angle(
+            torch.complex(vocal_mag * torch.cos(vocal_data['phase'][..., start:end]) + 
+            torch.complex(instr_mag * torch.cos(instr_data['phase'][..., start:end]))))
+        
+        return mixture_mag, mixture_phase, vocal_mag, instr_mag
+
+    def _load_stem(self, idx):
+        if self.preprocess_dir:
+            data = np.load(self.preprocessed_stems[idx]['path'])
+            return {
+                'mag': torch.from_numpy(data['mag']),
+                'phase': torch.from_numpy(data['phase']),
+                'audio_length': int(data['audio_length']),
+                'type': self.preprocessed_stems[idx]['type']
+            }
+        else:
+            return self.preprocessed_stems[idx]
 
 def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
     grad_norm = max(grad_norm, eps)
