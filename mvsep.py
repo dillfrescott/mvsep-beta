@@ -261,49 +261,99 @@ class BottleneckGRUBlock(nn.Module):
         x_out = apply_gru(self.gru, x)
         return x_out
 
-class GRUUNet(nn.Module):
+class GRUUWNet(nn.Module):
     def __init__(self, in_channels, base_hidden_channels, depth=3, gru_layers=1, bidirectional=False):
         super().__init__()
-        self.encoders = nn.ModuleList()
-        self.decoders = nn.ModuleList()
-        ch = base_hidden_channels
+        
+        self.encoders1 = nn.ModuleList()
+        self.decoders1 = nn.ModuleList()
+        self.encoders2 = nn.ModuleList()
+        self.decoders2 = nn.ModuleList()
+        
+        ch1 = base_hidden_channels
+        current_in_channels1 = in_channels
         for i in range(depth):
-            self.encoders.append(EncoderGRUBlock(in_channels if i == 0 else ch, ch * 2, gru_layers, bidirectional))
-            in_channels = ch * 2
-            ch *= 2
-        self.bottleneck = BottleneckGRUBlock(ch, ch * 2, gru_layers, bidirectional)
-        ch *= 2
+            out_ch = ch1 * 2
+            self.encoders1.append(EncoderGRUBlock(current_in_channels1, out_ch, gru_layers, bidirectional))
+            current_in_channels1 = out_ch
+            ch1 *= 2
+            
+        self.bottleneck1 = BottleneckGRUBlock(ch1, ch1 * 2, gru_layers, bidirectional)
+        ch1 *= 2
+        
         for i in range(depth):
-            skip_ch = ch // 2
-            self.decoders.append(DecoderGRUBlock(ch, skip_ch, ch // 2, gru_layers, bidirectional))
-            ch //= 2
-        self.final_conv = nn.Conv2d(ch, base_hidden_channels, kernel_size=1)
+            skip_ch = ch1 // 2 
+            out_ch = ch1 // 2
+            self.decoders1.append(DecoderGRUBlock(ch1, skip_ch, out_ch, gru_layers, bidirectional))
+            ch1 //= 2
+            
+        first_wnet_out_channels = base_hidden_channels
+        self.final_conv1 = nn.Conv2d(ch1, first_wnet_out_channels, kernel_size=1) 
+
+        ch2 = base_hidden_channels
+        current_in_channels2 = first_wnet_out_channels 
+        for i in range(depth):
+            out_ch = ch2 * 2
+            self.encoders2.append(EncoderGRUBlock(current_in_channels2, out_ch, gru_layers, bidirectional))
+            current_in_channels2 = out_ch
+            ch2 *= 2
+            
+        self.bottleneck2 = BottleneckGRUBlock(ch2, ch2 * 2, gru_layers, bidirectional)
+        ch2 *= 2
+        
+        for i in range(depth):
+            skip_ch = ch2 // 2
+            out_ch = ch2 // 2
+            self.decoders2.append(DecoderGRUBlock(ch2, skip_ch, out_ch, gru_layers, bidirectional))
+            ch2 //= 2
+            
+        self.final_conv2 = nn.Conv2d(ch2, base_hidden_channels, kernel_size=1)
+
 
     def forward(self, x):
-        skips = []
-        for encoder in self.encoders:
-            x, skip = encoder(x)
-            skips.append(skip)
-        x = self.bottleneck(x)
-        skips = skips[::-1]
-        for i, decoder in enumerate(self.decoders):
-            x = decoder(x, skips[i])
-        x = self.final_conv(x)
-        return x
+        skips1 = []
+        x1 = x
+        for encoder in self.encoders1:
+            x1, skip = encoder(x1)
+            skips1.append(skip)
+        
+        x1 = self.bottleneck1(x1)
+        
+        skips1 = skips1[::-1]
+        for i, decoder in enumerate(self.decoders1):
+            x1 = decoder(x1, skips1[i])
+            
+        x1_out = self.final_conv1(x1)
+
+        skips2 = []
+        x2 = x1_out
+        for encoder in self.encoders2:
+            x2, skip = encoder(x2)
+            skips2.append(skip)
+            
+        x2 = self.bottleneck2(x2)
+        
+        skips2 = skips2[::-1]
+        for i, decoder in enumerate(self.decoders2):
+            x2 = decoder(x2, skips2[i])
+            
+        x2_out = self.final_conv2(x2)
+        
+        return x2_out
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=96, num_unet_layers=4, gru_layers_per_block=1, bidirectional_gru=False):
+    def __init__(self, in_channels=2, hidden_channels=84, num_wnet_layers=2, gru_layers_per_block=1, bidirectional_gru=False):
         super(NeuralModel, self).__init__()
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-        self.darpe = DARPE(dim=hidden_channels)
-        self.gru_unet = GRUUNet(
-            in_channels=hidden_channels,
+        self.darpe = DARPE(dim=hidden_channels) 
+        self.gru_w_net = GRUUWNet(
+            in_channels=hidden_channels, 
             base_hidden_channels=hidden_channels,
-            depth=num_unet_layers,
+            depth=num_wnet_layers,
             gru_layers=gru_layers_per_block,
             bidirectional=bidirectional_gru
         )
@@ -312,9 +362,9 @@ class NeuralModel(nn.Module):
     def forward(self, x):
         x = self.projection(x)
         x = self.darpe(x)
-        x = self.gru_unet(x)
+        x = self.gru_w_net(x) 
         vocal_mask = self.mask_predictor(x)
-        final_vocal_mask = vocal_mask.expand(-1, 2, -1, -1)
+        final_vocal_mask = vocal_mask.expand(-1, 2, -1, -1) 
         return final_vocal_mask
 
 def loss_fn(pred_vocal_mask,
