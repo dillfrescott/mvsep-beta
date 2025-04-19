@@ -154,43 +154,158 @@ class DualMaskPredictor(nn.Module):
         vocal_mask = masks[:, 0:1, :, :]
         return vocal_mask
 
+def apply_gru(gru_layer, x):
+    batch_size, channels, freq, time = x.shape
+    x_gru_input = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
+    x_gru_output, _ = gru_layer(x_gru_input)
+    output_channels = gru_layer.hidden_size * (2 if gru_layer.bidirectional else 1)
+    x_out = x_gru_output.view(batch_size, freq, time, output_channels).permute(0, 3, 1, 2)
+    return x_out
+
+class EncoderGRUBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, gru_layers=1, bidirectional=False):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+        gru_hidden_size = out_channels // 2 if bidirectional else out_channels
+        self.gru = nn.GRU(
+            input_size=out_channels,
+            hidden_size=gru_hidden_size,
+            num_layers=gru_layers,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+        self.gru_out_channels = out_channels
+        self.downsample = nn.MaxPool2d(2)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x_gru = apply_gru(self.gru, x)
+        skip = x_gru
+        out = self.downsample(x_gru)
+        return out, skip
+
+class DecoderGRUBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels, gru_layers=1, bidirectional=False):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        combined_channels = in_channels + skip_channels
+        self.conv = nn.Sequential(
+            nn.Conv2d(combined_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+        gru_hidden_size = out_channels // 2 if bidirectional else out_channels
+        self.gru = nn.GRU(
+            input_size=out_channels,
+            hidden_size=gru_hidden_size,
+            num_layers=gru_layers,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+        self.gru_out_channels = out_channels
+
+    def forward(self, x, skip):
+        x = self.upsample(x)
+        diffY = skip.size()[2] - x.size()[2]
+        diffX = skip.size()[3] - x.size()[3]
+        x = F.pad(x, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv(x)
+        x_out = apply_gru(self.gru, x)
+        return x_out
+
+class BottleneckGRUBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, gru_layers=1, bidirectional=False):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+        gru_hidden_size = out_channels // 2 if bidirectional else out_channels
+        self.gru = nn.GRU(
+            input_size=out_channels,
+            hidden_size=gru_hidden_size,
+            num_layers=gru_layers,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+        self.gru_out_channels = out_channels
+
+    def forward(self, x):
+        x = self.conv(x)
+        x_out = apply_gru(self.gru, x)
+        return x_out
+
+class GRUUNet(nn.Module):
+    def __init__(self, in_channels, base_hidden_channels, depth=3, gru_layers=1, bidirectional=False):
+        super().__init__()
+        self.encoders = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        ch = base_hidden_channels
+        for i in range(depth):
+            self.encoders.append(EncoderGRUBlock(in_channels if i == 0 else ch, ch * 2, gru_layers, bidirectional))
+            in_channels = ch * 2
+            ch *= 2
+        self.bottleneck = BottleneckGRUBlock(ch, ch * 2, gru_layers, bidirectional)
+        ch *= 2
+        for i in range(depth):
+            skip_ch = ch // 2
+            self.decoders.append(DecoderGRUBlock(ch, skip_ch, ch // 2, gru_layers, bidirectional))
+            ch //= 2
+        self.final_conv = nn.Conv2d(ch, base_hidden_channels, kernel_size=1)
+
+    def forward(self, x):
+        skips = []
+        for encoder in self.encoders:
+            x, skip = encoder(x)
+            skips.append(skip)
+        x = self.bottleneck(x)
+        skips = skips[::-1]
+        for i, decoder in enumerate(self.decoders):
+            x = decoder(x, skips[i])
+        x = self.final_conv(x)
+        return x
+
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=512, num_layers=2):
+    def __init__(self, in_channels=2, hidden_channels=96, num_unet_layers=4, gru_layers_per_block=1, bidirectional_gru=False):
         super(NeuralModel, self).__init__()
-        
-        self.darpe = DARPE(dim=hidden_channels)
-        
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-        
-        self.gru = nn.GRU(
-            input_size=hidden_channels,
-            hidden_size=hidden_channels,
-            num_layers=num_layers,
-            batch_first=True
+        self.darpe = DARPE(dim=hidden_channels)
+        self.gru_unet = GRUUNet(
+            in_channels=hidden_channels,
+            base_hidden_channels=hidden_channels,
+            depth=num_unet_layers,
+            gru_layers=gru_layers_per_block,
+            bidirectional=bidirectional_gru
         )
-        
         self.mask_predictor = DualMaskPredictor(hidden_channels)
-        
+
     def forward(self, x):
         x = self.projection(x)
-        
         x = self.darpe(x)
-        
-        batch_size, channels, freq, time = x.shape
-        x = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
-        x, _ = self.gru(x)
-        x = x.view(batch_size, freq, time, channels).permute(0, 3, 1, 2)
-        
+        x = self.gru_unet(x)
         vocal_mask = self.mask_predictor(x)
-        return vocal_mask.expand(-1, 2, -1, -1)
+        final_vocal_mask = vocal_mask.expand(-1, 2, -1, -1)
+        return final_vocal_mask
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
