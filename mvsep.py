@@ -182,13 +182,23 @@ class EncoderGRUBlock(nn.Module):
             bidirectional=bidirectional
         )
         self.gru_out_channels = out_channels
-        self.downsample = nn.MaxPool2d(2)
 
     def forward(self, x):
         x = self.conv(x)
         x_gru = apply_gru(self.gru, x)
         skip = x_gru
-        out = self.downsample(x_gru)
+
+        F_dim = x_gru.shape[2]
+        T_dim = x_gru.shape[3]
+
+        pool_kernel_F = 2 if F_dim > 1 else 1
+        pool_kernel_T = 2 if T_dim > 1 else 1
+
+        if pool_kernel_F > 1 or pool_kernel_T > 1:
+            out = F.max_pool2d(x_gru, kernel_size=(pool_kernel_F, pool_kernel_T))
+        else:
+            out = x_gru
+
         return out, skip
 
 class DecoderGRUBlock(nn.Module):
