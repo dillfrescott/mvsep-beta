@@ -261,7 +261,7 @@ class BottleneckGRUBlock(nn.Module):
         x_out = apply_gru(self.gru, x)
         return x_out
 
-class GRUUWNet(nn.Module):
+class GRUWNet(nn.Module):
     def __init__(self, in_channels, base_hidden_channels, depth=3, gru_layers=1, bidirectional=False):
         super().__init__()
         
@@ -350,7 +350,7 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         self.darpe = DARPE(dim=hidden_channels) 
-        self.gru_w_net = GRUUWNet(
+        self.gru_w_net = GRUWNet(
             in_channels=hidden_channels, 
             base_hidden_channels=hidden_channels,
             depth=num_wnet_layers,
