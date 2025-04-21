@@ -379,10 +379,8 @@ def loss_fn(pred_vocal_mask,
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
         win_lengths=[1024, 2048, 8192],
-        perceptual_weighting=True,
+        perceptual_weighting=False,
         sample_rate=44100,
-        scale="mel",
-        n_bins=128,
         device=device
     )
 
@@ -398,10 +396,6 @@ def loss_fn(pred_vocal_mask,
     pred_instrumental_mag = torch.clamp(pred_instrumental_mag, min=1e-8)
     target_vocal_mag = torch.clamp(target_vocal_mag, min=1e-8)
     target_instrumental_mag = torch.clamp(target_instrumental_mag, min=1e-8)
-
-    # L1 loss on magnitudes (now comparing derived pred_mags with targets)
-    l1_vocal_loss = F.l1_loss(pred_vocal_mag, target_vocal_mag)
-    l1_instrumental_loss = F.l1_loss(pred_instrumental_mag, target_instrumental_mag)
 
     def make_complex(mag, phase):
         # Ensure phase has the same shape as mag if necessary (it should already match)
@@ -444,19 +438,12 @@ def loss_fn(pred_vocal_mask,
     target_instrumental_audio = target_instrumental_audio[..., :min_len]
 
     # Calculate STFT-based reconstruction losses
-    vocal_reconstruction_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
-    instrumental_reconstruction_loss = stft_loss_calculator(pred_instrumental_audio, target_instrumental_audio)
-
-    # Penalizes similarity between predicted vocals and target instrumentals (and vice versa)
-    dissimilarity_v = F.l1_loss(pred_vocal_audio, target_instrumental_audio)
-    dissimilarity_i = F.l1_loss(pred_instrumental_audio, target_vocal_audio)
+    vocal_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
+    instrumental_loss = stft_loss_calculator(pred_instrumental_audio, target_instrumental_audio)
 
     total_loss = (
-        l1_vocal_loss +
-        l1_instrumental_loss +
-        vocal_reconstruction_loss +
-        instrumental_reconstruction_loss -
-        (dissimilarity_v + dissimilarity_i)
+        vocal_loss +
+        instrumental_loss
     )
 
     return total_loss
