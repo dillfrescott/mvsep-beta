@@ -141,18 +141,13 @@ class DualMaskPredictor(nn.Module):
             nn.BatchNorm2d(hidden_channels),
             nn.GELU()
         )
-        # Output two channels: one for vocals and one for instrumentals.
         self.out_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
-    
+
     def forward(self, x):
-        # x is expected to have shape [B, hidden_channels, F, T].
         x = self.conv_block(x)
-        logits = self.out_conv(x)  # shape: [B, 2, F, T]
-        # Softmax produces a probability distribution between the two classes per bin.
-        masks = torch.softmax(logits, dim=1)
-        # Extract vocal mask
-        vocal_mask = masks[:, 0:1, :, :]
-        return vocal_mask
+        logits = self.out_conv(x)
+        masks = torch.sigmoid(logits)
+        return masks
 
 def apply_gru(gru_layer, x):
     batch_size, channels, freq, time = x.shape
@@ -349,9 +344,9 @@ class NeuralModel(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-        self.darpe = DARPE(dim=hidden_channels) 
+        self.darpe = DARPE(dim=hidden_channels)
         self.gru_w_net = GRUWNet(
-            in_channels=hidden_channels, 
+            in_channels=hidden_channels,
             base_hidden_channels=hidden_channels,
             depth=num_wnet_layers,
             gru_layers=gru_layers_per_block,
@@ -362,19 +357,18 @@ class NeuralModel(nn.Module):
     def forward(self, x):
         x = self.projection(x)
         x = self.darpe(x)
-        x = self.gru_w_net(x) 
-        vocal_mask = self.mask_predictor(x)
-        final_vocal_mask = vocal_mask.expand(-1, 2, -1, -1) 
-        return final_vocal_mask
+        x = self.gru_w_net(x)
+        predicted_masks = self.mask_predictor(x)
+        return predicted_masks
 
-def loss_fn(pred_vocal_mask,
+def loss_fn(predicted_masks,
             target_vocal_mag,
             target_instrumental_mag,
             mixture_mag,
             mixture_phase,
             window, n_fft, hop_length):
 
-    device = target_vocal_mag.device
+    device = predicted_masks.device # Get device from input tensor
     stft_loss_calculator = auraloss.freq.SumAndDifferenceSTFTLoss(
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
@@ -384,27 +378,26 @@ def loss_fn(pred_vocal_mask,
         device=device
     )
 
+    pred_vocal_mask = predicted_masks[:, 0:1, :, :]
+    pred_instrumental_mask = predicted_masks[:, 1:2, :, :]
+
     pred_vocal_mask = torch.clamp(pred_vocal_mask, 0.0, 1.0)
+    pred_instrumental_mask = torch.clamp(pred_instrumental_mask, 0.0, 1.0)
 
-    # Apply the mask to the mixture magnitude to get predicted source magnitudes
     pred_vocal_mag = mixture_mag * pred_vocal_mask
-    # The instrumental mask is implicitly (1 - vocal_mask)
-    pred_instrumental_mag = mixture_mag * (1.0 - pred_vocal_mask)
+    pred_instrumental_mag = mixture_mag * pred_instrumental_mask
 
-    # Clamp all magnitudes (predicted and target) to avoid log(0) or division by zero issues
     pred_vocal_mag = torch.clamp(pred_vocal_mag, min=1e-8)
     pred_instrumental_mag = torch.clamp(pred_instrumental_mag, min=1e-8)
     target_vocal_mag = torch.clamp(target_vocal_mag, min=1e-8)
     target_instrumental_mag = torch.clamp(target_instrumental_mag, min=1e-8)
 
     def make_complex(mag, phase):
-        # Ensure phase has the same shape as mag if necessary (it should already match)
         return torch.polar(mag, phase)
 
     def istft_channels(spec, n_fft, hop_length, window):
         batch_size, channels, F_dim, T_dim = spec.shape
         spec_combined = spec.reshape(batch_size * channels, F_dim, T_dim)
-        # Ensure window is on the correct device
         window = window.to(spec_combined.device)
         audio = torch.istft(
             spec_combined,
@@ -418,7 +411,6 @@ def loss_fn(pred_vocal_mask,
         audio = audio.reshape(batch_size, channels, -1)
         return audio
 
-    # Use mixture phase for consistency
     pred_vocal_spec = make_complex(pred_vocal_mag, mixture_phase)
     target_vocal_spec = make_complex(target_vocal_mag, mixture_phase)
     pred_instrumental_spec = make_complex(pred_instrumental_mag, mixture_phase)
@@ -429,7 +421,6 @@ def loss_fn(pred_vocal_mask,
     pred_instrumental_audio = istft_channels(pred_instrumental_spec, n_fft, hop_length, window)
     target_instrumental_audio = istft_channels(target_instrumental_spec, n_fft, hop_length, window)
 
-    # Trimming to same length
     min_len = min(pred_vocal_audio.shape[-1], target_vocal_audio.shape[-1],
                   pred_instrumental_audio.shape[-1], target_instrumental_audio.shape[-1])
     pred_vocal_audio = pred_vocal_audio[..., :min_len]
@@ -437,15 +428,10 @@ def loss_fn(pred_vocal_mask,
     pred_instrumental_audio = pred_instrumental_audio[..., :min_len]
     target_instrumental_audio = target_instrumental_audio[..., :min_len]
 
-    # Calculate STFT-based reconstruction losses
     vocal_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instrumental_loss = stft_loss_calculator(pred_instrumental_audio, target_instrumental_audio)
 
-    total_loss = (
-        vocal_loss +
-        instrumental_loss
-    )
-
+    total_loss = vocal_loss + instrumental_loss
     return total_loss
 
 class MUSDBDataset(Dataset):
