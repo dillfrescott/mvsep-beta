@@ -377,10 +377,15 @@ def loss_fn(pred_vocal_mask,
     # Calculate STFT-based reconstruction losses
     vocal_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instrumental_loss = stft_loss_calculator(pred_instrumental_audio, target_instrumental_audio)
+    
+    # Penalizes similarity between predicted vocals and target instrumentals (and vice versa)
+    dissimilarity_v = F.l1_loss(pred_vocal_audio, target_instrumental_audio)
+    dissimilarity_i = F.l1_loss(pred_instrumental_audio, target_vocal_audio)
 
     total_loss = (
         vocal_loss +
-        instrumental_loss
+        instrumental_loss -
+        (dissimilarity_v + dissimilarity_i)
     )
 
     return total_loss
