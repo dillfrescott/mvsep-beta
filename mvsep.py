@@ -130,241 +130,182 @@ class DARPE(nn.Module):
         x_rotated = x_rotated + 1e-8
         return x_rotated
 
-class DualMaskPredictor(nn.Module):
-    def __init__(self, hidden_channels):
-        super().__init__()
-        self.conv_block = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_channels),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_channels),
-            nn.GELU()
-        )
-        # Output two channels: one for vocals and one for instrumentals.
-        self.out_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
-    
-    def forward(self, x):
-        # x is expected to have shape [B, hidden_channels, F, T].
-        x = self.conv_block(x)
-        logits = self.out_conv(x)  # shape: [B, 2, F, T]
-        # Softmax produces a probability distribution between the two classes per bin.
-        masks = torch.softmax(logits, dim=1)
-        # Extract vocal mask
-        vocal_mask = masks[:, 0:1, :, :]
-        return vocal_mask
-
-def apply_gru(gru_layer, x):
+def apply_gru_osc(gru_layer, x):
     batch_size, channels, freq, time = x.shape
-    x_gru_input = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
-    x_gru_output, _ = gru_layer(x_gru_input)
+    x_reshaped = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
+    x_gru_output, _ = gru_layer(x_reshaped)
     output_channels = gru_layer.hidden_size * (2 if gru_layer.bidirectional else 1)
     x_out = x_gru_output.view(batch_size, freq, time, output_channels).permute(0, 3, 1, 2)
     return x_out
 
-class EncoderGRUBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, gru_layers=1, bidirectional=False):
+class EncoderGRUOscillatorBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, gru_hidden_mult=2, gru_layers=1, bidirectional=False):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU()
-        )
-        gru_hidden_size = out_channels // 2 if bidirectional else out_channels
+        gru_input_channels = in_channels
+        gru_hidden_size = gru_input_channels * gru_hidden_mult // (2 if bidirectional else 1)
         self.gru = nn.GRU(
-            input_size=out_channels,
+            input_size=gru_input_channels,
             hidden_size=gru_hidden_size,
             num_layers=gru_layers,
             batch_first=True,
             bidirectional=bidirectional
         )
-        self.gru_out_channels = out_channels
+        self.gru_out_channels = gru_hidden_size * (2 if bidirectional else 1)
+
+        self.conv_down = nn.Sequential(
+            nn.Conv2d(self.gru_out_channels, out_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
 
     def forward(self, x):
-        x = self.conv(x)
-        x_gru = apply_gru(self.gru, x)
+        x_gru = apply_gru_osc(self.gru, x)
+        x_down = self.conv_down(x_gru)
         skip = x_gru
+        return x_down, skip
 
-        F_dim = x_gru.shape[2]
-        T_dim = x_gru.shape[3]
-
-        pool_kernel_F = 2 if F_dim > 1 else 1
-        pool_kernel_T = 2 if T_dim > 1 else 1
-
-        if pool_kernel_F > 1 or pool_kernel_T > 1:
-            out = F.max_pool2d(x_gru, kernel_size=(pool_kernel_F, pool_kernel_T))
-        else:
-            out = x_gru
-
-        return out, skip
-
-class DecoderGRUBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, gru_layers=1, bidirectional=False):
+class DecoderGRUOscillatorBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels, gru_hidden_mult=1, gru_layers=1, bidirectional=False):
         super().__init__()
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        combined_channels = in_channels + skip_channels
-        self.conv = nn.Sequential(
-            nn.Conv2d(combined_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+        self.transposed_conv_up = nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.BatchNorm2d(out_channels),
             nn.GELU()
         )
-        gru_hidden_size = out_channels // 2 if bidirectional else out_channels
+
+        gru_input_channels = out_channels + skip_channels
+        gru_hidden_size = gru_input_channels * gru_hidden_mult // (2 if bidirectional else 1)
         self.gru = nn.GRU(
-            input_size=out_channels,
+            input_size=gru_input_channels,
             hidden_size=gru_hidden_size,
             num_layers=gru_layers,
             batch_first=True,
             bidirectional=bidirectional
         )
-        self.gru_out_channels = out_channels
+        self.final_channels = gru_hidden_size * (2 if bidirectional else 1)
+
+        if self.final_channels != out_channels:
+             self.proj = nn.Conv2d(self.final_channels, out_channels, kernel_size=1)
+        else:
+            self.proj = nn.Identity()
 
     def forward(self, x, skip):
-        x = self.upsample(x)
-        diffY = skip.size()[2] - x.size()[2]
-        diffX = skip.size()[3] - x.size()[3]
-        x = F.pad(x, [diffX // 2, diffX - diffX // 2,
-                        diffY // 2, diffY - diffY // 2])
-        x = torch.cat([x, skip], dim=1)
-        x = self.conv(x)
-        x_out = apply_gru(self.gru, x)
+        x_up = self.transposed_conv_up(x)
+
+        diffY = skip.size()[2] - x_up.size()[2]
+        diffX = skip.size()[3] - x_up.size()[3]
+        x_up_padded = F.pad(x_up, [diffX // 2, diffX - diffX // 2,
+                                   diffY // 2, diffY - diffY // 2])
+
+        x_combined = torch.cat([x_up_padded, skip], dim=1)
+        x_gru = apply_gru_osc(self.gru, x_combined)
+        x_out = self.proj(x_gru)
         return x_out
 
-class BottleneckGRUBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, gru_layers=1, bidirectional=False):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU()
-        )
-        gru_hidden_size = out_channels // 2 if bidirectional else out_channels
-        self.gru = nn.GRU(
-            input_size=out_channels,
-            hidden_size=gru_hidden_size,
-            num_layers=gru_layers,
-            batch_first=True,
-            bidirectional=bidirectional
-        )
-        self.gru_out_channels = out_channels
-
-    def forward(self, x):
-        x = self.conv(x)
-        x_out = apply_gru(self.gru, x)
-        return x_out
-
-class GRUWNet(nn.Module):
+class GRUOscillatorNet(nn.Module):
     def __init__(self, in_channels, base_hidden_channels, depth=3, gru_layers=1, bidirectional=False):
         super().__init__()
-        
-        self.encoders1 = nn.ModuleList()
-        self.decoders1 = nn.ModuleList()
-        self.encoders2 = nn.ModuleList()
-        self.decoders2 = nn.ModuleList()
-        
-        ch1 = base_hidden_channels
-        current_in_channels1 = in_channels
-        for i in range(depth):
-            out_ch = ch1 * 2
-            self.encoders1.append(EncoderGRUBlock(current_in_channels1, out_ch, gru_layers, bidirectional))
-            current_in_channels1 = out_ch
-            ch1 *= 2
-            
-        self.bottleneck1 = BottleneckGRUBlock(ch1, ch1 * 2, gru_layers, bidirectional)
-        ch1 *= 2
-        
-        for i in range(depth):
-            skip_ch = ch1 // 2 
-            out_ch = ch1 // 2
-            self.decoders1.append(DecoderGRUBlock(ch1, skip_ch, out_ch, gru_layers, bidirectional))
-            ch1 //= 2
-            
-        first_wnet_out_channels = base_hidden_channels
-        self.final_conv1 = nn.Conv2d(ch1, first_wnet_out_channels, kernel_size=1) 
+        self.encoders = nn.ModuleList()
+        self.decoders = nn.ModuleList()
 
-        ch2 = base_hidden_channels
-        current_in_channels2 = first_wnet_out_channels 
-        for i in range(depth):
-            out_ch = ch2 * 2
-            self.encoders2.append(EncoderGRUBlock(current_in_channels2, out_ch, gru_layers, bidirectional))
-            current_in_channels2 = out_ch
-            ch2 *= 2
-            
-        self.bottleneck2 = BottleneckGRUBlock(ch2, ch2 * 2, gru_layers, bidirectional)
-        ch2 *= 2
-        
-        for i in range(depth):
-            skip_ch = ch2 // 2
-            out_ch = ch2 // 2
-            self.decoders2.append(DecoderGRUBlock(ch2, skip_ch, out_ch, gru_layers, bidirectional))
-            ch2 //= 2
-            
-        self.final_conv2 = nn.Conv2d(ch2, base_hidden_channels, kernel_size=1)
+        current_channels = in_channels
+        encoder_out_channels_list = []
+        encoder_gru_out_channels_list = [] # Need channels before down-conv for skip connection
 
+        for i in range(depth):
+            out_ch = base_hidden_channels * (2**i)
+            encoder_block = EncoderGRUOscillatorBlock(current_channels, out_ch, gru_layers=gru_layers, bidirectional=bidirectional)
+            self.encoders.append(encoder_block)
+            encoder_out_channels_list.append(out_ch)
+            encoder_gru_out_channels_list.append(encoder_block.gru_out_channels)
+            current_channels = out_ch # Output channels after conv_down
+
+        decoder_target_channels_list = encoder_out_channels_list[:-1][::-1] # Target channels for decoder outputs
+        if not decoder_target_channels_list: # Handle depth=1 case
+             final_decoder_out_channels = base_hidden_channels
+        else:
+             final_decoder_out_channels = decoder_target_channels_list[-1]
+
+        encoder_gru_out_channels_list = encoder_gru_out_channels_list[::-1] # Reverse for decoder matching
+
+        for i in range(depth):
+            skip_channels = encoder_gru_out_channels_list[i] # Skip comes from GRU output of corresponding encoder
+
+            # Target output channels for this decoder level. For the last level, use base_hidden_channels or input_channels? Let's use base_hidden_channels.
+            if i < depth - 1:
+                out_ch = decoder_target_channels_list[i]
+            else:
+                out_ch = base_hidden_channels
+
+            decoder_block = DecoderGRUOscillatorBlock(current_channels, skip_channels, out_ch, gru_layers=gru_layers, bidirectional=bidirectional)
+            self.decoders.append(decoder_block)
+            current_channels = out_ch # Update current_channels to the output of the current decoder block
+
+        self.final_out_channels = current_channels # The output channels of the very last decoder block
 
     def forward(self, x):
-        skips1 = []
-        x1 = x
-        for encoder in self.encoders1:
-            x1, skip = encoder(x1)
-            skips1.append(skip)
-        
-        x1 = self.bottleneck1(x1)
-        
-        skips1 = skips1[::-1]
-        for i, decoder in enumerate(self.decoders1):
-            x1 = decoder(x1, skips1[i])
+        skips = []
+        for encoder in self.encoders:
+            x, skip = encoder(x)
+            skips.append(skip)
             
-        x1_out = self.final_conv1(x1)
+        skips = skips[::-1]
+        for i, decoder in enumerate(self.decoders):
+            x = decoder(x, skips[i])
 
-        skips2 = []
-        x2 = x1_out
-        for encoder in self.encoders2:
-            x2, skip = encoder(x2)
-            skips2.append(skip)
-            
-        x2 = self.bottleneck2(x2)
-        
-        skips2 = skips2[::-1]
-        for i, decoder in enumerate(self.decoders2):
-            x2 = decoder(x2, skips2[i])
-            
-        x2_out = self.final_conv2(x2)
-        
-        return x2_out
+        return x
+
+class DualMaskPredictor(nn.Module):
+    def __init__(self, in_channels, hidden_channels_factor=1):
+        super().__init__()
+        hidden_channels = in_channels * hidden_channels_factor
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU()
+        )
+        self.out_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
+
+    def forward(self, x):
+        x = self.conv_block(x)
+        logits = self.out_conv(x)
+        masks = torch.softmax(logits, dim=1)
+        vocal_mask = masks[:, 0:1, :, :]
+        return vocal_mask
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=84, num_wnet_layers=2, gru_layers_per_block=1, bidirectional_gru=False):
+    def __init__(self, in_channels=2, base_hidden_channels=128, depth=4, gru_layers_per_block=1, bidirectional_gru=False):
         super(NeuralModel, self).__init__()
         self.projection = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
+            nn.Conv2d(in_channels, base_hidden_channels, kernel_size=1),
+            nn.BatchNorm2d(base_hidden_channels),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
+            nn.Conv2d(base_hidden_channels, base_hidden_channels, kernel_size=1),
+            nn.BatchNorm2d(base_hidden_channels),
+            nn.GELU()
         )
-        self.darpe = DARPE(dim=hidden_channels) 
-        self.gru_w_net = GRUWNet(
-            in_channels=hidden_channels, 
-            base_hidden_channels=hidden_channels,
-            depth=num_wnet_layers,
+        self.darpe = DARPE(dim=base_hidden_channels, in_channels=base_hidden_channels)
+
+        self.osc_net = GRUOscillatorNet(
+            in_channels=base_hidden_channels,
+            base_hidden_channels=base_hidden_channels,
+            depth=depth,
             gru_layers=gru_layers_per_block,
             bidirectional=bidirectional_gru
         )
-        self.mask_predictor = DualMaskPredictor(hidden_channels)
+
+        mask_predictor_in_channels = self.osc_net.final_out_channels
+        self.mask_predictor = DualMaskPredictor(mask_predictor_in_channels)
 
     def forward(self, x):
-        x = self.projection(x)
-        x = self.darpe(x)
-        x = self.gru_w_net(x) 
-        vocal_mask = self.mask_predictor(x)
-        final_vocal_mask = vocal_mask.expand(-1, 2, -1, -1) 
+        x_proj = self.projection(x)
+        x_pe = self.darpe(x_proj)
+        x_osc = self.osc_net(x_pe)
+        vocal_mask = self.mask_predictor(x_osc)
+        final_vocal_mask = vocal_mask.repeat(1, 2, 1, 1)
         return final_vocal_mask
 
 def loss_fn(pred_vocal_mask,
