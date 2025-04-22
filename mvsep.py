@@ -307,10 +307,8 @@ def loss_fn(pred_vocal_mask,
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
         win_lengths=[1024, 2048, 8192],
-        perceptual_weighting=True,
+        perceptual_weighting=False,
         sample_rate=44100,
-        scale="mel",
-        n_bins=128,
         device=device
     )
 
