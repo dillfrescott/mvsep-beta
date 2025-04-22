@@ -161,11 +161,10 @@ class EncoderGRUOscillatorBlock(nn.Module):
     def forward(self, x):
         x_gru = apply_gru_osc(self.gru, x)
         x_down = self.conv_down(x_gru)
-        skip = x_gru
-        return x_down, skip
+        return x_down
 
 class DecoderGRUOscillatorBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, gru_hidden_mult=1, gru_layers=1, bidirectional=False):
+    def __init__(self, in_channels, out_channels, gru_hidden_mult=1, gru_layers=1, bidirectional=False):
         super().__init__()
         self.transposed_conv_up = nn.Sequential(
             nn.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1),
@@ -173,7 +172,7 @@ class DecoderGRUOscillatorBlock(nn.Module):
             nn.GELU()
         )
 
-        gru_input_channels = out_channels + skip_channels
+        gru_input_channels = out_channels
         gru_hidden_size = gru_input_channels * gru_hidden_mult // (2 if bidirectional else 1)
         self.gru = nn.GRU(
             input_size=gru_input_channels,
@@ -189,16 +188,9 @@ class DecoderGRUOscillatorBlock(nn.Module):
         else:
             self.proj = nn.Identity()
 
-    def forward(self, x, skip):
+    def forward(self, x):
         x_up = self.transposed_conv_up(x)
-
-        diffY = skip.size()[2] - x_up.size()[2]
-        diffX = skip.size()[3] - x_up.size()[3]
-        x_up_padded = F.pad(x_up, [diffX // 2, diffX - diffX // 2,
-                                   diffY // 2, diffY - diffY // 2])
-
-        x_combined = torch.cat([x_up_padded, skip], dim=1)
-        x_gru = apply_gru_osc(self.gru, x_combined)
+        x_gru = apply_gru_osc(self.gru, x_up)
         x_out = self.proj(x_gru)
         return x_out
 
@@ -210,48 +202,43 @@ class GRUOscillatorNet(nn.Module):
 
         current_channels = in_channels
         encoder_out_channels_list = []
-        encoder_gru_out_channels_list = [] # Need channels before down-conv for skip connection
 
         for i in range(depth):
             out_ch = base_hidden_channels * (2**i)
             encoder_block = EncoderGRUOscillatorBlock(current_channels, out_ch, gru_layers=gru_layers, bidirectional=bidirectional)
             self.encoders.append(encoder_block)
             encoder_out_channels_list.append(out_ch)
-            encoder_gru_out_channels_list.append(encoder_block.gru_out_channels)
-            current_channels = out_ch # Output channels after conv_down
+            current_channels = out_ch
 
-        decoder_target_channels_list = encoder_out_channels_list[:-1][::-1] # Target channels for decoder outputs
-        if not decoder_target_channels_list: # Handle depth=1 case
+        decoder_target_channels_list = encoder_out_channels_list[:-1][::-1]
+        if not decoder_target_channels_list:
              final_decoder_out_channels = base_hidden_channels
         else:
              final_decoder_out_channels = decoder_target_channels_list[-1]
 
-        encoder_gru_out_channels_list = encoder_gru_out_channels_list[::-1] # Reverse for decoder matching
-
         for i in range(depth):
-            skip_channels = encoder_gru_out_channels_list[i] # Skip comes from GRU output of corresponding encoder
-
-            # Target output channels for this decoder level. For the last level, use base_hidden_channels or input_channels? Let's use base_hidden_channels.
             if i < depth - 1:
                 out_ch = decoder_target_channels_list[i]
             else:
                 out_ch = base_hidden_channels
 
-            decoder_block = DecoderGRUOscillatorBlock(current_channels, skip_channels, out_ch, gru_layers=gru_layers, bidirectional=bidirectional)
+            decoder_block = DecoderGRUOscillatorBlock(
+                in_channels=current_channels,
+                out_channels=out_ch,
+                gru_layers=gru_layers,
+                bidirectional=bidirectional
+            )
             self.decoders.append(decoder_block)
-            current_channels = out_ch # Update current_channels to the output of the current decoder block
+            current_channels = out_ch
 
-        self.final_out_channels = current_channels # The output channels of the very last decoder block
+        self.final_out_channels = current_channels
 
     def forward(self, x):
-        skips = []
         for encoder in self.encoders:
-            x, skip = encoder(x)
-            skips.append(skip)
-            
-        skips = skips[::-1]
-        for i, decoder in enumerate(self.decoders):
-            x = decoder(x, skips[i])
+            x = encoder(x)
+
+        for decoder in self.decoders:
+            x = decoder(x)
 
         return x
 
@@ -326,6 +313,15 @@ def loss_fn(pred_vocal_mask,
     )
 
     pred_vocal_mask = torch.clamp(pred_vocal_mask, 0.0, 1.0)
+    
+    target_height = mixture_mag.shape[2]
+    target_width = mixture_mag.shape[3]
+    pred_vocal_mask = torch.nn.functional.interpolate(
+        pred_vocal_mask,
+        size=(target_height, target_width),
+        mode='bilinear',
+        align_corners=False
+    )
 
     # Apply the mask to the mixture magnitude to get predicted source magnitudes
     pred_vocal_mag = mixture_mag * pred_vocal_mask
@@ -628,6 +624,15 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             
             with torch.no_grad():
                 pred_vocal_mask = model(chunk_mag.unsqueeze(0)).squeeze(0)
+                
+            target_height = chunk_mag.shape[1]
+            target_width = chunk_mag.shape[2]
+            pred_vocal_mask = torch.nn.functional.interpolate(
+                pred_vocal_mask.unsqueeze(0),
+                size=(target_height, target_width),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
             
             pred_vocal_mag = chunk_mag * pred_vocal_mask
             pred_instrumental_mag = chunk_mag * (1 - pred_vocal_mask)
