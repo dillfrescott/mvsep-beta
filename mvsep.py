@@ -307,13 +307,15 @@ def loss_fn(pred_vocal_mask,
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
         win_lengths=[1024, 2048, 8192],
-        perceptual_weighting=False,
+        perceptual_weighting=True,
         sample_rate=44100,
+        scale="mel",
+        n_bins=128,
         device=device
     )
 
     pred_vocal_mask = torch.clamp(pred_vocal_mask, 0.0, 1.0)
-    
+
     target_height = mixture_mag.shape[2]
     target_width = mixture_mag.shape[3]
     pred_vocal_mask = torch.nn.functional.interpolate(
@@ -377,15 +379,16 @@ def loss_fn(pred_vocal_mask,
     # Calculate STFT-based reconstruction losses
     vocal_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instrumental_loss = stft_loss_calculator(pred_instrumental_audio, target_instrumental_audio)
-    
-    # Penalizes similarity between predicted vocals and target instrumentals (and vice versa)
-    dissimilarity_v = F.l1_loss(pred_vocal_audio, target_instrumental_audio)
-    dissimilarity_i = F.l1_loss(pred_instrumental_audio, target_vocal_audio)
+
+    # Calculate L1 loss between predicted and target magnitudes
+    vocal_mag_l1_loss = F.l1_loss(pred_vocal_mag, target_vocal_mag)
+    instrumental_mag_l1_loss = F.l1_loss(pred_instrumental_mag, target_instrumental_mag)
 
     total_loss = (
         vocal_loss +
-        instrumental_loss -
-        (dissimilarity_v + dissimilarity_i)
+        instrumental_loss +
+        vocal_mag_l1_loss +
+        instrumental_mag_l1_loss
     )
 
     return total_loss
