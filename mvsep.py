@@ -130,170 +130,67 @@ class DARPE(nn.Module):
         x_rotated = x_rotated + 1e-8
         return x_rotated
 
-def apply_gru_osc(gru_layer, x):
-    batch_size, channels, freq, time = x.shape
-    x_reshaped = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
-    x_gru_output, _ = gru_layer(x_reshaped)
-    output_channels = gru_layer.hidden_size * (2 if gru_layer.bidirectional else 1)
-    x_out = x_gru_output.view(batch_size, freq, time, output_channels).permute(0, 3, 1, 2)
-    return x_out
-
-class EncoderGRUOscillatorBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, gru_hidden_mult=2, gru_layers=1, bidirectional=False):
-        super().__init__()
-        gru_input_channels = in_channels
-        gru_hidden_size = gru_input_channels * gru_hidden_mult // (2 if bidirectional else 1)
-        self.gru = nn.GRU(
-            input_size=gru_input_channels,
-            hidden_size=gru_hidden_size,
-            num_layers=gru_layers,
-            batch_first=True,
-            bidirectional=bidirectional
-        )
-        self.gru_out_channels = gru_hidden_size * (2 if bidirectional else 1)
-
-        self.conv_down = nn.Sequential(
-            nn.Conv2d(self.gru_out_channels, out_channels, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU()
-        )
-
-    def forward(self, x):
-        x_gru = apply_gru_osc(self.gru, x)
-        x_down = self.conv_down(x_gru)
-        return x_down
-
-class DecoderGRUOscillatorBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, gru_hidden_mult=1, gru_layers=1, bidirectional=False):
-        super().__init__()
-        self.transposed_conv_up = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU()
-        )
-
-        gru_input_channels = out_channels
-        gru_hidden_size = gru_input_channels * gru_hidden_mult // (2 if bidirectional else 1)
-        self.gru = nn.GRU(
-            input_size=gru_input_channels,
-            hidden_size=gru_hidden_size,
-            num_layers=gru_layers,
-            batch_first=True,
-            bidirectional=bidirectional
-        )
-        self.final_channels = gru_hidden_size * (2 if bidirectional else 1)
-
-        if self.final_channels != out_channels:
-             self.proj = nn.Conv2d(self.final_channels, out_channels, kernel_size=1)
-        else:
-            self.proj = nn.Identity()
-
-    def forward(self, x):
-        x_up = self.transposed_conv_up(x)
-        x_gru = apply_gru_osc(self.gru, x_up)
-        x_out = self.proj(x_gru)
-        return x_out
-
-class GRUOscillatorNet(nn.Module):
-    def __init__(self, in_channels, base_hidden_channels, depth=3, gru_layers=1, bidirectional=False):
-        super().__init__()
-        self.encoders = nn.ModuleList()
-        self.decoders = nn.ModuleList()
-
-        current_channels = in_channels
-        encoder_out_channels_list = []
-
-        for i in range(depth):
-            out_ch = base_hidden_channels * (2**i)
-            encoder_block = EncoderGRUOscillatorBlock(current_channels, out_ch, gru_layers=gru_layers, bidirectional=bidirectional)
-            self.encoders.append(encoder_block)
-            encoder_out_channels_list.append(out_ch)
-            current_channels = out_ch
-
-        decoder_target_channels_list = encoder_out_channels_list[:-1][::-1]
-        if not decoder_target_channels_list:
-             final_decoder_out_channels = base_hidden_channels
-        else:
-             final_decoder_out_channels = decoder_target_channels_list[-1]
-
-        for i in range(depth):
-            if i < depth - 1:
-                out_ch = decoder_target_channels_list[i]
-            else:
-                out_ch = base_hidden_channels
-
-            decoder_block = DecoderGRUOscillatorBlock(
-                in_channels=current_channels,
-                out_channels=out_ch,
-                gru_layers=gru_layers,
-                bidirectional=bidirectional
-            )
-            self.decoders.append(decoder_block)
-            current_channels = out_ch
-
-        self.final_out_channels = current_channels
-
-    def forward(self, x):
-        for encoder in self.encoders:
-            x = encoder(x)
-
-        for decoder in self.decoders:
-            x = decoder(x)
-
-        return x
-
 class DualMaskPredictor(nn.Module):
-    def __init__(self, in_channels, hidden_channels_factor=1):
+    def __init__(self, hidden_channels):
         super().__init__()
-        hidden_channels = in_channels * hidden_channels_factor
         self.conv_block = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(hidden_channels),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(hidden_channels),
             nn.GELU()
         )
+        # Output two channels: one for vocals and one for instrumentals.
         self.out_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
-
+    
     def forward(self, x):
+        # x is expected to have shape [B, hidden_channels, F, T].
         x = self.conv_block(x)
-        logits = self.out_conv(x)
+        logits = self.out_conv(x)  # shape: [B, 2, F, T]
+        # Softmax produces a probability distribution between the two classes per bin.
         masks = torch.softmax(logits, dim=1)
+        # Extract vocal mask
         vocal_mask = masks[:, 0:1, :, :]
         return vocal_mask
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, base_hidden_channels=128, depth=4, gru_layers_per_block=1, bidirectional_gru=False):
+    def __init__(self, in_channels=2, hidden_channels=256, num_layers=4):
         super(NeuralModel, self).__init__()
+        
+        self.darpe = DARPE(dim=hidden_channels)
+        
         self.projection = nn.Sequential(
-            nn.Conv2d(in_channels, base_hidden_channels, kernel_size=1),
-            nn.BatchNorm2d(base_hidden_channels),
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(base_hidden_channels, base_hidden_channels, kernel_size=1),
-            nn.BatchNorm2d(base_hidden_channels),
-            nn.GELU()
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-        self.darpe = DARPE(dim=base_hidden_channels, in_channels=base_hidden_channels)
-
-        self.osc_net = GRUOscillatorNet(
-            in_channels=base_hidden_channels,
-            base_hidden_channels=base_hidden_channels,
-            depth=depth,
-            gru_layers=gru_layers_per_block,
-            bidirectional=bidirectional_gru
+        
+        self.gru = nn.GRU(
+            input_size=hidden_channels,
+            hidden_size=hidden_channels,
+            num_layers=num_layers,
+            batch_first=True
         )
-
-        mask_predictor_in_channels = self.osc_net.final_out_channels
-        self.mask_predictor = DualMaskPredictor(mask_predictor_in_channels)
-
+        
+        self.mask_predictor = DualMaskPredictor(hidden_channels)
+        
     def forward(self, x):
-        x_proj = self.projection(x)
-        x_pe = self.darpe(x_proj)
-        x_osc = self.osc_net(x_pe)
-        vocal_mask = self.mask_predictor(x_osc)
-        final_vocal_mask = vocal_mask.repeat(1, 2, 1, 1)
-        return final_vocal_mask
+        x = self.projection(x)
+        
+        x = self.darpe(x)
+        
+        batch_size, channels, freq, time = x.shape
+        x = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
+        x, _ = self.gru(x)
+        x = x.view(batch_size, freq, time, channels).permute(0, 3, 1, 2)
+        
+        vocal_mask = self.mask_predictor(x)
+        return vocal_mask.expand(-1, 2, -1, -1)
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
@@ -316,15 +213,6 @@ def loss_fn(pred_vocal_mask,
 
     pred_vocal_mask = torch.clamp(pred_vocal_mask, 0.0, 1.0)
 
-    target_height = mixture_mag.shape[2]
-    target_width = mixture_mag.shape[3]
-    pred_vocal_mask = torch.nn.functional.interpolate(
-        pred_vocal_mask,
-        size=(target_height, target_width),
-        mode='bilinear',
-        align_corners=False
-    )
-
     # Apply the mask to the mixture magnitude to get predicted source magnitudes
     pred_vocal_mag = mixture_mag * pred_vocal_mask
     # The instrumental mask is implicitly (1 - vocal_mask)
@@ -335,6 +223,10 @@ def loss_fn(pred_vocal_mask,
     pred_instrumental_mag = torch.clamp(pred_instrumental_mag, min=1e-8)
     target_vocal_mag = torch.clamp(target_vocal_mag, min=1e-8)
     target_instrumental_mag = torch.clamp(target_instrumental_mag, min=1e-8)
+
+    # L1 loss on magnitudes (now comparing derived pred_mags with targets)
+    l1_vocal_loss = F.l1_loss(pred_vocal_mag, target_vocal_mag)
+    l1_instrumental_loss = F.l1_loss(pred_instrumental_mag, target_instrumental_mag)
 
     def make_complex(mag, phase):
         # Ensure phase has the same shape as mag if necessary (it should already match)
@@ -377,18 +269,19 @@ def loss_fn(pred_vocal_mask,
     target_instrumental_audio = target_instrumental_audio[..., :min_len]
 
     # Calculate STFT-based reconstruction losses
-    vocal_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
-    instrumental_loss = stft_loss_calculator(pred_instrumental_audio, target_instrumental_audio)
+    vocal_reconstruction_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
+    instrumental_reconstruction_loss = stft_loss_calculator(pred_instrumental_audio, target_instrumental_audio)
 
-    # Calculate L1 loss between predicted and target magnitudes
-    vocal_mag_l1_loss = F.l1_loss(pred_vocal_mag, target_vocal_mag)
-    instrumental_mag_l1_loss = F.l1_loss(pred_instrumental_mag, target_instrumental_mag)
+    # Penalizes similarity between predicted vocals and target instrumentals (and vice versa)
+    dissimilarity_v = F.l1_loss(pred_vocal_audio, target_instrumental_audio)
+    dissimilarity_i = F.l1_loss(pred_instrumental_audio, target_vocal_audio)
 
     total_loss = (
-        vocal_loss +
-        instrumental_loss +
-        vocal_mag_l1_loss +
-        instrumental_mag_l1_loss
+        l1_vocal_loss +
+        l1_instrumental_loss +
+        vocal_reconstruction_loss +
+        instrumental_reconstruction_loss -
+        (dissimilarity_v + dissimilarity_i)
     )
 
     return total_loss
@@ -632,15 +525,6 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             
             with torch.no_grad():
                 pred_vocal_mask = model(chunk_mag.unsqueeze(0)).squeeze(0)
-                
-            target_height = chunk_mag.shape[1]
-            target_width = chunk_mag.shape[2]
-            pred_vocal_mask = torch.nn.functional.interpolate(
-                pred_vocal_mask.unsqueeze(0),
-                size=(target_height, target_width),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)
             
             pred_vocal_mag = chunk_mag * pred_vocal_mask
             pred_instrumental_mag = chunk_mag * (1 - pred_vocal_mask)
