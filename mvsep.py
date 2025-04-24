@@ -154,43 +154,210 @@ class DualMaskPredictor(nn.Module):
         vocal_mask = masks[:, 0:1, :, :]
         return vocal_mask
 
+class EncoderTransformerBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, nhead=8, num_layers=2, dim_feedforward=None):
+        super().__init__()
+        if dim_feedforward is None:
+            dim_feedforward = out_channels * 4
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=out_channels,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+            activation=F.gelu
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        skip = x
+        B, C, F_dim, T = x.shape
+
+        x_transformer_input = x.permute(0, 2, 3, 1).reshape(B * F_dim, T, C)
+
+        x_transformer_output = self.transformer_encoder(x_transformer_input)
+        x_transformer_output = self.norm(x_transformer_output)
+
+        x_out = x_transformer_output.reshape(B, F_dim, T, C).permute(0, 3, 1, 2)
+
+        current_F_dim = x_out.shape[2]
+        current_T_dim = x_out.shape[3]
+
+        pool_kernel_F = 2 if current_F_dim > 1 else 1
+        pool_kernel_T = 2 if current_T_dim > 1 else 1
+
+        if pool_kernel_F > 1 or pool_kernel_T > 1:
+            out = F.max_pool2d(x_out, kernel_size=(pool_kernel_F, pool_kernel_T))
+        else:
+            out = x_out
+
+        return out, skip
+
+class DecoderTransformerBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels, nhead=8, num_layers=2, dim_feedforward=None):
+        super().__init__()
+        if dim_feedforward is None:
+            dim_feedforward = out_channels * 4
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        combined_channels = in_channels + skip_channels
+        self.conv = nn.Sequential(
+            nn.Conv2d(combined_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=out_channels,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+            activation=F.gelu
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(out_channels)
+        self.skip_proj = nn.Conv2d(skip_channels, out_channels, kernel_size=1) if skip_channels != out_channels else nn.Identity()
+
+    def forward(self, x, skip):
+        x = self.upsample(x)
+        diffY = skip.size()[2] - x.size()[2]
+        diffX = skip.size()[3] - x.size()[3]
+        x = F.pad(x, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv(x)
+
+        B, C, F_dim, T = x.shape
+
+        tgt = x.permute(0, 2, 3, 1).reshape(B * F_dim, T, C)
+
+        skip_processed = self.skip_proj(skip)
+        Bs, Cs, Fs, Ts = skip_processed.shape
+        memory = skip_processed.permute(0, 2, 3, 1).reshape(Bs * Fs, Ts, Cs)
+
+        if T != Ts:
+
+             memory_permuted = memory.permute(0, 2, 1)
+             memory_interpolated = F.interpolate(memory_permuted, size=T, mode='linear', align_corners=False)
+             memory = memory_interpolated.permute(0, 2, 1)
+
+        x_transformer_output = self.transformer_decoder(tgt, memory)
+        x_transformer_output = self.norm(x_transformer_output)
+
+        x_out = x_transformer_output.reshape(B, F_dim, T, C).permute(0, 3, 1, 2)
+
+        return x_out
+
+class BottleneckTransformerBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, nhead=8, num_layers=2, dim_feedforward=None):
+        super().__init__()
+        if dim_feedforward is None:
+            dim_feedforward = out_channels * 4
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=out_channels,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+            activation=F.gelu
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        B, C, F_dim, T = x.shape
+
+        x_transformer_input = x.permute(0, 2, 3, 1).reshape(B * F_dim, T, C)
+
+        x_transformer_output = self.transformer_encoder(x_transformer_input)
+        x_transformer_output = self.norm(x_transformer_output)
+
+        x_out = x_transformer_output.reshape(B, F_dim, T, C).permute(0, 3, 1, 2)
+        return x_out
+
+class TransformerUNet(nn.Module):
+    def __init__(self, in_channels, base_hidden_channels, depth=3, nhead=8, num_tf_layers=2):
+        super().__init__()
+        self.encoders = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        ch = base_hidden_channels
+        current_in = in_channels
+        for i in range(depth):
+            out_ch = ch * (2**i)
+            self.encoders.append(EncoderTransformerBlock(current_in, out_ch, nhead=nhead, num_layers=num_tf_layers))
+            current_in = out_ch
+
+        bottleneck_ch = ch * (2**depth)
+        self.bottleneck = BottleneckTransformerBlock(current_in, bottleneck_ch, nhead=nhead, num_layers=num_tf_layers)
+        current_in = bottleneck_ch
+
+        for i in range(depth - 1, -1, -1):
+            skip_ch = ch * (2**i)
+            out_ch = skip_ch
+            self.decoders.append(DecoderTransformerBlock(current_in, skip_ch, out_ch, nhead=nhead, num_layers=num_tf_layers))
+            current_in = out_ch
+
+        self.final_conv = nn.Conv2d(current_in, base_hidden_channels, kernel_size=1)
+
+    def forward(self, x):
+        skips = []
+        for encoder in self.encoders:
+            x, skip = encoder(x)
+            skips.append(skip)
+
+        x = self.bottleneck(x)
+        skips = skips[::-1]
+
+        for i, decoder in enumerate(self.decoders):
+            x = decoder(x, skips[i])
+
+        x = self.final_conv(x)
+        return x
+
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=256, num_layers=4):
+    def __init__(self, in_channels=2, hidden_channels=64, num_unet_layers=4, transformer_nhead=8, transformer_layers_per_block=2):
         super(NeuralModel, self).__init__()
-        
-        self.darpe = DARPE(dim=hidden_channels)
-        
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-        
-        self.gru = nn.GRU(
-            input_size=hidden_channels,
-            hidden_size=hidden_channels,
-            num_layers=num_layers,
-            batch_first=True
+        self.darpe = DARPE(dim=hidden_channels)
+        self.transformer_unet = TransformerUNet(
+            in_channels=hidden_channels,
+            base_hidden_channels=hidden_channels,
+            depth=num_unet_layers,
+            nhead=transformer_nhead,
+            num_tf_layers=transformer_layers_per_block
         )
-        
         self.mask_predictor = DualMaskPredictor(hidden_channels)
-        
+
     def forward(self, x):
         x = self.projection(x)
-        
         x = self.darpe(x)
-        
-        batch_size, channels, freq, time = x.shape
-        x = x.permute(0, 2, 3, 1).reshape(batch_size * freq, time, channels)
-        x, _ = self.gru(x)
-        x = x.view(batch_size, freq, time, channels).permute(0, 3, 1, 2)
-        
+        x = self.transformer_unet(x)
         vocal_mask = self.mask_predictor(x)
-        return vocal_mask.expand(-1, 2, -1, -1)
+        final_vocal_mask = vocal_mask.expand(-1, 2, -1, -1)
+        return final_vocal_mask
 
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
