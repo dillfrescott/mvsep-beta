@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-import auraloss
+from torch_log_wmse import LogWMSE
 import numpy as np
 import random
 import math
@@ -359,99 +359,83 @@ class NeuralModel(nn.Module):
         final_vocal_mask = vocal_mask.expand(-1, 2, -1, -1)
         return final_vocal_mask
 
+def istft_channels(spec, n_fft, hop_length, window, target_length):
+    batch_size, channels, F_dim, T_dim = spec.shape
+    spec_combined = spec.reshape(batch_size * channels, F_dim, T_dim)
+    if window is not None:
+        window = window.to(spec_combined.device)
+
+    audio = torch.istft(
+        spec_combined,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=window.shape[0] if window is not None else n_fft,
+        window=window,
+        return_complex=False,
+        center=True,
+        length=target_length
+    )
+    audio = audio.reshape(batch_size, channels, -1)
+    return audio
+
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
             target_instrumental_mag,
             mixture_mag,
             mixture_phase,
-            window, n_fft, hop_length):
+            window,
+            n_fft,
+            hop_length,
+            segment_length,
+            sample_rate):
 
-    device = target_vocal_mag.device
-    stft_loss_calculator = auraloss.freq.SumAndDifferenceSTFTLoss(
-        fft_sizes=[1024, 2048, 8192],
-        hop_sizes=[256, 512, 2048],
-        win_lengths=[1024, 2048, 8192],
-        perceptual_weighting=True,
-        sample_rate=44100,
-        scale="mel",
-        n_bins=128,
-        device=device
+    device = mixture_mag.device
+    audio_length_seconds = segment_length / sample_rate
+
+    log_wmse_calculator = LogWMSE(
+        audio_length=audio_length_seconds,
+        sample_rate=sample_rate,
+        return_as_loss=True,
+        bypass_filter=False
     )
 
     pred_vocal_mask = torch.clamp(pred_vocal_mask, 0.0, 1.0)
-
-    # Apply the mask to the mixture magnitude to get predicted source magnitudes
     pred_vocal_mag = mixture_mag * pred_vocal_mask
-    # The instrumental mask is implicitly (1 - vocal_mask)
     pred_instrumental_mag = mixture_mag * (1.0 - pred_vocal_mask)
 
-    # Clamp all magnitudes (predicted and target) to avoid log(0) or division by zero issues
     pred_vocal_mag = torch.clamp(pred_vocal_mag, min=1e-8)
     pred_instrumental_mag = torch.clamp(pred_instrumental_mag, min=1e-8)
     target_vocal_mag = torch.clamp(target_vocal_mag, min=1e-8)
     target_instrumental_mag = torch.clamp(target_instrumental_mag, min=1e-8)
+    mixture_mag_clamped = torch.clamp(mixture_mag, min=1e-8)
 
-    # L1 loss on magnitudes (now comparing derived pred_mags with targets)
-    l1_vocal_loss = F.l1_loss(pred_vocal_mag, target_vocal_mag)
-    l1_instrumental_loss = F.l1_loss(pred_instrumental_mag, target_instrumental_mag)
+    mixture_spec = torch.polar(mixture_mag_clamped, mixture_phase)
+    pred_vocal_spec = torch.polar(pred_vocal_mag, mixture_phase)
+    target_vocal_spec = torch.polar(target_vocal_mag, mixture_phase)
+    pred_instrumental_spec = torch.polar(pred_instrumental_mag, mixture_phase)
+    target_instrumental_spec = torch.polar(target_instrumental_mag, mixture_phase)
 
-    def make_complex(mag, phase):
-        # Ensure phase has the same shape as mag if necessary (it should already match)
-        return torch.polar(mag, phase)
+    unprocessed_audio = istft_channels(mixture_spec, n_fft, hop_length, window, segment_length)
+    pred_vocal_audio = istft_channels(pred_vocal_spec, n_fft, hop_length, window, segment_length)
+    target_vocal_audio = istft_channels(target_vocal_spec, n_fft, hop_length, window, segment_length)
+    pred_instrumental_audio = istft_channels(pred_instrumental_spec, n_fft, hop_length, window, segment_length)
+    target_instrumental_audio = istft_channels(target_instrumental_spec, n_fft, hop_length, window, segment_length)
 
-    def istft_channels(spec, n_fft, hop_length, window):
-        batch_size, channels, F_dim, T_dim = spec.shape
-        spec_combined = spec.reshape(batch_size * channels, F_dim, T_dim)
-        # Ensure window is on the correct device
-        window = window.to(spec_combined.device)
-        audio = torch.istft(
-            spec_combined,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=window.shape[0],
-            window=window,
-            return_complex=False,
-            center=True
-        )
-        audio = audio.reshape(batch_size, channels, -1)
-        return audio
-
-    # Use mixture phase for consistency
-    pred_vocal_spec = make_complex(pred_vocal_mag, mixture_phase)
-    target_vocal_spec = make_complex(target_vocal_mag, mixture_phase)
-    pred_instrumental_spec = make_complex(pred_instrumental_mag, mixture_phase)
-    target_instrumental_spec = make_complex(target_instrumental_mag, mixture_phase)
-
-    pred_vocal_audio = istft_channels(pred_vocal_spec, n_fft, hop_length, window)
-    target_vocal_audio = istft_channels(target_vocal_spec, n_fft, hop_length, window)
-    pred_instrumental_audio = istft_channels(pred_instrumental_spec, n_fft, hop_length, window)
-    target_instrumental_audio = istft_channels(target_instrumental_spec, n_fft, hop_length, window)
-
-    # Trimming to same length
-    min_len = min(pred_vocal_audio.shape[-1], target_vocal_audio.shape[-1],
+    min_len = min(unprocessed_audio.shape[-1], pred_vocal_audio.shape[-1], target_vocal_audio.shape[-1],
                   pred_instrumental_audio.shape[-1], target_instrumental_audio.shape[-1])
+
+    unprocessed_audio = unprocessed_audio[..., :min_len]
     pred_vocal_audio = pred_vocal_audio[..., :min_len]
     target_vocal_audio = target_vocal_audio[..., :min_len]
     pred_instrumental_audio = pred_instrumental_audio[..., :min_len]
     target_instrumental_audio = target_instrumental_audio[..., :min_len]
 
-    # Calculate STFT-based reconstruction losses
-    vocal_reconstruction_loss = stft_loss_calculator(pred_vocal_audio, target_vocal_audio)
-    instrumental_reconstruction_loss = stft_loss_calculator(pred_instrumental_audio, target_instrumental_audio)
+    processed_audio = torch.stack([pred_vocal_audio, pred_instrumental_audio], dim=2)
+    target_audio = torch.stack([target_vocal_audio, target_instrumental_audio], dim=2)
 
-    # Penalizes similarity between predicted vocals and target instrumentals (and vice versa)
-    dissimilarity_v = F.l1_loss(pred_vocal_audio, target_instrumental_audio)
-    dissimilarity_i = F.l1_loss(pred_instrumental_audio, target_vocal_audio)
+    loss = log_wmse_calculator(unprocessed_audio, processed_audio, target_audio)
 
-    total_loss = (
-        l1_vocal_loss +
-        l1_instrumental_loss +
-        vocal_reconstruction_loss +
-        instrumental_reconstruction_loss -
-        (dissimilarity_v + dissimilarity_i)
-    )
-
-    return total_loss
+    return loss
 
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
@@ -596,7 +580,16 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
 
             optimizer.zero_grad()
             pred_vocal_mask = model(mixture_mag)
-            loss = loss_fn(pred_vocal_mask, vocal_mag, instrumental_mag, mixture_mag, mixture_phase, window, 4096, 1024)
+            loss = loss_fn(pred_vocal_mask,
+                                   vocal_mag,
+                                   instrumental_mag,
+                                   mixture_mag,
+                                   mixture_phase,
+                                   window,
+                                   n_fft=4096,
+                                   hop_length=1024,
+                                   segment_length=args.segment_length,
+                                   sample_rate=44100)
             
             if torch.isnan(loss).any():
                 print("NaN loss detected, skipping batch")
