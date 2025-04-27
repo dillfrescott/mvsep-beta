@@ -199,9 +199,15 @@ def loss_fn(pred_vocal_mask,
     processed_audio = torch.stack([pred_vocal_audio, pred_instrumental_audio], dim=2)
     target_audio = torch.stack([target_vocal_audio, target_instrumental_audio], dim=2)
 
-    loss = log_wmse_calculator(unprocessed_audio, processed_audio, target_audio)
+    log_wmse_loss = log_wmse_calculator(unprocessed_audio, processed_audio, target_audio)
+    
+    mse_loss_calculator = nn.MSELoss()
 
-    return loss
+    l2_loss = mse_loss_calculator(pred_vocal_mag, target_vocal_mag)
+
+    total_loss = log_wmse_loss + l2_loss
+
+    return total_loss
 
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
