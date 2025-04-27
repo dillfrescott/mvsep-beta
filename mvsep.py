@@ -18,112 +18,81 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-class UNetConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, mid_channels=None):
+class MultiScaleDilatedConv(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        if not mid_channels:
-            mid_channels = out_channels
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.GELU(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+        self.conv_dil2 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU()
+        )
+        self.conv_dil4 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=4, dilation=4, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU()
+        )
+        self.conv_dil8 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=8, dilation=8, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU()
+        )
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, kernel_size=1),
+            nn.BatchNorm2d(channels),
             nn.GELU()
         )
 
     def forward(self, x):
-        return self.conv(x)
-
-class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = UNetConvBlock(in_channels, out_channels)
-        self.pool = nn.MaxPool2d(2)
-
-    def forward(self, x):
-        skip = self.conv(x)
-        down = self.pool(skip)
-        return skip, down
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        # in_channels includes channels from skip connection + upsampled features
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv = UNetConvBlock(in_channels, out_channels, in_channels // 2)
-
-    def forward(self, x, skip):
-        x = self.up(x)
-        # Handle potential size mismatch due to pooling/convolutions
-        diffY = skip.size()[2] - x.size()[2]
-        diffX = skip.size()[3] - x.size()[3]
-        x = F.pad(x, [diffX // 2, diffX - diffX // 2,
-                      diffY // 2, diffY - diffY // 2])
-        x = torch.cat([skip, x], dim=1)
-        return self.conv(x)
+        x2 = self.conv_dil2(x)
+        x4 = self.conv_dil4(x)
+        x8 = self.conv_dil8(x)
+        x_cat = torch.cat([x2, x4, x8], dim=1)
+        return self.output_conv(x_cat)
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=128, out_channels=2, fno_modes=(16,16)):
+    def __init__(self, in_channels=2, hidden_channels=256, out_channels=2, fno_modes=(16, 16)):
         super(NeuralModel, self).__init__()
-        
-        unet_depth_channels = [hidden_channels, hidden_channels*2, hidden_channels*4]
 
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-        
+
         self.fno1 = FNO(
             n_modes=fno_modes,
             hidden_channels=hidden_channels,
             in_channels=hidden_channels,
             out_channels=hidden_channels,
-            n_layers=1 
+            n_layers=1
         )
 
-        self.down1 = DownBlock(unet_depth_channels[0], unet_depth_channels[1])
-        self.down2 = DownBlock(unet_depth_channels[1], unet_depth_channels[2])
-        
-        self.center_conv = nn.Sequential(
-            UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
-            UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
-        )
-
-        self.up1 = UpBlock(unet_depth_channels[2] + unet_depth_channels[2], unet_depth_channels[1])
-        self.up2 = UpBlock(unet_depth_channels[1] + unet_depth_channels[1], unet_depth_channels[0])
+        self.center_multiscale = MultiScaleDilatedConv(hidden_channels)
 
         self.fno2 = FNO(
             n_modes=fno_modes,
             hidden_channels=hidden_channels,
             in_channels=hidden_channels,
             out_channels=hidden_channels,
-            n_layers=1 
+            n_layers=1
         )
-        
+
         self.final_proj = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
         self.final_activation = nn.Sigmoid()
 
     def forward(self, x):
         x = self.projection(x)
-        
-        x_fno1_out = self.fno1(x)
 
-        skip1, down1 = self.down1(x_fno1_out)
-        skip2, down2 = self.down2(down1)
-        
-        center = self.center_conv(down2)
-        
-        up1 = self.up1(center, skip2)
-        x_unet_out = self.up2(up1, skip1)
+        x = self.fno1(x)
 
-        x = self.fno2(x_unet_out)
-        
-        pred_vocal_mask = self.final_proj(x)
-        final_vocal_mask = self.final_activation(pred_vocal_mask)
-        
-        return final_vocal_mask
+        x = self.center_multiscale(x)
+
+        x = self.fno2(x)
+
+        x = self.final_proj(x)
+        x = self.final_activation(x)
+
+        return x
 
 def istft_channels(spec, n_fft, hop_length, window, target_length):
     batch_size, channels, F_dim, T_dim = spec.shape
