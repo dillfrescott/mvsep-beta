@@ -287,6 +287,12 @@ class MUSDBDataset(Dataset):
         
         return mixture_mag, mixture_phase, vocal_mag, instr_mag
 
+def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
+    grad_norm = max(grad_norm, eps)
+    lr = base_lr * (1.0 / (1.0 + grad_norm / scale))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
 def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
     model.to(device)
     step = 0
@@ -353,11 +359,12 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
                 continue
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            adjust_learning_rate(optimizer, grad_norm, base_lr=args.learning_rate)
             optimizer.step()
 
             current_loss = loss.item()
-            if avg_loss == 0.0 and step == start_epoch * len(dataloader): # Correct initialization check
+            if avg_loss == 0.0 and step == start_epoch * len(dataloader):
                  avg_loss = current_loss
             else:
                  avg_loss = 0.98 * avg_loss + 0.02 * current_loss
@@ -543,13 +550,13 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=88200, help='Segment length for training')
-    parser.add_argument('--learning_rate', type=float, default=2e-6, help='Learning rate for the optimizer')
+    parser.add_argument('--learning_rate', type=float, default=2e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
     model = NeuralModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
         train_dataset = MUSDBDataset(root_dir=args.data_dir,
