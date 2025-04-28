@@ -123,7 +123,7 @@ class NeuralModel(nn.Module):
         logits = self.final_proj(x)
         mask = self.final_activation(logits)
 
-        return mask, logits
+        return mask
 
 def istft_channels(spec, n_fft, hop_length, window, target_length):
     batch_size, channels, F_dim, T_dim = spec.shape
@@ -145,7 +145,6 @@ def istft_channels(spec, n_fft, hop_length, window, target_length):
     return audio
 
 def loss_fn(pred_vocal_mask,
-            pred_logits,
             target_vocal_mag,
             target_instrumental_mag,
             mixture_mag,
@@ -205,9 +204,7 @@ def loss_fn(pred_vocal_mask,
     mse_loss_calculator = nn.MSELoss()
     l2_loss = mse_loss_calculator(pred_vocal_mag, target_vocal_mag)
 
-    logit_penalty = torch.mean(pred_logits**2)
-
-    total_loss = log_wmse_loss + l2_loss + logit_penalty
+    total_loss = log_wmse_loss + l2_loss
 
     return total_loss
 
@@ -376,10 +373,9 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
 
             optimizer.zero_grad(set_to_none=True)
 
-            pred_vocal_mask, pred_logits = model(mixture_mag)
+            pred_vocal_mask = model(mixture_mag)
 
             loss = loss_fn(pred_vocal_mask,
-                           pred_logits,
                            vocal_mag,
                            instrumental_mag,
                            mixture_mag,
@@ -443,8 +439,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
     model.to(device)
-    
-    # Load audio
+
     input_audio, sr = torchaudio.load(input_wav_path)
     if sr != 44100:
         raise ValueError(f"Input audio must be 44100Hz, but got {sr}Hz. Please resample the audio first.")
@@ -453,7 +448,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             input_audio = input_audio.repeat(2, 1)
         else:
             raise ValueError("Input audio must be mono or stereo")
-        
+
     input_audio = input_audio.to(device)
     total_length = input_audio.shape[1]
     vocals = torch.zeros_like(input_audio)
@@ -462,53 +457,47 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     window = torch.hann_window(4096).to(device)
     n_fft = 4096
     hop_length = 1024
-    min_chunk_size = n_fft  # Minimum size needed for STFT
-    
-    # Calculate number of chunks
+    min_chunk_size = n_fft
+
     step_size = max(1, chunk_size - overlap)
     num_chunks = math.ceil(max(0, total_length - overlap) / step_size)
-    
+
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length, step_size):
             end = min(i + chunk_size, total_length)
             chunk = input_audio[:, i:end]
             chunk_length = chunk.shape[1]
-            
-            # Skip chunks that are too small
+
             if chunk_length < min_chunk_size:
                 if i == 0:
-                    # Pad first chunk if too small
                     pad_amount = min_chunk_size - chunk_length
                     chunk = F.pad(chunk, (0, pad_amount))
                     chunk_length = chunk.shape[1]
                 else:
-                    # For other small chunks, just skip them
                     pbar.update(1)
                     continue
-            
-            # Process the chunk
+
             try:
-                chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, 
+                chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length,
                                       window=window, return_complex=True)
             except RuntimeError as e:
                 print(f"Skipping chunk at position {i}-{end} due to error: {str(e)}")
                 pbar.update(1)
                 continue
-            
+
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
-            
+
             with torch.no_grad():
-                pred_vocal_mask, _ = model(chunk_mag.unsqueeze(0))
+                pred_vocal_mask = model(chunk_mag.unsqueeze(0)) # <<< This line was changed
                 pred_vocal_mask = pred_vocal_mask.squeeze(0)
-            
+
             pred_vocal_mag = chunk_mag * pred_vocal_mask
             pred_instrumental_mag = chunk_mag * (1 - pred_vocal_mask)
 
             vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
             instrumental_spec = pred_instrumental_mag * torch.exp(1j * chunk_phase)
-            
-            # Reconstruct audio
+
             vocal_chunk = torch.zeros_like(chunk)
             inst_chunk = torch.zeros_like(chunk)
             for channel in range(2):
@@ -520,7 +509,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                     length=chunk_length,
                     return_complex=False
                 ).squeeze(0)
-                
+
                 inst_chunk[channel] = torch.istft(
                     instrumental_spec[channel].unsqueeze(0),
                     n_fft=n_fft,
@@ -529,47 +518,39 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                     length=chunk_length,
                     return_complex=False
                 ).squeeze(0)
-            
-            # Handle overlap-add
+
             if i == 0:
-                # First chunk - just copy
                 copy_length = min(chunk_length, total_length)
                 vocals[:, :copy_length] = vocal_chunk[:, :copy_length]
                 instrumentals[:, :copy_length] = inst_chunk[:, :copy_length]
             else:
-                # Cross-fade with previous chunk
                 fade_in = torch.linspace(0, 1, cross_fade_length).to(device)
                 fade_out = torch.linspace(1, 0, cross_fade_length).to(device)
-                
-                # Determine actual overlap region
+
                 overlap_start = i
                 overlap_end = min(i + cross_fade_length, total_length)
                 actual_overlap = overlap_end - overlap_start
-                
+
                 if actual_overlap > 0:
-                    # Vocals cross-fade
                     vocal_chunk[:, :actual_overlap] *= fade_in[:actual_overlap]
                     vocals[:, overlap_start:overlap_end] *= fade_out[:actual_overlap]
                     vocals[:, overlap_start:overlap_end] += vocal_chunk[:, :actual_overlap]
-                    
-                    # Instrumentals cross-fade
+
                     inst_chunk[:, :actual_overlap] *= fade_in[:actual_overlap]
                     instrumentals[:, overlap_start:overlap_end] *= fade_out[:actual_overlap]
                     instrumentals[:, overlap_start:overlap_end] += inst_chunk[:, :actual_overlap]
-                
-                # Copy remaining samples
+
                 remaining_start = min(i + cross_fade_length, total_length)
                 remaining_end = min(i + chunk_length, total_length)
                 if remaining_start < remaining_end:
                     vocals[:, remaining_start:remaining_end] = vocal_chunk[:, remaining_start-i:remaining_end-i]
                     instrumentals[:, remaining_start:remaining_end] = inst_chunk[:, remaining_start-i:remaining_end-i]
-            
+
             pbar.update(1)
-    
-    # Trim to original length and clamp
+
     vocals = vocals[:, :total_length].clamp(-1.0, 1.0)
     instrumentals = instrumentals[:, :total_length].clamp(-1.0, 1.0)
-    
+
     torchaudio.save(output_vocal_path, vocals.cpu(), sr)
     torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
 
