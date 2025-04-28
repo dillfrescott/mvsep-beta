@@ -1,5 +1,6 @@
 librosa
+neuraloperator
 numpy
 soundfile
-auraloss
+torch-log-wmse
 tqdm
