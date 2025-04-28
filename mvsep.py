@@ -18,112 +18,76 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-class UNetConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, mid_channels=None):
+class MultiScaleDilatedConv(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        if not mid_channels:
-            mid_channels = out_channels
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.GELU(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+        self.conv_dil2 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU()
+        )
+        self.conv_dil4 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=4, dilation=4, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU()
+        )
+        self.conv_dil8 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=8, dilation=8, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU()
+        )
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, kernel_size=1),
+            nn.BatchNorm2d(channels),
             nn.GELU()
         )
 
     def forward(self, x):
-        return self.conv(x)
-
-class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = UNetConvBlock(in_channels, out_channels)
-        self.pool = nn.MaxPool2d(2)
-
-    def forward(self, x):
-        skip = self.conv(x)
-        down = self.pool(skip)
-        return skip, down
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        # in_channels includes channels from skip connection + upsampled features
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv = UNetConvBlock(in_channels, out_channels, in_channels // 2)
-
-    def forward(self, x, skip):
-        x = self.up(x)
-        # Handle potential size mismatch due to pooling/convolutions
-        diffY = skip.size()[2] - x.size()[2]
-        diffX = skip.size()[3] - x.size()[3]
-        x = F.pad(x, [diffX // 2, diffX - diffX // 2,
-                      diffY // 2, diffY - diffY // 2])
-        x = torch.cat([skip, x], dim=1)
-        return self.conv(x)
+        x2 = self.conv_dil2(x)
+        x4 = self.conv_dil4(x)
+        x8 = self.conv_dil8(x)
+        x_cat = torch.cat([x2, x4, x8], dim=1)
+        return self.output_conv(x_cat)
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=128, out_channels=2, fno_modes=(16,16)):
+    def __init__(self, in_channels=2, hidden_channels=256, out_channels=2, fno_modes=(16, 16)):
         super(NeuralModel, self).__init__()
-        
-        unet_depth_channels = [hidden_channels, hidden_channels*2, hidden_channels*4]
 
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-        
+
         self.fno1 = FNO(
             n_modes=fno_modes,
             hidden_channels=hidden_channels,
             in_channels=hidden_channels,
             out_channels=hidden_channels,
-            n_layers=1 
+            n_layers=1
         )
 
-        self.down1 = DownBlock(unet_depth_channels[0], unet_depth_channels[1])
-        self.down2 = DownBlock(unet_depth_channels[1], unet_depth_channels[2])
-        
-        self.center_conv = nn.Sequential(
-            UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
-            UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
-        )
-
-        self.up1 = UpBlock(unet_depth_channels[2] + unet_depth_channels[2], unet_depth_channels[1])
-        self.up2 = UpBlock(unet_depth_channels[1] + unet_depth_channels[1], unet_depth_channels[0])
+        self.center_multiscale = MultiScaleDilatedConv(hidden_channels)
 
         self.fno2 = FNO(
             n_modes=fno_modes,
             hidden_channels=hidden_channels,
             in_channels=hidden_channels,
             out_channels=hidden_channels,
-            n_layers=1 
+            n_layers=1
         )
-        
+
         self.final_proj = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
         self.final_activation = nn.Sigmoid()
 
     def forward(self, x):
         x = self.projection(x)
-        
-        x_fno1_out = self.fno1(x)
-
-        skip1, down1 = self.down1(x_fno1_out)
-        skip2, down2 = self.down2(down1)
-        
-        center = self.center_conv(down2)
-        
-        up1 = self.up1(center, skip2)
-        x_unet_out = self.up2(up1, skip1)
-
-        x = self.fno2(x_unet_out)
-        
-        pred_vocal_mask = self.final_proj(x)
-        final_vocal_mask = self.final_activation(pred_vocal_mask)
-        
-        return final_vocal_mask
+        x = self.fno1(x)
+        x = self.center_multiscale(x)
+        x = self.fno2(x)
+        logits = self.final_proj(x)
+        mask = self.final_activation(logits)
+        return mask, logits
 
 def istft_channels(spec, n_fft, hop_length, window, target_length):
     batch_size, channels, F_dim, T_dim = spec.shape
@@ -145,6 +109,7 @@ def istft_channels(spec, n_fft, hop_length, window, target_length):
     return audio
 
 def loss_fn(pred_vocal_mask,
+            pred_logits, # Add logits here
             target_vocal_mag,
             target_instrumental_mag,
             mixture_mag,
@@ -200,12 +165,13 @@ def loss_fn(pred_vocal_mask,
     target_audio = torch.stack([target_vocal_audio, target_instrumental_audio], dim=2)
 
     log_wmse_loss = log_wmse_calculator(unprocessed_audio, processed_audio, target_audio)
-    
-    mse_loss_calculator = nn.MSELoss()
 
+    mse_loss_calculator = nn.MSELoss()
     l2_loss = mse_loss_calculator(pred_vocal_mag, target_vocal_mag)
 
-    total_loss = log_wmse_loss + l2_loss
+    logit_penalty = torch.mean(pred_logits**2)
+
+    total_loss = log_wmse_loss + l2_loss + logit_penalty
 
     return total_loss
 
@@ -328,62 +294,104 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     checkpoint_files = []
 
     if checkpoint_path:
-        checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
-        step = checkpoint_data['step']
-        avg_loss = checkpoint_data['avg_loss']
-        print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
+        if os.path.exists(checkpoint_path):
+            try:
+                checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
+                print(f"Resuming training from checkpoint: {checkpoint_path}")
+                step = checkpoint_data.get('step', 0)
+                avg_loss = checkpoint_data.get('avg_loss', 0.0)
+                if 'optimizer_state_dict' in checkpoint_data:
+                     try:
+                        optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
+                     except Exception as e:
+                        print(f"Warning: Could not load optimizer state from checkpoint: {e}. Optimizer state will be reinitialized.")
+                else:
+                    print("Warning: Optimizer state not found in checkpoint. Optimizer state will be reinitialized.")
 
-    progress_bar = tqdm(total=epochs * len(dataloader))
+            except Exception as e:
+                print(f"Error loading checkpoint {checkpoint_path}: {e}. Starting training from scratch.")
+                step = 0
+                avg_loss = 0.0
+        else:
+             print(f"Checkpoint path {checkpoint_path} not found. Starting training from scratch.")
+             step = 0
+             avg_loss = 0.0
+
+    total_steps_expected = epochs * len(dataloader)
+    progress_bar = tqdm(total=total_steps_expected, initial=step)
     model.train()
-    for epoch in range(epochs):
-        for batch in dataloader:
+    start_epoch = (step // len(dataloader)) if len(dataloader) > 0 else 0
+    progress_bar.set_description(f"Epoch {start_epoch+1}/{epochs} - Starting...")
+
+    for epoch in range(start_epoch, epochs):
+         for batch in dataloader:
             mixture_mag, mixture_phase, vocal_mag, instrumental_mag = batch
             mixture_mag = mixture_mag.to(device)
             mixture_phase = mixture_phase.to(device)
             vocal_mag = vocal_mag.to(device)
             instrumental_mag = instrumental_mag.to(device)
 
-            optimizer.zero_grad()
-            pred_vocal_mask = model(mixture_mag)
+            optimizer.zero_grad(set_to_none=True)
+
+            pred_vocal_mask, pred_logits = model(mixture_mag)
+
             loss = loss_fn(pred_vocal_mask,
-                                   vocal_mag,
-                                   instrumental_mag,
-                                   mixture_mag,
-                                   mixture_phase,
-                                   window,
-                                   n_fft=4096,
-                                   hop_length=1024,
-                                   segment_length=args.segment_length,
-                                   sample_rate=44100)
-            
-            if torch.isnan(loss).any():
-                print("NaN loss detected, skipping batch")
+                           pred_logits,
+                           vocal_mag,
+                           instrumental_mag,
+                           mixture_mag,
+                           mixture_phase,
+                           window,
+                           n_fft=4096,
+                           hop_length=1024,
+                           segment_length=args.segment_length,
+                           sample_rate=44100)
+
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                print(f"Warning: NaN or Inf loss detected at step {step}, skipping batch.")
                 continue
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            avg_loss = (avg_loss * step + loss.item()) / (step + 1)
+            current_loss = loss.item()
+            if avg_loss == 0.0 and step == start_epoch * len(dataloader): # Correct initialization check
+                 avg_loss = current_loss
+            else:
+                 avg_loss = 0.98 * avg_loss + 0.02 * current_loss
+
             step += 1
             progress_bar.update(1)
+
             current_lr = optimizer.param_groups[0]['lr']
-            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
+            desc = f"Epoch {epoch+1}/{epochs} - Loss: {current_loss:.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
             progress_bar.set_description(desc)
 
             if step % checkpoint_steps == 0:
                 checkpoint_filename = f"checkpoint_step_{step}.pt"
-                torch.save({
+                save_dict = {
                     'step': step,
                     'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
-                }, checkpoint_filename)
+                 }
+                try:
+                     save_dict['optimizer_state_dict'] = optimizer.state_dict()
+                except Exception as e:
+                     print(f"Could not get optimizer state dict for checkpoint: {e}")
+
+                torch.save(save_dict, checkpoint_filename)
+
                 checkpoint_files.append(checkpoint_filename)
                 if len(checkpoint_files) > 3:
                     oldest_checkpoint = checkpoint_files.pop(0)
                     if os.path.exists(oldest_checkpoint):
-                        os.remove(oldest_checkpoint)
+                        try:
+                            os.remove(oldest_checkpoint)
+                        except OSError as e:
+                            print(f"Error removing old checkpoint {oldest_checkpoint}: {e}")
+
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
@@ -448,7 +456,8 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             chunk_phase = torch.angle(chunk_spec)
             
             with torch.no_grad():
-                pred_vocal_mask = model(chunk_mag.unsqueeze(0)).squeeze(0)
+                pred_vocal_mask, _ = model(chunk_mag.unsqueeze(0))
+                pred_vocal_mask = pred_vocal_mask.squeeze(0)
             
             pred_vocal_mag = chunk_mag * pred_vocal_mask
             pred_instrumental_mag = chunk_mag * (1 - pred_vocal_mask)
