@@ -8,7 +8,7 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch_log_wmse import LogWMSE
-from prodigyopt import Prodigy
+from neuralop.models import FNO
 import numpy as np
 import random
 import math
@@ -50,7 +50,7 @@ class MultiScaleDilatedConv(nn.Module):
         return self.output_conv(x_cat)
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=256, out_channels=2, num_layers=4):
+    def __init__(self, in_channels=2, hidden_channels=256, out_channels=2, fno_modes=(16, 16)):
         super(NeuralModel, self).__init__()
 
         self.projection = nn.Sequential(
@@ -59,13 +59,22 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
 
-        self.multiscale = MultiScaleDilatedConv(hidden_channels)
+        self.fno1 = FNO(
+            n_modes=fno_modes,
+            hidden_channels=hidden_channels,
+            in_channels=hidden_channels,
+            out_channels=hidden_channels,
+            n_layers=1
+        )
 
-        self.gru = nn.GRU(
-            input_size=hidden_channels,
-            hidden_size=hidden_channels,
-            num_layers=num_layers,
-            batch_first=True
+        self.center_multiscale = MultiScaleDilatedConv(hidden_channels)
+
+        self.fno2 = FNO(
+            n_modes=fno_modes,
+            hidden_channels=hidden_channels,
+            in_channels=hidden_channels,
+            out_channels=hidden_channels,
+            n_layers=1
         )
 
         self.final_proj = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
@@ -73,13 +82,9 @@ class NeuralModel(nn.Module):
 
     def forward(self, x):
         x = self.projection(x)
-        x = self.multiscale(x)
-
-        B, C, H, W = x.shape
-        x_reshaped = x.permute(0, 2, 3, 1).reshape(B * H, W, C)
-        gru_out, _ = self.gru(x_reshaped)
-        x = gru_out.reshape(B, H, W, C).permute(0, 3, 1, 2)
-
+        x = self.fno1(x)
+        x = self.center_multiscale(x)
+        x = self.fno2(x)
         logits = self.final_proj(x)
         mask = self.final_activation(logits)
         return mask, logits
@@ -282,6 +287,12 @@ class MUSDBDataset(Dataset):
         
         return mixture_mag, mixture_phase, vocal_mag, instr_mag
 
+def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
+    grad_norm = max(grad_norm, eps)
+    lr = base_lr * (1.0 / (1.0 + grad_norm / scale))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
 def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
     model.to(device)
     step = 0
@@ -348,6 +359,8 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
                 continue
 
             loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            adjust_learning_rate(optimizer, grad_norm, base_lr=args.learning_rate)
             optimizer.step()
 
             current_loss = loss.item()
@@ -360,7 +373,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
             progress_bar.update(1)
 
             current_lr = optimizer.param_groups[0]['lr']
-            desc = f"Epoch {epoch+1}/{epochs} - Loss: {current_loss:.4f} - Avg Loss: {avg_loss:.4f}"
+            desc = f"Epoch {epoch+1}/{epochs} - Loss: {current_loss:.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
             progress_bar.set_description(desc)
 
             if step % checkpoint_steps == 0:
@@ -537,12 +550,13 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=88200, help='Segment length for training')
+    parser.add_argument('--learning_rate', type=float, default=2e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
     model = NeuralModel()
-    optimizer = Prodigy(model.parameters(), lr=1.0)
+    optimizer = torch.optim.Adam(model.parameters())
 
     if args.train:
         train_dataset = MUSDBDataset(root_dir=args.data_dir,
