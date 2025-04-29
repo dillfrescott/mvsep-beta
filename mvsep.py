@@ -66,7 +66,7 @@ class UpBlock(nn.Module):
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=128, out_channels=2, fno_modes=(16,16)):
         super(NeuralModel, self).__init__()
-
+        
         unet_depth_channels = [hidden_channels, hidden_channels*2, hidden_channels*4]
 
         self.projection = nn.Sequential(
@@ -74,18 +74,18 @@ class NeuralModel(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-
+        
         self.fno1 = FNO(
             n_modes=fno_modes,
             hidden_channels=hidden_channels,
             in_channels=hidden_channels,
             out_channels=hidden_channels,
-            n_layers=1
+            n_layers=1 
         )
 
         self.down1 = DownBlock(unet_depth_channels[0], unet_depth_channels[1])
         self.down2 = DownBlock(unet_depth_channels[1], unet_depth_channels[2])
-
+        
         self.center_conv = nn.Sequential(
             UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
             UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
@@ -99,31 +99,31 @@ class NeuralModel(nn.Module):
             hidden_channels=hidden_channels,
             in_channels=hidden_channels,
             out_channels=hidden_channels,
-            n_layers=1
+            n_layers=1 
         )
-
+        
         self.final_proj = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
         self.final_activation = nn.Sigmoid()
 
     def forward(self, x):
-        x = self.projection(x) #
+        x = self.projection(x)
+        
+        x_fno1_out = self.fno1(x)
 
-        x_fno1_out = self.fno1(x) #
+        skip1, down1 = self.down1(x_fno1_out)
+        skip2, down2 = self.down2(down1)
+        
+        center = self.center_conv(down2)
+        
+        up1 = self.up1(center, skip2)
+        x_unet_out = self.up2(up1, skip1)
 
-        skip1, down1 = self.down1(x_fno1_out) #
-        skip2, down2 = self.down2(down1) #
-
-        center = self.center_conv(down2) #
-
-        up1 = self.up1(center, skip2) #
-        x_unet_out = self.up2(up1, skip1) #
-
-        x = self.fno2(x_unet_out) #
-
-        logits = self.final_proj(x)
-        mask = self.final_activation(logits)
-
-        return mask
+        x = self.fno2(x_unet_out)
+        
+        pred_vocal_mask = self.final_proj(x)
+        final_vocal_mask = self.final_activation(pred_vocal_mask)
+        
+        return final_vocal_mask
 
 def istft_channels(spec, n_fft, hop_length, window, target_length):
     batch_size, channels, F_dim, T_dim = spec.shape
@@ -165,7 +165,6 @@ def loss_fn(pred_vocal_mask,
         bypass_filter=False
     )
 
-    pred_vocal_mask = torch.clamp(pred_vocal_mask, 0.0, 1.0)
     pred_vocal_mag = mixture_mag * pred_vocal_mask
     pred_instrumental_mag = mixture_mag * (1.0 - pred_vocal_mask)
 
@@ -200,8 +199,9 @@ def loss_fn(pred_vocal_mask,
     target_audio = torch.stack([target_vocal_audio, target_instrumental_audio], dim=2)
 
     log_wmse_loss = log_wmse_calculator(unprocessed_audio, processed_audio, target_audio)
-
+    
     mse_loss_calculator = nn.MSELoss()
+
     l2_loss = mse_loss_calculator(pred_vocal_mag, target_vocal_mag)
 
     total_loss = log_wmse_loss + l2_loss
@@ -333,61 +333,37 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     checkpoint_files = []
 
     if checkpoint_path:
-        if os.path.exists(checkpoint_path):
-            try:
-                checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
-                model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
-                print(f"Resuming training from checkpoint: {checkpoint_path}")
-                step = checkpoint_data.get('step', 0)
-                avg_loss = checkpoint_data.get('avg_loss', 0.0)
-                if 'optimizer_state_dict' in checkpoint_data:
-                     try:
-                        optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
-                     except Exception as e:
-                        print(f"Warning: Could not load optimizer state from checkpoint: {e}. Optimizer state will be reinitialized.")
-                else:
-                    print("Warning: Optimizer state not found in checkpoint. Optimizer state will be reinitialized.")
+        checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
+        step = checkpoint_data['step']
+        avg_loss = checkpoint_data['avg_loss']
+        print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
 
-            except Exception as e:
-                print(f"Error loading checkpoint {checkpoint_path}: {e}. Starting training from scratch.")
-                step = 0
-                avg_loss = 0.0
-        else:
-             print(f"Checkpoint path {checkpoint_path} not found. Starting training from scratch.")
-             step = 0
-             avg_loss = 0.0
-
-    total_steps_expected = epochs * len(dataloader)
-    progress_bar = tqdm(total=total_steps_expected, initial=step)
+    progress_bar = tqdm(total=epochs * len(dataloader))
     model.train()
-    start_epoch = (step // len(dataloader)) if len(dataloader) > 0 else 0
-    progress_bar.set_description(f"Epoch {start_epoch+1}/{epochs} - Starting...")
-
-    for epoch in range(start_epoch, epochs):
-         for batch in dataloader:
+    for epoch in range(epochs):
+        for batch in dataloader:
             mixture_mag, mixture_phase, vocal_mag, instrumental_mag = batch
             mixture_mag = mixture_mag.to(device)
             mixture_phase = mixture_phase.to(device)
             vocal_mag = vocal_mag.to(device)
             instrumental_mag = instrumental_mag.to(device)
 
-            optimizer.zero_grad(set_to_none=True)
-
+            optimizer.zero_grad()
             pred_vocal_mask = model(mixture_mag)
-
             loss = loss_fn(pred_vocal_mask,
-                           vocal_mag,
-                           instrumental_mag,
-                           mixture_mag,
-                           mixture_phase,
-                           window,
-                           n_fft=4096,
-                           hop_length=1024,
-                           segment_length=args.segment_length,
-                           sample_rate=44100)
-
-            if torch.isnan(loss).any() or torch.isinf(loss).any():
-                print(f"Warning: NaN or Inf loss detected at step {step}, skipping batch.")
+                                   vocal_mag,
+                                   instrumental_mag,
+                                   mixture_mag,
+                                   mixture_phase,
+                                   window,
+                                   n_fft=4096,
+                                   hop_length=1024,
+                                   segment_length=args.segment_length,
+                                   sample_rate=44100)
+            
+            if torch.isnan(loss).any():
+                print("NaN loss detected, skipping batch")
                 continue
 
             loss.backward()
@@ -395,42 +371,26 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
             adjust_learning_rate(optimizer, grad_norm, base_lr=args.learning_rate)
             optimizer.step()
 
-            current_loss = loss.item()
-            if avg_loss == 0.0 and step == start_epoch * len(dataloader):
-                 avg_loss = current_loss
-            else:
-                 avg_loss = 0.98 * avg_loss + 0.02 * current_loss
-
+            avg_loss = (avg_loss * step + loss.item()) / (step + 1)
             step += 1
             progress_bar.update(1)
-
             current_lr = optimizer.param_groups[0]['lr']
-            desc = f"Epoch {epoch+1}/{epochs} - Loss: {current_loss:.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
+            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
             progress_bar.set_description(desc)
 
             if step % checkpoint_steps == 0:
                 checkpoint_filename = f"checkpoint_step_{step}.pt"
-                save_dict = {
+                torch.save({
                     'step': step,
                     'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
-                 }
-                try:
-                     save_dict['optimizer_state_dict'] = optimizer.state_dict()
-                except Exception as e:
-                     print(f"Could not get optimizer state dict for checkpoint: {e}")
-
-                torch.save(save_dict, checkpoint_filename)
-
+                }, checkpoint_filename)
                 checkpoint_files.append(checkpoint_filename)
                 if len(checkpoint_files) > 3:
                     oldest_checkpoint = checkpoint_files.pop(0)
                     if os.path.exists(oldest_checkpoint):
-                        try:
-                            os.remove(oldest_checkpoint)
-                        except OSError as e:
-                            print(f"Error removing old checkpoint {oldest_checkpoint}: {e}")
-
+                        os.remove(oldest_checkpoint)
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
@@ -439,7 +399,8 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
     model.to(device)
-
+    
+    # Load audio
     input_audio, sr = torchaudio.load(input_wav_path)
     if sr != 44100:
         raise ValueError(f"Input audio must be 44100Hz, but got {sr}Hz. Please resample the audio first.")
@@ -448,7 +409,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
             input_audio = input_audio.repeat(2, 1)
         else:
             raise ValueError("Input audio must be mono or stereo")
-
+        
     input_audio = input_audio.to(device)
     total_length = input_audio.shape[1]
     vocals = torch.zeros_like(input_audio)
@@ -457,47 +418,52 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
     window = torch.hann_window(4096).to(device)
     n_fft = 4096
     hop_length = 1024
-    min_chunk_size = n_fft
-
+    min_chunk_size = n_fft  # Minimum size needed for STFT
+    
+    # Calculate number of chunks
     step_size = max(1, chunk_size - overlap)
     num_chunks = math.ceil(max(0, total_length - overlap) / step_size)
-
+    
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length, step_size):
             end = min(i + chunk_size, total_length)
             chunk = input_audio[:, i:end]
             chunk_length = chunk.shape[1]
-
+            
+            # Skip chunks that are too small
             if chunk_length < min_chunk_size:
                 if i == 0:
+                    # Pad first chunk if too small
                     pad_amount = min_chunk_size - chunk_length
                     chunk = F.pad(chunk, (0, pad_amount))
                     chunk_length = chunk.shape[1]
                 else:
+                    # For other small chunks, just skip them
                     pbar.update(1)
                     continue
-
+            
+            # Process the chunk
             try:
-                chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length,
+                chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, 
                                       window=window, return_complex=True)
             except RuntimeError as e:
                 print(f"Skipping chunk at position {i}-{end} due to error: {str(e)}")
                 pbar.update(1)
                 continue
-
+            
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
-
+            
             with torch.no_grad():
-                pred_vocal_mask = model(chunk_mag.unsqueeze(0)) # <<< This line was changed
-                pred_vocal_mask = pred_vocal_mask.squeeze(0)
-
+                pred_vocal_mask = model(chunk_mag.unsqueeze(0)).squeeze(0)
+            
             pred_vocal_mag = chunk_mag * pred_vocal_mask
             pred_instrumental_mag = chunk_mag * (1 - pred_vocal_mask)
 
             vocal_spec = pred_vocal_mag * torch.exp(1j * chunk_phase)
             instrumental_spec = pred_instrumental_mag * torch.exp(1j * chunk_phase)
-
+            
+            # Reconstruct audio
             vocal_chunk = torch.zeros_like(chunk)
             inst_chunk = torch.zeros_like(chunk)
             for channel in range(2):
@@ -509,7 +475,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                     length=chunk_length,
                     return_complex=False
                 ).squeeze(0)
-
+                
                 inst_chunk[channel] = torch.istft(
                     instrumental_spec[channel].unsqueeze(0),
                     n_fft=n_fft,
@@ -518,39 +484,47 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, 
                     length=chunk_length,
                     return_complex=False
                 ).squeeze(0)
-
+            
+            # Handle overlap-add
             if i == 0:
+                # First chunk - just copy
                 copy_length = min(chunk_length, total_length)
                 vocals[:, :copy_length] = vocal_chunk[:, :copy_length]
                 instrumentals[:, :copy_length] = inst_chunk[:, :copy_length]
             else:
+                # Cross-fade with previous chunk
                 fade_in = torch.linspace(0, 1, cross_fade_length).to(device)
                 fade_out = torch.linspace(1, 0, cross_fade_length).to(device)
-
+                
+                # Determine actual overlap region
                 overlap_start = i
                 overlap_end = min(i + cross_fade_length, total_length)
                 actual_overlap = overlap_end - overlap_start
-
+                
                 if actual_overlap > 0:
+                    # Vocals cross-fade
                     vocal_chunk[:, :actual_overlap] *= fade_in[:actual_overlap]
                     vocals[:, overlap_start:overlap_end] *= fade_out[:actual_overlap]
                     vocals[:, overlap_start:overlap_end] += vocal_chunk[:, :actual_overlap]
-
+                    
+                    # Instrumentals cross-fade
                     inst_chunk[:, :actual_overlap] *= fade_in[:actual_overlap]
                     instrumentals[:, overlap_start:overlap_end] *= fade_out[:actual_overlap]
                     instrumentals[:, overlap_start:overlap_end] += inst_chunk[:, :actual_overlap]
-
+                
+                # Copy remaining samples
                 remaining_start = min(i + cross_fade_length, total_length)
                 remaining_end = min(i + chunk_length, total_length)
                 if remaining_start < remaining_end:
                     vocals[:, remaining_start:remaining_end] = vocal_chunk[:, remaining_start-i:remaining_end-i]
                     instrumentals[:, remaining_start:remaining_end] = inst_chunk[:, remaining_start-i:remaining_end-i]
-
+            
             pbar.update(1)
-
+    
+    # Trim to original length and clamp
     vocals = vocals[:, :total_length].clamp(-1.0, 1.0)
     instrumentals = instrumentals[:, :total_length].clamp(-1.0, 1.0)
-
+    
     torchaudio.save(output_vocal_path, vocals.cpu(), sr)
     torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
 
@@ -567,7 +541,7 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=88200, help='Segment length for training')
-    parser.add_argument('--learning_rate', type=float, default=2e-4, help='Learning rate for the optimizer')
+    parser.add_argument('--learning_rate', type=float, default=4e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
