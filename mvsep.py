@@ -339,7 +339,8 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
         avg_loss = checkpoint_data['avg_loss']
         print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
 
-    progress_bar = tqdm(total=epochs * len(dataloader))
+    total_steps = epochs * len(dataloader)
+    progress_bar = tqdm(total=total_steps, initial=step)
     model.train()
     for epoch in range(epochs):
         for batch in dataloader:
@@ -553,7 +554,7 @@ def main():
         train_dataset = MUSDBDataset(root_dir=args.data_dir,
                                      segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                      num_workers=16, pin_memory=False, persistent_workers=True)
+                                      num_workers=0, pin_memory=False, persistent_workers=False)
         total_steps = args.epochs * len(train_dataloader)
         train(model, train_dataloader, optimizer, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
