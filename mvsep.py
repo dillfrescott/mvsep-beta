@@ -368,7 +368,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
                 continue
 
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
             adjust_learning_rate(optimizer, grad_norm, base_lr=args.learning_rate)
             optimizer.step()
 
