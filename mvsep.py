@@ -8,6 +8,7 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch_log_wmse import LogWMSE
+from prodigyopt import Prodigy
 import numpy as np
 import random
 import math
@@ -127,87 +128,14 @@ class NeuralModel(nn.Module):
         
         return final_vocal_mask
 
-def istft_channels(spec, n_fft, hop_length, window, target_length):
-    batch_size, channels, F_dim, T_dim = spec.shape
-    spec_combined = spec.reshape(batch_size * channels, F_dim, T_dim)
-    if window is not None:
-        window = window.to(spec_combined.device)
-
-    audio = torch.istft(
-        spec_combined,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        win_length=window.shape[0] if window is not None else n_fft,
-        window=window,
-        return_complex=False,
-        center=True,
-        length=target_length
-    )
-    audio = audio.reshape(batch_size, channels, -1)
-    return audio
-
-def loss_fn(pred_vocal_mask,
-            target_vocal_mag,
-            target_instrumental_mag,
-            mixture_mag,
-            mixture_phase,
-            window,
-            n_fft,
-            hop_length,
-            segment_length,
-            sample_rate):
-
-    device = mixture_mag.device
-    audio_length_seconds = segment_length / sample_rate
-
-    log_wmse_calculator = LogWMSE(
-        audio_length=audio_length_seconds,
-        sample_rate=sample_rate,
-        return_as_loss=True,
-        bypass_filter=False
-    )
-
+def loss_fn(pred_vocal_mask, target_vocal_mag, target_instrumental_mag, mixture_mag):
     pred_vocal_mag = mixture_mag * pred_vocal_mask
     pred_instrumental_mag = mixture_mag * (1.0 - pred_vocal_mask)
-
-    pred_vocal_mag = torch.clamp(pred_vocal_mag, min=1e-8)
-    pred_instrumental_mag = torch.clamp(pred_instrumental_mag, min=1e-8)
-    target_vocal_mag = torch.clamp(target_vocal_mag, min=1e-8)
-    target_instrumental_mag = torch.clamp(target_instrumental_mag, min=1e-8)
-    mixture_mag_clamped = torch.clamp(mixture_mag, min=1e-8)
-
-    mixture_spec = torch.polar(mixture_mag_clamped, mixture_phase)
-    pred_vocal_spec = torch.polar(pred_vocal_mag, mixture_phase)
-    target_vocal_spec = torch.polar(target_vocal_mag, mixture_phase)
-    pred_instrumental_spec = torch.polar(pred_instrumental_mag, mixture_phase)
-    target_instrumental_spec = torch.polar(target_instrumental_mag, mixture_phase)
-
-    unprocessed_audio = istft_channels(mixture_spec, n_fft, hop_length, window, segment_length)
-    pred_vocal_audio = istft_channels(pred_vocal_spec, n_fft, hop_length, window, segment_length)
-    target_vocal_audio = istft_channels(target_vocal_spec, n_fft, hop_length, window, segment_length)
-    pred_instrumental_audio = istft_channels(pred_instrumental_spec, n_fft, hop_length, window, segment_length)
-    target_instrumental_audio = istft_channels(target_instrumental_spec, n_fft, hop_length, window, segment_length)
-
-    min_len = min(unprocessed_audio.shape[-1], pred_vocal_audio.shape[-1], target_vocal_audio.shape[-1],
-                  pred_instrumental_audio.shape[-1], target_instrumental_audio.shape[-1])
-
-    unprocessed_audio = unprocessed_audio[..., :min_len]
-    pred_vocal_audio = pred_vocal_audio[..., :min_len]
-    target_vocal_audio = target_vocal_audio[..., :min_len]
-    pred_instrumental_audio = pred_instrumental_audio[..., :min_len]
-    target_instrumental_audio = target_instrumental_audio[..., :min_len]
-
-    processed_audio = torch.stack([pred_vocal_audio, pred_instrumental_audio], dim=2)
-    target_audio = torch.stack([target_vocal_audio, target_instrumental_audio], dim=2)
-
-    log_wmse_loss = log_wmse_calculator(unprocessed_audio, processed_audio, target_audio)
     
-    mse_loss_calculator = nn.MSELoss()
-
-    l2_loss = mse_loss_calculator(pred_vocal_mag, target_vocal_mag)
-
-    total_loss = log_wmse_loss + l2_loss
-
+    mse_loss = nn.MSELoss()
+    l2_loss_vocal = mse_loss(pred_vocal_mag, target_vocal_mag)
+    l2_loss_instrumental = mse_loss(pred_instrumental_mag, target_instrumental_mag)
+    total_loss = l2_loss_vocal + l2_loss_instrumental
     return total_loss
 
 class MUSDBDataset(Dataset):
@@ -322,12 +250,6 @@ class MUSDBDataset(Dataset):
         
         return mixture_mag, mixture_phase, vocal_mag, instr_mag
 
-def adjust_learning_rate(optimizer, grad_norm, base_lr, scale=1.0, eps=1e-8):
-    grad_norm = max(grad_norm, eps)
-    lr = base_lr * (1.0 / (1.0 + grad_norm / scale))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
 def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
     model.to(device)
     step = 0
@@ -354,31 +276,20 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
 
             optimizer.zero_grad()
             pred_vocal_mask = model(mixture_mag)
-            loss = loss_fn(pred_vocal_mask,
-                                   vocal_mag,
-                                   instrumental_mag,
-                                   mixture_mag,
-                                   mixture_phase,
-                                   window,
-                                   n_fft=4096,
-                                   hop_length=1024,
-                                   segment_length=args.segment_length,
-                                   sample_rate=44100)
+            loss = loss_fn(pred_vocal_mask, vocal_mag, instrumental_mag, mixture_mag)
             
             if torch.isnan(loss).any():
                 print("NaN loss detected, skipping batch")
                 continue
 
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-            adjust_learning_rate(optimizer, grad_norm, base_lr=args.learning_rate)
             optimizer.step()
 
             avg_loss = (avg_loss * step + loss.item()) / (step + 1)
             step += 1
             progress_bar.update(1)
             current_lr = optimizer.param_groups[0]['lr']
-            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - LR: {current_lr:.8f}"
+            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f}"
             progress_bar.set_description(desc)
 
             if step % checkpoint_steps == 0:
@@ -544,13 +455,12 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=88200, help='Segment length for training')
-    parser.add_argument('--learning_rate', type=float, default=2e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
     model = NeuralModel()
-    optimizer = torch.optim.Adam(model.parameters())
+    optimizer = Prodigy(model.parameters(), lr=1.0)
 
     if args.train:
         train_dataset = MUSDBDataset(root_dir=args.data_dir,
