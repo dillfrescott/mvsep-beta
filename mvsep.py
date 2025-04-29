@@ -8,15 +8,11 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch_log_wmse import LogWMSE
-from neuralop.models import FNO
 import numpy as np
 import random
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
-import warnings
-
-warnings.filterwarnings('ignore')
 
 class UNetConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, mid_channels=None):
@@ -64,23 +60,23 @@ class UpBlock(nn.Module):
         return self.conv(x)
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=128, out_channels=2, fno_modes=(16,16)):
+    def __init__(self, in_channels=2, hidden_channels=128, out_channels=2):
         super(NeuralModel, self).__init__()
         
         unet_depth_channels = [hidden_channels, hidden_channels*2, hidden_channels*4]
-
+        
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-        
-        self.fno1 = FNO(
-            n_modes=fno_modes,
-            hidden_channels=hidden_channels,
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            n_layers=1 
+
+        # Replace FNO1 with GRU
+        self.fno1 = nn.GRU(
+            input_size=hidden_channels,
+            hidden_size=hidden_channels,
+            num_layers=1,
+            batch_first=True
         )
 
         self.down1 = DownBlock(unet_depth_channels[0], unet_depth_channels[1])
@@ -91,24 +87,27 @@ class NeuralModel(nn.Module):
             UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
         )
 
+        # Replace FNO2 with GRU
+        self.fno2 = nn.GRU(
+            input_size=hidden_channels,
+            hidden_size=hidden_channels,
+            num_layers=1,
+            batch_first=True
+        )
+        
         self.up1 = UpBlock(unet_depth_channels[2] + unet_depth_channels[2], unet_depth_channels[1])
         self.up2 = UpBlock(unet_depth_channels[1] + unet_depth_channels[1], unet_depth_channels[0])
 
-        self.fno2 = FNO(
-            n_modes=fno_modes,
-            hidden_channels=hidden_channels,
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            n_layers=1 
-        )
-        
         self.final_proj = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
         self.final_activation = nn.Sigmoid()
 
     def forward(self, x):
         x = self.projection(x)
         
-        x_fno1_out = self.fno1(x)
+        B, C, H, W = x.shape
+        x_flat = x.permute(0, 2, 3, 1).reshape(B * H, W, C)
+        x_gru, _ = self.fno1(x_flat)
+        x_fno1_out = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
         skip1, down1 = self.down1(x_fno1_out)
         skip2, down2 = self.down2(down1)
@@ -118,8 +117,11 @@ class NeuralModel(nn.Module):
         up1 = self.up1(center, skip2)
         x_unet_out = self.up2(up1, skip1)
 
-        x = self.fno2(x_unet_out)
-        
+        B, C, H, W = x_unet_out.shape
+        x_flat = x_unet_out.permute(0, 2, 3, 1).reshape(B * H, W, C)
+        x_gru, _ = self.fno2(x_flat)
+        x = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
+
         pred_vocal_mask = self.final_proj(x)
         final_vocal_mask = self.final_activation(pred_vocal_mask)
         
@@ -542,7 +544,7 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=88200, help='Segment length for training')
-    parser.add_argument('--learning_rate', type=float, default=2e-5, help='Learning rate for the optimizer')
+    parser.add_argument('--learning_rate', type=float, default=2e-4, help='Learning rate for the optimizer')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
