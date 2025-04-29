@@ -71,8 +71,7 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
 
-        # Replace FNO1 with GRU
-        self.fno1 = nn.GRU(
+        self.gru1 = nn.GRU(
             input_size=hidden_channels,
             hidden_size=hidden_channels,
             num_layers=1,
@@ -87,8 +86,7 @@ class NeuralModel(nn.Module):
             UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
         )
 
-        # Replace FNO2 with GRU
-        self.fno2 = nn.GRU(
+        self.gru2 = nn.GRU(
             input_size=hidden_channels,
             hidden_size=hidden_channels,
             num_layers=1,
@@ -106,7 +104,7 @@ class NeuralModel(nn.Module):
         
         B, C, H, W = x.shape
         x_flat = x.permute(0, 2, 3, 1).reshape(B * H, W, C)
-        x_gru, _ = self.fno1(x_flat)
+        x_gru, _ = self.gru1(x_flat)
         x_fno1_out = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
         skip1, down1 = self.down1(x_fno1_out)
@@ -119,7 +117,7 @@ class NeuralModel(nn.Module):
 
         B, C, H, W = x_unet_out.shape
         x_flat = x_unet_out.permute(0, 2, 3, 1).reshape(B * H, W, C)
-        x_gru, _ = self.fno2(x_flat)
+        x_gru, _ = self.gru2(x_flat)
         x = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
         pred_vocal_mask = self.final_proj(x)
