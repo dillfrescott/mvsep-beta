@@ -60,51 +60,70 @@ class UpBlock(nn.Module):
         return self.conv(x)
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=256, out_channels=2):
+    def __init__(self, in_channels=2, hidden_channels=128, out_channels=2):
         super(NeuralModel, self).__init__()
-        
+
         unet_depth_channels = [hidden_channels, hidden_channels*2, hidden_channels*4]
-        
+
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
-        
+
+        self.gru_proj = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
         self.down1 = DownBlock(unet_depth_channels[0], unet_depth_channels[1])
+        self.gru_down1 = nn.GRU(unet_depth_channels[1], unet_depth_channels[1], batch_first=True)
+
         self.down2 = DownBlock(unet_depth_channels[1], unet_depth_channels[2])
-        
+        self.gru_down2 = nn.GRU(unet_depth_channels[2], unet_depth_channels[2], batch_first=True)
+
         self.center_conv = nn.Sequential(
             UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
             UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
         )
-        
+        self.gru_center = nn.GRU(unet_depth_channels[2], unet_depth_channels[2], batch_first=True)
+
         self.up1 = UpBlock(unet_depth_channels[2] + unet_depth_channels[2], unet_depth_channels[1])
+        self.gru_up1 = nn.GRU(unet_depth_channels[1], unet_depth_channels[1], batch_first=True)
+
         self.up2 = UpBlock(unet_depth_channels[1] + unet_depth_channels[1], unet_depth_channels[0])
+        self.gru_up2 = nn.GRU(unet_depth_channels[0], unet_depth_channels[0], batch_first=True)
 
         self.final_proj = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
         self.final_activation = nn.Sigmoid()
 
     def forward(self, x):
         x = self.projection(x)
-        
         B, C, H, W = x.shape
-        x_flat = x.permute(0, 2, 3, 1).reshape(B * H, W, C)
+        x = self.apply_gru(self.gru_proj, x)
 
         skip1, down1 = self.down1(x)
+        down1 = self.apply_gru(self.gru_down1, down1)
+
         skip2, down2 = self.down2(down1)
-        
+        down2 = self.apply_gru(self.gru_down2, down2)
+
         center = self.center_conv(down2)
-        
+        center = self.apply_gru(self.gru_center, center)
+
         up1 = self.up1(center, skip2)
-        x_unet_out = self.up2(up1, skip1)
+        up1 = self.apply_gru(self.gru_up1, up1)
 
-        B, C, H, W = x_unet_out.shape
+        up2 = self.up2(up1, skip1)
+        up2 = self.apply_gru(self.gru_up2, up2)
 
-        pred_vocal_mask = self.final_proj(x)
+        pred_vocal_mask = self.final_proj(up2)
         final_vocal_mask = self.final_activation(pred_vocal_mask)
-        
+
         return final_vocal_mask
+
+    def apply_gru(self, gru, x):
+        B, C, H, W = x.shape
+        x_flat = x.permute(0, 2, 3, 1).reshape(B * H, W, C)
+        x_gru, _ = gru(x_flat)
+        x_out = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        return x_out
 
 def loss_fn(pred_vocal_mask, target_vocal_mag, target_instrumental_mag, mixture_mag):
     pred_vocal_mag = mixture_mag * pred_vocal_mask
