@@ -60,7 +60,7 @@ class UpBlock(nn.Module):
         return self.conv(x)
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=128, out_channels=2):
+    def __init__(self, in_channels=2, hidden_channels=256, out_channels=2):
         super(NeuralModel, self).__init__()
         
         unet_depth_channels = [hidden_channels, hidden_channels*2, hidden_channels*4]
@@ -77,13 +77,6 @@ class NeuralModel(nn.Module):
         self.center_conv = nn.Sequential(
             UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
             UNetConvBlock(unet_depth_channels[2], unet_depth_channels[2]),
-        )
-
-        self.gru = nn.GRU(
-            input_size=hidden_channels,
-            hidden_size=hidden_channels,
-            num_layers=1,
-            batch_first=True
         )
         
         self.up1 = UpBlock(unet_depth_channels[2] + unet_depth_channels[2], unet_depth_channels[1])
@@ -107,9 +100,6 @@ class NeuralModel(nn.Module):
         x_unet_out = self.up2(up1, skip1)
 
         B, C, H, W = x_unet_out.shape
-        x_flat = x_unet_out.permute(0, 2, 3, 1).reshape(B * H, W, C)
-        x_gru, _ = self.gru(x_flat)
-        x = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
         pred_vocal_mask = self.final_proj(x)
         final_vocal_mask = self.final_activation(pred_vocal_mask)
