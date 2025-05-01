@@ -125,7 +125,7 @@ class NeuralModel(nn.Module):
         x_out = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
         return x_out
 
-def loss_fn(pred_vocal_mask, target_vocal_mag, target_instrumental_mag, mixture_mag, scales=None, weights=[0.5, 0.3, 0.15, 0.05]):
+def loss_fn(pred_vocal_mask, target_vocal_mag, target_instrumental_mag, mixture_mag, scales=None, weights=None):
     if scales is None:
         scales = [1, 2, 4, 8]
     if weights is None:
