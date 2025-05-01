@@ -125,14 +125,38 @@ class NeuralModel(nn.Module):
         x_out = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
         return x_out
 
-def loss_fn(pred_vocal_mask, target_vocal_mag, target_instrumental_mag, mixture_mag):
-    pred_vocal_mag = mixture_mag * pred_vocal_mask
-    pred_instrumental_mag = mixture_mag * (1.0 - pred_vocal_mask)
-    
-    mse_loss = nn.MSELoss()
-    l2_loss_vocal = mse_loss(pred_vocal_mag, target_vocal_mag)
-    l2_loss_instrumental = mse_loss(pred_instrumental_mag, target_instrumental_mag)
-    total_loss = l2_loss_vocal + l2_loss_instrumental
+def loss_fn(pred_vocal_mask, target_vocal_mag, target_instrumental_mag, mixture_mag, scales=None, weights=[0.5, 0.3, 0.15, 0.05]):
+    if scales is None:
+        scales = [1, 2, 4, 8]
+    if weights is None:
+        # by default, equal weight
+        weights = [1.0] * len(scales)
+
+    mse = torch.nn.MSELoss()
+    total_loss = 0.0
+
+    for scale, w in zip(scales, weights):
+        if scale == 1:
+            pm = pred_vocal_mask
+            mix = mixture_mag
+            tv = target_vocal_mag
+            ti = target_instrumental_mag
+        else:
+            size = (pred_vocal_mask.shape[2] // scale,
+                    pred_vocal_mask.shape[3] // scale)
+            pm = F.interpolate(pred_vocal_mask, size=size, mode='area')
+            mix = F.interpolate(mixture_mag,      size=size, mode='area')
+            tv  = F.interpolate(target_vocal_mag, size=size, mode='area')
+            ti  = F.interpolate(target_instrumental_mag, size=size, mode='area')
+
+        pv_mag = mix * pm
+        pi_mag = mix * (1.0 - pm)
+
+        loss_v = mse(pv_mag, tv)
+        loss_i = mse(pi_mag, ti)
+
+        total_loss = total_loss + w * (loss_v + loss_i)
+
     return total_loss
 
 class MUSDBDataset(Dataset):
