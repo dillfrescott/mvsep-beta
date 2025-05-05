@@ -160,74 +160,37 @@ class NeuralModel(nn.Module):
         x_out = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
         return x_out
 
-def aweight_coefficients(freqs):
-    freqs = np.array(freqs)
-    # avoid zero-frequency singularity
-    freqs = np.maximum(freqs, 1e-6)
-    numer = (12194**2) * (freqs**4)
-    denom = (freqs**2 + 20.6**2) * np.sqrt(
-        (freqs**2 + 107.7**2) * (freqs**2 + 737.9**2)
-    ) * (freqs**2 + 12194**2)
-    return 20 * np.log10(numer / (denom + 1e-10)) + 2.0
-
-def loss_fn(pred_vocal_mask, target_vocal_mag, target_instrumental_mag, mixture_mag,
-            scales=None, weights=None):
-    device = mixture_mag.device
-    dtype = mixture_mag.dtype
-
-    # STFT params
-    n_fft = 4096
-    sample_rate = 44100
-
-    # frequency bins
-    freqs = np.fft.rfftfreq(n_fft, 1 / sample_rate)
-    a_weights = aweight_coefficients(freqs)           # [2049]
-    a_weights = torch.tensor(a_weights, device=device, dtype=dtype)
-    a_weights = a_weights.view(1, 1, -1, 1)            # [1,1,2049,1]
-    a_weights_linear = torch.pow(10.0, a_weights / 20.0)
+def loss_fn(pred_vocal_mask, target_vocal_mag, target_instrumental_mag, mixture_mag, scales=None, weights=None):
+    if scales is None:
+        scales = [1, 2, 4, 8]
+    if weights is None:
+        # by default, equal weight
+        weights = [1.0] * len(scales)
 
     mse = torch.nn.MSELoss()
     total_loss = 0.0
 
-    if scales  is None: scales  = [1, 2, 4, 8]
-    if weights is None: weights = [1.0] * len(scales)
-
     for scale, w in zip(scales, weights):
-        # downsample everything (including masks) except at scale=1
         if scale == 1:
-            pm, mix, tv, ti = (
-                pred_vocal_mask,
-                mixture_mag,
-                target_vocal_mag,
-                target_instrumental_mag
-            )
-            aw = a_weights_linear
+            pm = pred_vocal_mask
+            mix = mixture_mag
+            tv = target_vocal_mag
+            ti = target_instrumental_mag
         else:
-            size = (
-                pred_vocal_mask.shape[2] // scale,
-                pred_vocal_mask.shape[3] // scale
-            )
-            pm  = F.interpolate(pred_vocal_mask,        size=size, mode='area')
-            mix = F.interpolate(mixture_mag,             size=size, mode='area')
-            tv  = F.interpolate(target_vocal_mag,        size=size, mode='area')
+            size = (pred_vocal_mask.shape[2] // scale,
+                    pred_vocal_mask.shape[3] // scale)
+            pm = F.interpolate(pred_vocal_mask, size=size, mode='area')
+            mix = F.interpolate(mixture_mag,      size=size, mode='area')
+            tv  = F.interpolate(target_vocal_mag, size=size, mode='area')
             ti  = F.interpolate(target_instrumental_mag, size=size, mode='area')
 
-            # downsample A-weights to [1,1,freq_bins,1]
-            aw = F.interpolate(
-                a_weights_linear,
-                size=(pm.shape[2], 1),
-                mode='area'
-            )
+        pv_mag = mix * pm
+        pi_mag = mix * (1.0 - pm)
 
-        # apply perceptual weighting
-        pv_weighted = (mix * pm)         * aw
-        pi_weighted = (mix * (1.0 - pm)) * aw
-        tv_weighted = tv                * aw
-        ti_weighted = ti                * aw
+        loss_v = mse(pv_mag, tv)
+        loss_i = mse(pi_mag, ti)
 
-        loss_v = mse(pv_weighted, tv_weighted)
-        loss_i = mse(pi_weighted, ti_weighted)
-        total_loss += w * (loss_v + loss_i)
+        total_loss = total_loss + w * (loss_v + loss_i)
 
     return total_loss
 
