@@ -13,123 +13,6 @@ import random
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
-from torch.nn import TransformerEncoder, TransformerEncoderLayer, TransformerDecoder, TransformerDecoderLayer
-
-def apply_rotary_emb(x, freqs):
-    batch, channels, freq, time = x.shape
-
-    # Permute to [batch, freq, time, channels] and flatten spatial dims.
-    x_reshaped = x.permute(0, 2, 3, 1).reshape(-1, channels)
-
-    # Make sure freqs is broadcastable over batch, freq, time.
-    if freqs.shape[1] != channels:
-        repeat_times = math.ceil(channels / freqs.shape[1])
-        freqs = freqs.repeat(1, repeat_times, 1, 1)[:, :channels, :, :]
-    freqs = freqs.reshape(-1, channels)
-
-    # Ensure channels is even for complex representation.
-    if channels % 2 != 0:
-        channels_adjusted = channels - 1
-        x_reshaped = x_reshaped[:, :channels_adjusted]
-        freqs = freqs[:, :channels_adjusted]
-    else:
-        channels_adjusted = channels
-
-    # Reshape into pairs for complex arithmetic.
-    x_pairs = x_reshaped.float().reshape(-1, channels_adjusted // 2, 2)
-    freqs_pairs = freqs.float().reshape(-1, channels_adjusted // 2, 2)
-
-    # Convert pairs to complex numbers and apply rotation.
-    x_complex = torch.view_as_complex(x_pairs.contiguous())
-    freqs_complex = torch.view_as_complex(freqs_pairs.contiguous())
-    x_rotated = x_complex * torch.exp(1j * freqs_complex)
-
-    # Convert back to real and flatten the pairs.
-    x_rotated = torch.view_as_real(x_rotated).flatten(1)
-    
-    # If channels were odd, append the unrotated last channel.
-    if channels % 2 != 0:
-        x_remaining = x[:, -1:, :, :].reshape(batch * freq * time, 1)
-        x_rotated = torch.cat([x_rotated, x_remaining.float()], dim=-1)
-
-    # Reshape back to [batch, channels, freq, time].
-    x_rotated = x_rotated.reshape(batch, freq, time, channels).permute(0, 3, 1, 2)
-    return x_rotated
-
-class DARPE(nn.Module):
-    def __init__(self, dim, in_channels=None, max_freq=10000, init_scale=1.0, mlp_hidden=128):
-        super().__init__()
-        self.dim = dim
-        self.max_freq = max_freq
-        self.base_scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
-        
-        # If in_channels is not provided, default to using 'dim'
-        in_channels = in_channels if in_channels is not None else dim
-        
-        # Register projection if needed.
-        if in_channels != dim:
-            self.proj = nn.Conv2d(in_channels, dim, kernel_size=1)
-        else:
-            self.proj = nn.Identity()
-            
-        self.adaptive_mlp = nn.Sequential(
-            nn.Conv2d(dim, mlp_hidden, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mlp_hidden, dim, kernel_size=1),
-            nn.Tanh()
-        )
-    
-    def _get_1d_freqs(self, pos, scale):
-        half_dim = self.dim // 2
-        dim_t = torch.arange(half_dim, dtype=torch.float32, device=pos.device)
-        # Compute frequencies as in standard sinusoidal PE.
-        dim_t = self.max_freq ** (-2 * dim_t / half_dim)
-        pos = pos.unsqueeze(-1) / scale
-        freqs = pos * dim_t.unsqueeze(0)
-        return freqs
-
-    def get_freqs(self, F_dim, T_dim):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # Create positional indices for frequency and time axes.
-        h_pos = torch.arange(F_dim, device=device).float()
-        t_pos = torch.arange(T_dim, device=device).float()
-        # Get 1D frequencies for each axis.
-        freqs_h = self._get_1d_freqs(h_pos, F_dim)
-        freqs_t = self._get_1d_freqs(t_pos, T_dim)
-        # Create a 2D grid of frequencies.
-        freqs = torch.zeros(F_dim, T_dim, self.dim, device=device)
-        freqs[..., 0::2] = freqs_h.unsqueeze(1).expand(-1, T_dim, -1)
-        freqs[..., 1::2] = freqs_t.unsqueeze(0).expand(F_dim, -1, -1)
-        return freqs  # Shape: [F_dim, T_dim, dim]
-    
-    def forward(self, x):
-        B, channels, F_dim, T_dim = x.shape
-            
-        # Compute frequencies.
-        freqs = self.get_freqs(F_dim, T_dim)  # shape [F_dim, T_dim, dim]
-        freqs = freqs * self.base_scale
-        freqs = freqs.permute(2, 0, 1).unsqueeze(0)  # [1, dim, F, T]
-        
-        if channels > self.dim:
-            repeat_times = math.ceil(channels / self.dim)
-            freqs = freqs.repeat(1, repeat_times, 1, 1)[:, :channels, :, :]
-        
-        # Use the registered projection.
-        x_proj = self.proj(x)
-        adaptive = self.adaptive_mlp(x_proj)  # [B, dim, F, T]
-        
-        # Clamp the adaptive scaling factor to prevent extreme values
-        adaptive = torch.clamp(adaptive, min=-1.0, max=1.0)
-        
-        freqs = freqs.expand(B, -1, -1, -1)
-        adapted_freqs = freqs * (1 + adaptive)
-        
-        # Safe complex operations
-        x_rotated = apply_rotary_emb(x, adapted_freqs)
-        
-        # Add a small epsilon to prevent NaN in gradients
-        x_rotated = x_rotated + 1e-8
-        return x_rotated
 
 class UNetConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, mid_channels=None):
@@ -179,7 +62,7 @@ class UpBlock(nn.Module):
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, hidden_channels=128, out_channels=2):
         super(NeuralModel, self).__init__()
-        
+
         # U1 Encoder Path
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
@@ -187,60 +70,44 @@ class NeuralModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
         )
         
-        # Transformer configurations
-        encoder_layer = lambda d: TransformerEncoderLayer(d_model=d, nhead=8, batch_first=True)
-        decoder_layer = lambda d: TransformerDecoderLayer(d_model=d, nhead=8, batch_first=True)
-        
-        # U1 Path Transformers + DARPE
-        self.darpe_proj = DARPE(dim=hidden_channels)
-        self.gru_proj = TransformerEncoder(encoder_layer(hidden_channels), num_layers=1)
-        
+        self.gru_proj = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
+
         self.down1 = DownBlock(hidden_channels, hidden_channels*2)
-        self.darpe_down1 = DARPE(dim=hidden_channels*2)
-        self.gru_down1 = TransformerEncoder(encoder_layer(hidden_channels*2), num_layers=1)
-        
+        self.gru_down1 = nn.GRU(hidden_channels*2, hidden_channels*2, batch_first=True)
+
         self.down2 = DownBlock(hidden_channels*2, hidden_channels*4)
-        self.darpe_down2 = DARPE(dim=hidden_channels*4)
-        self.gru_down2 = TransformerEncoder(encoder_layer(hidden_channels*4), num_layers=1)
-        
+        self.gru_down2 = nn.GRU(hidden_channels*4, hidden_channels*4, batch_first=True)
+
         # U1 Center
         self.center_conv = UNetConvBlock(hidden_channels*4, hidden_channels*4)
-        self.darpe_center = DARPE(dim=hidden_channels*4)
-        self.gru_center = TransformerEncoder(encoder_layer(hidden_channels*4), num_layers=1)
-        
+        self.gru_center = nn.GRU(hidden_channels*4, hidden_channels*4, batch_first=True)
+
         # U1 Decoder Path
         self.up1 = UpBlock(hidden_channels*4 + hidden_channels*4, hidden_channels*2)
-        self.darpe_up1 = DARPE(dim=hidden_channels*2)
-        self.gru_up1 = TransformerDecoder(decoder_layer(hidden_channels*2), num_layers=1)
-        
+        self.gru_up1 = nn.GRU(hidden_channels*2, hidden_channels*2, batch_first=True)
+
         self.up2 = UpBlock(hidden_channels*2 + hidden_channels*2, hidden_channels)
-        self.darpe_up2 = DARPE(dim=hidden_channels)
-        self.gru_up2 = TransformerDecoder(decoder_layer(hidden_channels), num_layers=1)
-        
-        # U2 Path
+        self.gru_up2 = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
+
+        # U2 Encoder Path
         self.down3 = DownBlock(hidden_channels, hidden_channels*2)
-        self.darpe_down3 = DARPE(dim=hidden_channels*2)
-        self.gru_down3 = TransformerEncoder(encoder_layer(hidden_channels*2), num_layers=1)
-        
+        self.gru_down3 = nn.GRU(hidden_channels*2, hidden_channels*2, batch_first=True)
+
         self.down4 = DownBlock(hidden_channels*2, hidden_channels*4)
-        self.darpe_down4 = DARPE(dim=hidden_channels*4)
-        self.gru_down4 = TransformerEncoder(encoder_layer(hidden_channels*4), num_layers=1)
-        
+        self.gru_down4 = nn.GRU(hidden_channels*4, hidden_channels*4, batch_first=True)
+
         # U2 Center
         self.center2_conv = UNetConvBlock(hidden_channels*4, hidden_channels*4)
-        self.darpe_center2 = DARPE(dim=hidden_channels*4)
-        self.gru_center2 = TransformerEncoder(encoder_layer(hidden_channels*4), num_layers=1)
-        
+        self.gru_center2 = nn.GRU(hidden_channels*4, hidden_channels*4, batch_first=True)
+
         # U2 Decoder Path
         self.up3 = UpBlock(hidden_channels*4 + hidden_channels*4, hidden_channels*2)
-        self.darpe_up3 = DARPE(dim=hidden_channels*2)
-        self.gru_up3 = TransformerDecoder(decoder_layer(hidden_channels*2), num_layers=1)
-        
+        self.gru_up3 = nn.GRU(hidden_channels*2, hidden_channels*2, batch_first=True)
+
         self.up4 = UpBlock(hidden_channels*2 + hidden_channels*2, hidden_channels)
-        self.darpe_up4 = DARPE(dim=hidden_channels)
-        self.gru_up4 = TransformerDecoder(decoder_layer(hidden_channels), num_layers=1)
-        
-        # Final Output
+        self.gru_up4 = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
+
+        # Final Output Projection
         self.final_proj = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
         self.final_activation = nn.Sigmoid()
 
@@ -248,79 +115,49 @@ class NeuralModel(nn.Module):
         # U1 Processing
         x = self.projection(x)
         B, C, H, W = x.shape
-        
-        # Encoder path
-        x = self.darpe_proj(x)  # DARPE before Transformer
-        x = self.apply_transformer(self.gru_proj, x)
-        
+        x = self.apply_gru(self.gru_proj, x)
+
         skip1, down1 = self.down1(x)
-        down1 = self.darpe_down1(down1)
-        down1 = self.apply_transformer(self.gru_down1, down1)
-        
+        down1 = self.apply_gru(self.gru_down1, down1)
+
         skip2, down2 = self.down2(down1)
-        down2 = self.darpe_down2(down2)
-        down2 = self.apply_transformer(self.gru_down2, down2)
-        
-        # Center
+        down2 = self.apply_gru(self.gru_down2, down2)
+
         center = self.center_conv(down2)
-        center = self.darpe_center(center)
-        center = self.apply_transformer(self.gru_center, center)
-        
-        # Decoder path with cross-attention
+        center = self.apply_gru(self.gru_center, center)
+
         up1 = self.up1(center, skip2)
-        up1 = self.darpe_up1(up1)
-        up1 = self.apply_decoder(self.gru_up1, up1, skip2)
-        
+        up1 = self.apply_gru(self.gru_up1, up1)
+
         up2 = self.up2(up1, skip1)
-        up2 = self.darpe_up2(up2)
-        up2 = self.apply_decoder(self.gru_up2, up2, skip1)
-        
+        up2 = self.apply_gru(self.gru_up2, up2)
+
         # U2 Processing
         skip3, down3 = self.down3(up2)
-        down3 = self.darpe_down3(down3)
-        down3 = self.apply_transformer(self.gru_down3, down3)
-        
+        down3 = self.apply_gru(self.gru_down3, down3)
+
         skip4, down4 = self.down4(down3)
-        down4 = self.darpe_down4(down4)
-        down4 = self.apply_transformer(self.gru_down4, down4)
-        
-        # Center
+        down4 = self.apply_gru(self.gru_down4, down4)
+
         center2 = self.center2_conv(down4)
-        center2 = self.darpe_center2(center2)
-        center2 = self.apply_transformer(self.gru_center2, center2)
-        
-        # Decoder path
+        center2 = self.apply_gru(self.gru_center2, center2)
+
         up3 = self.up3(center2, skip4)
-        up3 = self.darpe_up3(up3)
-        up3 = self.apply_decoder(self.gru_up3, up3, skip4)
-        
+        up3 = self.apply_gru(self.gru_up3, up3)
+
         up4 = self.up4(up3, skip3)
-        up4 = self.darpe_up4(up4)
-        up4 = self.apply_decoder(self.gru_up4, up4, skip3)
-        
+        up4 = self.apply_gru(self.gru_up4, up4)
+
         # Final Output
         pred_vocal_mask = self.final_proj(up4)
         final_vocal_mask = self.final_activation(pred_vocal_mask)
         return final_vocal_mask
 
-    def apply_transformer(self, transformer_layer, x):
-        """For encoder layers"""
+    def apply_gru(self, gru_layer, x):
         B, C, H, W = x.shape
         x_flat = x.permute(0, 2, 3, 1).reshape(B * H, W, C)
-        x_transformed = transformer_layer(x_flat)
-        x_out = x_transformed.reshape(B, H, W, C).permute(0, 3, 1, 2)
-        return x_out
-
-    def apply_decoder(self, decoder_layer, x, memory):
-        """For decoder layers with cross-attention"""
-        B, C, H, W = x.shape
-        x_flat = x.permute(0, 2, 3, 1).reshape(B * H, W, C)
-        memory_flat = memory.permute(0, 2, 3, 1).reshape(B * H, -1, C)
-        
-        # Process through decoder
-        x_decoded = decoder_layer(x_flat, memory_flat)
-        
-        x_out = x_decoded.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        x_gru, _ = gru_layer(x_flat)
+        x_out = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
         return x_out
 
 def aweight_coefficients(freqs):
@@ -564,7 +401,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=32000, overlap=16000, device='cpu'):
+              chunk_size=88200, overlap=44100, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
@@ -710,7 +547,7 @@ def main():
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=32000, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=88200, help='Segment length for training')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
