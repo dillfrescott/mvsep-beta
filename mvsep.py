@@ -8,157 +8,53 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from prodigyopt import Prodigy
+from x_unet import XUnet
 import numpy as np
 import random
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class UNetConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, mid_channels=None):
-        super().__init__()
-        if not mid_channels:
-            mid_channels = out_channels
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.GELU(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU()
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = UNetConvBlock(in_channels, out_channels)
-        self.pool = nn.MaxPool2d(2)
-
-    def forward(self, x):
-        skip = self.conv(x)
-        down = self.pool(skip)
-        return skip, down
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        # in_channels includes channels from skip connection + upsampled features
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv = UNetConvBlock(in_channels, out_channels, in_channels // 2)
-
-    def forward(self, x, skip):
-        x = self.up(x)
-        # Handle potential size mismatch due to pooling/convolutions
-        diffY = skip.size()[2] - x.size()[2]
-        diffX = skip.size()[3] - x.size()[3]
-        x = F.pad(x, [diffX // 2, diffX - diffX // 2,
-                      diffY // 2, diffY - diffY // 2])
-        x = torch.cat([skip, x], dim=1)
-        return self.conv(x)
-
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=128, out_channels=2):
+    def __init__(self, in_channels=2, out_channels=2):
         super(NeuralModel, self).__init__()
 
-        # U1 Encoder Path
-        self.projection = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1)
+        self.nested_depths = (4, 3, 2, 1)
+        self.max_downsample_layers = max(self.nested_depths)
+
+        self.unet = XUnet(
+            dim=84,
+            channels=in_channels,
+            dim_mults=(1, 2, 4, 8),
+            nested_unet_depths=self.nested_depths,
+            consolidate_upsample_fmaps=True
         )
-        
-        self.gru_proj = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
 
-        self.down1 = DownBlock(hidden_channels, hidden_channels*2)
-        self.gru_down1 = nn.GRU(hidden_channels*2, hidden_channels*2, batch_first=True)
-
-        self.down2 = DownBlock(hidden_channels*2, hidden_channels*4)
-        self.gru_down2 = nn.GRU(hidden_channels*4, hidden_channels*4, batch_first=True)
-
-        # U1 Center
-        self.center_conv = UNetConvBlock(hidden_channels*4, hidden_channels*4)
-        self.gru_center = nn.GRU(hidden_channels*4, hidden_channels*4, batch_first=True)
-
-        # U1 Decoder Path
-        self.up1 = UpBlock(hidden_channels*4 + hidden_channels*4, hidden_channels*2)
-        self.gru_up1 = nn.GRU(hidden_channels*2, hidden_channels*2, batch_first=True)
-
-        self.up2 = UpBlock(hidden_channels*2 + hidden_channels*2, hidden_channels)
-        self.gru_up2 = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
-
-        # U2 Encoder Path
-        self.down3 = DownBlock(hidden_channels, hidden_channels*2)
-        self.gru_down3 = nn.GRU(hidden_channels*2, hidden_channels*2, batch_first=True)
-
-        self.down4 = DownBlock(hidden_channels*2, hidden_channels*4)
-        self.gru_down4 = nn.GRU(hidden_channels*4, hidden_channels*4, batch_first=True)
-
-        # U2 Center
-        self.center2_conv = UNetConvBlock(hidden_channels*4, hidden_channels*4)
-        self.gru_center2 = nn.GRU(hidden_channels*4, hidden_channels*4, batch_first=True)
-
-        # U2 Decoder Path
-        self.up3 = UpBlock(hidden_channels*4 + hidden_channels*4, hidden_channels*2)
-        self.gru_up3 = nn.GRU(hidden_channels*2, hidden_channels*2, batch_first=True)
-
-        self.up4 = UpBlock(hidden_channels*2 + hidden_channels*2, hidden_channels)
-        self.gru_up4 = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
-
-        # Final Output Projection
-        self.final_proj = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
-        self.final_activation = nn.Sigmoid()
+        self.output_layer = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        # U1 Processing
-        x = self.projection(x)
-        B, C, H, W = x.shape
-        x = self.apply_gru(self.gru_proj, x)
+        if x.shape[1] != 2:
+            raise ValueError(f"Expected input with 2 channels (stereo), got {x.shape[1]}")
 
-        skip1, down1 = self.down1(x)
-        down1 = self.apply_gru(self.gru_down1, down1)
+        B, C, freq_bins, time_bins = x.shape
 
-        skip2, down2 = self.down2(down1)
-        down2 = self.apply_gru(self.gru_down2, down2)
+        total_multiple = 2 ** (self.max_downsample_layers + 1)
+        pad_freq = (total_multiple - (freq_bins % total_multiple)) % total_multiple
+        pad_time = (total_multiple - (time_bins % total_multiple)) % total_multiple
 
-        center = self.center_conv(down2)
-        center = self.apply_gru(self.gru_center, center)
+        pad = (0, pad_time, 0, pad_freq)
+        x = F.pad(x, pad)
 
-        up1 = self.up1(center, skip2)
-        up1 = self.apply_gru(self.gru_up1, up1)
+        out = self.unet(x)
+        mask = self.output_layer(out)
 
-        up2 = self.up2(up1, skip1)
-        up2 = self.apply_gru(self.gru_up2, up2)
+        if pad_freq > 0 or pad_time > 0:
+            mask = mask[:, :, :freq_bins, :time_bins]
 
-        # U2 Processing
-        skip3, down3 = self.down3(up2)
-        down3 = self.apply_gru(self.gru_down3, down3)
-
-        skip4, down4 = self.down4(down3)
-        down4 = self.apply_gru(self.gru_down4, down4)
-
-        center2 = self.center2_conv(down4)
-        center2 = self.apply_gru(self.gru_center2, center2)
-
-        up3 = self.up3(center2, skip4)
-        up3 = self.apply_gru(self.gru_up3, up3)
-
-        up4 = self.up4(up3, skip3)
-        up4 = self.apply_gru(self.gru_up4, up4)
-
-        # Final Output
-        pred_vocal_mask = self.final_proj(up4)
-        final_vocal_mask = self.final_activation(pred_vocal_mask)
-        return final_vocal_mask
-
-    def apply_gru(self, gru_layer, x):
-        B, C, H, W = x.shape
-        x_flat = x.permute(0, 2, 3, 1).reshape(B * H, W, C)
-        x_gru, _ = gru_layer(x_flat)
-        x_out = x_gru.reshape(B, H, W, C).permute(0, 3, 1, 2)
-        return x_out
+        return mask
 
 def aweight_coefficients(freqs):
     freqs = np.array(freqs)
