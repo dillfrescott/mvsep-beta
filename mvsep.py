@@ -8,7 +8,7 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from prodigyopt import Prodigy
-from x_unet import XUnet
+from x_transformers import Encoder
 import numpy as np
 import random
 import math
@@ -16,45 +16,52 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2):
+    def __init__(self, in_channels=2, out_channels=2, freq_bins=2049, max_seq_len=529200):
         super(NeuralModel, self).__init__()
 
-        self.nested_depths = (4, 3, 2, 1)
-        self.max_downsample_layers = max(self.nested_depths)
+        self.freq_bins = freq_bins
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.embed_dim = 512
+        self.max_seq_len = max_seq_len
 
-        self.unet = XUnet(
-            dim=84,
-            channels=in_channels,
-            dim_mults=(1, 2, 4, 8),
-            nested_unet_depths=self.nested_depths,
-            consolidate_upsample_fmaps=True
+        self.input_proj = nn.Linear(freq_bins * in_channels, self.embed_dim)
+
+        self.encoder = Encoder(
+            dim=self.embed_dim,
+            depth=12,
+            heads=8,
+            ff_glu=True
         )
 
-        self.output_layer = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1),
-            nn.Sigmoid()
-        )
+        self.output_proj = nn.Linear(self.embed_dim, freq_bins * out_channels)
 
     def forward(self, x):
-        if x.shape[1] != 2:
-            raise ValueError(f"Expected input with 2 channels (stereo), got {x.shape[1]}")
+        # Input x: [B, C, Freq, Time]
+        B, C, F, T = x.shape
+        if C != self.in_channels:
+            raise ValueError(f"Expected {self.in_channels} channels, got {C}")
+        if F != self.freq_bins:
+            raise ValueError(f"Expected {self.freq_bins} frequency bins, got {F}")
+        if T > self.max_seq_len:
+            raise ValueError(f"Input time bins {T} exceed max_seq_len {self.max_seq_len}")
 
-        B, C, freq_bins, time_bins = x.shape
+        # Flatten freq + channel into one dimension
+        x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)   # [B, T, C*F]
 
-        total_multiple = 2 ** (self.max_downsample_layers + 1)
-        pad_freq = (total_multiple - (freq_bins % total_multiple)) % total_multiple
-        pad_time = (total_multiple - (time_bins % total_multiple)) % total_multiple
+        # Embed to transformer dim
+        x = self.input_proj(x)  # [B, T, embed_dim]
 
-        pad = (0, pad_time, 0, pad_freq)
-        x = F.pad(x, pad)
+        # Pass through encoder
+        x = self.encoder(x)  # [B, T, embed_dim]
 
-        out = self.unet(x)
-        mask = self.output_layer(out)
+        # Project back to mask size
+        x = self.output_proj(x)  # [B, T, F*out_channels]
 
-        if pad_freq > 0 or pad_time > 0:
-            mask = mask[:, :, :freq_bins, :time_bins]
+        # Reshape to [B, out_channels, Freq, Time]
+        x = x.view(B, T, self.out_channels, F).permute(0, 2, 3, 1)
 
-        return mask
+        return torch.sigmoid(x)
 
 def aweight_coefficients(freqs):
     freqs = np.array(freqs)
@@ -297,7 +304,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=88200, overlap=44100, device='cpu'):
+              chunk_size=529200, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
@@ -437,13 +444,13 @@ def main():
     parser.add_argument('--infer', action='store_true', help='Inference mode')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=88200, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=529200, help='Segment length for training')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
