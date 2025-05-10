@@ -1,5 +1,6 @@
 librosa
 numpy
+prodigyopt
 soundfile
 tqdm
 x-transformers
