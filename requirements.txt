@@ -2,3 +2,4 @@ librosa
 numpy
 soundfile
 tqdm
+x-transformers
