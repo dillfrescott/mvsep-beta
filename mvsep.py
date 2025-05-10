@@ -76,7 +76,7 @@ class NeuralModel(nn.Module):
 
         # apply mask + add residual
         out = mask * mixture + resid  # [B, out, in, F, T]
-        return out
+        return mask, resid, out
 
 def aweight_coefficients(freqs):
     freqs = np.array(freqs)
@@ -289,10 +289,12 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
 
             optimizer.zero_grad()
 
-            # model now outputs full spectrogram estimates [B, 2, F, T]
-            pred_spec = model(mixture_mag)              
-            pred_vocals = pred_spec[:, 0, :, :]         # [B, F, T]
-            pred_instr  = pred_spec[:, 1, :, :]         # [B, F, T]
+            # model now returns (mask, resid, combined)
+            mask, resid, combined = model(mixture_mag)
+
+            # combined has shape [B, 2, F, T]
+            pred_vocals = combined[:, 0, :, :]    # [B, F, T]
+            pred_instr  = combined[:, 1, :, :]    # [B, F, T]
 
             # compute loss on those estimates
             loss = loss_fn(pred_vocals, pred_instr,
@@ -333,15 +335,15 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
 
 def inference(model, checkpoint_path, input_wav_path,
               output_instrumental_path, output_vocal_path,
+              output_resid_instr_path, output_resid_vocal_path,
               chunk_size=529200, overlap=88200, device='cpu'):
 
-    # load checkpoint
-    checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Load checkpoint
+    checkpoint_data = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
-    model.eval()
-    model.to(device)
+    model.eval().to(device)
 
-    # load & prep audio
+    # Load and prepare audio
     audio, sr = torchaudio.load(input_wav_path)
     if sr != 44100:
         raise ValueError(f"Input must be 44.1 kHz, got {sr}")
@@ -352,23 +354,26 @@ def inference(model, checkpoint_path, input_wav_path,
     audio = audio.to(device)
 
     total_len = audio.shape[1]
-    vocals       = torch.zeros_like(audio)
-    instrumentals = torch.zeros_like(audio)
+    stems = {
+        'vocal': torch.zeros_like(audio),
+        'instr': torch.zeros_like(audio),
+        'resid_vocal': torch.zeros_like(audio),
+        'resid_instr': torch.zeros_like(audio)
+    }
 
-    n_fft     = 4096
-    hop_length= 1024
-    window    = torch.hann_window(n_fft).to(device)
-    step_size = chunk_size - overlap
-    cross_fade = overlap // 2
+    n_fft = 4096
+    hop = 1024
+    window = torch.hann_window(n_fft).to(device)
+    step = chunk_size - overlap
+    fade = overlap // 2
 
-    num_chunks = math.ceil(max(0, total_len - overlap) / step_size)
+    num_chunks = math.ceil((total_len - overlap) / step)
     with tqdm(total=num_chunks, desc="Inference") as pbar:
-        for start in range(0, total_len, step_size):
+        for start in range(0, total_len, step):
             end = min(start + chunk_size, total_len)
             chunk = audio[:, start:end]
             length = chunk.shape[1]
 
-            # pad first chunk if too short
             if length < n_fft:
                 if start == 0:
                     pad = n_fft - length
@@ -378,76 +383,73 @@ def inference(model, checkpoint_path, input_wav_path,
                     pbar.update(1)
                     continue
 
-            # STFT
-            spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length,
+            spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop,
                               window=window, return_complex=True)
-            mag  = spec.abs()
-            phase= spec.angle()
+            mag = spec.abs()
+            phase = spec.angle()
 
-            # model → full mags [1,2,F,T]
+            # Model returns mask, residual, combined
             with torch.no_grad():
-                pred_spec = model(mag.unsqueeze(0)).squeeze(0)
-            pred_voc_mag = pred_spec[0]   # [F, T]
-            pred_i_mag   = pred_spec[1]   # [F, T]
+                masks, resids, combined = model(mag.unsqueeze(0))
+            masks   = masks.squeeze(0)    # [out, in, F, T]
+            resids  = resids.squeeze(0)   # [out, in, F, T]
+            combined = combined.squeeze(0)
 
-            # reconstruct complex spectrograms
-            v_spec = pred_voc_mag * torch.exp(1j * phase)
-            i_spec = pred_i_mag   * torch.exp(1j * phase)
+            # For each stem (0=vocal,1=instr)
+            for idx, key in enumerate(['vocal', 'instr']):
+                # combined spectrogram
+                spec_full = combined[idx] * torch.exp(1j * phase)
+                # residual-only spectrogram
+                spec_res  = resids[idx, 0]   * torch.exp(1j * phase)
 
-            # ISTFT per channel
-            v_chunk = torch.zeros_like(chunk)
-            i_chunk = torch.zeros_like(chunk)
-            for ch in range(2):
-                v_chunk[ch] = torch.istft(v_spec[ch].unsqueeze(0),
-                                          n_fft=n_fft,
-                                          hop_length=hop_length,
-                                          window=window,
-                                          length=length).squeeze(0)
-                i_chunk[ch] = torch.istft(i_spec[ch].unsqueeze(0),
-                                          n_fft=n_fft,
-                                          hop_length=hop_length,
-                                          window=window,
-                                          length=length).squeeze(0)
+                # ISTFT
+                full_chunk = torch.istft(spec_full, n_fft=n_fft,
+                                         hop_length=hop, window=window,
+                                         length=length)
+                resid_chunk = torch.istft(spec_res, n_fft=n_fft,
+                                          hop_length=hop, window=window,
+                                          length=length)
 
-            # overlap–add with cross-fade
-            if start == 0:
-                L = min(length, total_len)
-                vocals[:, :L]       = v_chunk[:, :L]
-                instrumentals[:, :L]= i_chunk[:, :L]
-            else:
-                fade_in  = torch.linspace(0, 1, cross_fade, device=device)
-                fade_out = torch.linspace(1, 0, cross_fade, device=device)
+                # Overlap-add with crossfade
+                if start == 0:
+                    stems[key][:, :length] = full_chunk
+                    stems['resid_' + key][:, :length] = resid_chunk
+                else:
+                    in_f = torch.linspace(0,1,fade, device=device)
+                    out_f= torch.linspace(1,0,fade, device=device)
+                    ov_end = min(start + fade, total_len)
+                    ov_len = ov_end - start
 
-                overlap_start = start
-                overlap_end   = min(start + cross_fade, total_len)
-                ov = overlap_end - overlap_start
+                    # full
+                    full_chunk[:, :ov_len] *= in_f[:ov_len]
+                    stems[key][:, start:ov_end] *= out_f[:ov_len]
+                    stems[key][:, start:ov_end] += full_chunk[:, :ov_len]
+                    # resid
+                    resid_chunk[:, :ov_len] *= in_f[:ov_len]
+                    stems['resid_' + key][:, start:ov_end] *= out_f[:ov_len]
+                    stems['resid_' + key][:, start:ov_end] += resid_chunk[:, :ov_len]
 
-                # cross-fade vocals
-                v_chunk[:, :ov]    *= fade_in[:ov]
-                vocals[:, overlap_start:overlap_end] *= fade_out[:ov]
-                vocals[:, overlap_start:overlap_end] += v_chunk[:, :ov]
-
-                # cross-fade instrumentals
-                i_chunk[:, :ov]    *= fade_in[:ov]
-                instrumentals[:, overlap_start:overlap_end] *= fade_out[:ov]
-                instrumentals[:, overlap_start:overlap_end] += i_chunk[:, :ov]
-
-                # copy remainder
-                rem_start = min(start + cross_fade, total_len)
-                rem_end   = min(start + length, total_len)
-                if rem_start < rem_end:
-                    idx0 = rem_start - start
-                    idx1 = rem_end   - start
-                    vocals[:, rem_start:rem_end]       = v_chunk[:, idx0:idx1]
-                    instrumentals[:, rem_start:rem_end] = i_chunk[:, idx0:idx1]
+                    # remainder
+                    rem_s = min(start + fade, total_len)
+                    rem_e = min(start + length, total_len)
+                    if rem_s < rem_e:
+                        rs = rem_s - start
+                        re = rem_e - start
+                        stems[key][:, rem_s:rem_e] = full_chunk[:, rs:re]
+                        stems['resid_' + key][:, rem_s:rem_e] = resid_chunk[:, rs:re]
 
             pbar.update(1)
 
-    # clamp & save
-    vocals       = vocals[:, :total_len].clamp(-1, 1).cpu()
-    instrumentals= instrumentals[:, :total_len].clamp(-1, 1).cpu()
-    torchaudio.save(output_vocal_path, vocals, sr)
-    torchaudio.save(output_instrumental_path, instrumentals, sr)
+    # Save outputs
+    save_map = [
+        ('vocal', output_vocal_path),
+        ('instr', output_instrumental_path),
+        ('resid_vocal', output_resid_vocal_path),
+        ('resid_instr', output_resid_instr_path)
+    ]
+    for key, path in save_map:
+        data = stems[key][:, :total_len].clamp(-1,1).cpu()
+        torchaudio.save(path, data, sr)
 
 def main():
     parser = argparse.ArgumentParser(description='Train a model for instrumental separation')
@@ -461,6 +463,8 @@ def main():
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
+    parser.add_argument('--output_resid_instr', type=str, default='residual_instrumental.wav', help='Path to output instrumental residual WAV file')
+    parser.add_argument('--output_resid_vocal', type=str, default='residual_vocal.wav', help='Path to output vocal residual WAV file')
     parser.add_argument('--segment_length', type=int, default=529200, help='Segment length for training')
     args = parser.parse_args()
 
@@ -474,13 +478,21 @@ def main():
                                      segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                       num_workers=16, pin_memory=False, persistent_workers=True)
-        total_steps = args.epochs * len(train_dataloader)
         train(model, train_dataloader, optimizer, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
             return
-        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device)
+        inference(
+            model,
+            args.checkpoint_path,
+            args.input_wav,
+            args.output_instrumental,
+            args.output_vocal,
+            args.output_resid_instr,
+            args.output_resid_vocal,
+            device=device
+        )
     else:
         print("Please specify either --train or --infer")
 
