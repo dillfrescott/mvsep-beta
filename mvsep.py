@@ -16,7 +16,7 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, freq_bins=2049, max_seq_len=3969000):
+    def __init__(self, in_channels=2, out_channels=2, freq_bins=2049, max_seq_len=529200):
         super(NeuralModel, self).__init__()
 
         self.freq_bins = freq_bins
@@ -243,23 +243,7 @@ class MUSDBDataset(Dataset):
         mixture_spec = vocal_spec + instr_spec
         mixture_mag = torch.abs(mixture_spec)
         mixture_phase = torch.angle(mixture_spec)
-
-        # Ensure fixed time dimension
-        target_time_bins = 1 + (self.segment_length - self.n_fft) // self.hop_length
-        def pad_or_trim(x, target_len):
-            current_len = x.shape[-1]
-            if current_len < target_len:
-                pad_amt = target_len - current_len
-                return F.pad(x, (0, pad_amt))
-            elif current_len > target_len:
-                return x[..., :target_len]
-            return x
-
-        mixture_mag = pad_or_trim(mixture_mag, target_time_bins)
-        vocal_mag = pad_or_trim(vocal_mag, target_time_bins)
-        instr_mag = pad_or_trim(instr_mag, target_time_bins)
-        mixture_phase = pad_or_trim(mixture_phase, target_time_bins)
-
+        
         return mixture_mag, mixture_phase, vocal_mag, instr_mag
 
 def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
@@ -320,7 +304,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=3969000, overlap=88200, device='cpu'):
+              chunk_size=529200, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval()
@@ -460,13 +444,13 @@ def main():
     parser.add_argument('--infer', action='store_true', help='Inference mode')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=3969000, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=529200, help='Segment length for training')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
