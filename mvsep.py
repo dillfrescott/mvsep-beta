@@ -243,7 +243,23 @@ class MUSDBDataset(Dataset):
         mixture_spec = vocal_spec + instr_spec
         mixture_mag = torch.abs(mixture_spec)
         mixture_phase = torch.angle(mixture_spec)
-        
+
+        # Ensure fixed time dimension
+        target_time_bins = 1 + (self.segment_length - self.n_fft) // self.hop_length
+        def pad_or_trim(x, target_len):
+            current_len = x.shape[-1]
+            if current_len < target_len:
+                pad_amt = target_len - current_len
+                return F.pad(x, (0, pad_amt))
+            elif current_len > target_len:
+                return x[..., :target_len]
+            return x
+
+        mixture_mag = pad_or_trim(mixture_mag, target_time_bins)
+        vocal_mag = pad_or_trim(vocal_mag, target_time_bins)
+        instr_mag = pad_or_trim(instr_mag, target_time_bins)
+        mixture_phase = pad_or_trim(mixture_phase, target_time_bins)
+
         return mixture_mag, mixture_phase, vocal_mag, instr_mag
 
 def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
