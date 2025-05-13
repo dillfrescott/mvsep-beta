@@ -63,15 +63,28 @@ class NeuralModel(nn.Module):
 
         return torch.sigmoid(x)
 
-def loss_fn(pred_vocal_mask, target_vocal_mag, target_instrumental_mag, mixture_mag):
+def loss_fn(pred_vocal_mask,
+            target_vocal_mag,
+            target_instrumental_mag,
+            mixture_mag):
+
     mse = torch.nn.MSELoss()
-    # Predicted spectrograms
-    pred_vocal = pred_vocal_mask * mixture_mag
-    pred_instr = (1.0 - pred_vocal_mask) * mixture_mag
-    # Compute loss
-    loss_v = mse(pred_vocal, target_vocal_mag)
-    loss_i = mse(pred_instr, target_instrumental_mag)
-    return loss_v + loss_i
+
+    # Reconstruct mags
+    pred_vocal_mag = pred_vocal_mask * mixture_mag
+    pred_instr_mag = (1.0 - pred_vocal_mask) * mixture_mag
+
+    # Primary MSE losses
+    loss_v = mse(pred_vocal_mag, target_vocal_mag)
+    loss_i = mse(pred_instr_mag, target_instrumental_mag)
+
+    # Leakage penalties
+    leak_vi = torch.exp(-mse(pred_vocal_mag, target_instrumental_mag))
+    leak_iv = torch.exp(-mse(pred_instr_mag, target_vocal_mag))
+    leak_penalty = leak_vi + leak_iv
+
+    # Everything added
+    return loss_v + loss_i + leak_penalty
 
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
