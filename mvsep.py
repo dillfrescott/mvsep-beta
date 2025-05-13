@@ -63,78 +63,28 @@ class NeuralModel(nn.Module):
 
         return torch.sigmoid(x)
 
-def spectral_convergence(pred, target):
-    return torch.norm(target - pred, p='fro') / (torch.norm(target, p='fro') + 1e-10)
+def loss_fn(pred_vocal_mask,
+            target_vocal_mag,
+            target_instrumental_mag,
+            mixture_mag):
 
-def multi_scale_spectral_loss(pred_complex, target_complex, scales=[1, 2, 4]):
-    loss = 0.0
-    B, C, freq_bins, T = pred_complex.shape
+    mse = torch.nn.MSELoss()
 
-    for scale in scales:
-        if scale > 1:
-            pool_kernel = (scale, 1)
-
-            # Split into real and imaginary parts
-            pred_real = pred_complex.real  # [B, C, F, T]
-            pred_imag = pred_complex.imag
-            target_real = target_complex.real
-            target_imag = target_complex.imag
-
-            # Concatenate real and imaginary parts along the channel dimension
-            pred_combined = torch.cat([pred_real, pred_imag], dim=1)   # [B, 2*C, F, T]
-            target_combined = torch.cat([target_real, target_imag], dim=1)
-
-            # Reshape for 2D pooling (flatten batch and channel dims)
-            pred_combined = pred_combined.view(B * 2 * C, 1, freq_bins, T)
-            target_combined = target_combined.view(B * 2 * C, 1, freq_bins, T)
-
-            # Apply average pooling
-            pred_pooled = F.avg_pool2d(pred_combined, pool_kernel, stride=(scale, 1))
-            target_pooled = F.avg_pool2d(target_combined, pool_kernel, stride=(scale, 1))
-
-            # Reshape back to [B, 2*C, F/scale, T]
-            pred_pooled = pred_pooled.view(B, 2 * C, freq_bins // scale, T)
-            target_pooled = target_pooled.view(B, 2 * C, freq_bins // scale, T)
-
-            # Split back into real and imaginary parts
-            pred_real_pooled = pred_pooled[:, :C, :, :]
-            pred_imag_pooled = pred_pooled[:, C:, :, :]
-            target_real_pooled = target_pooled[:, :C, :, :]
-            target_imag_pooled = target_pooled[:, C:, :, :]
-
-            # Recombine into complex tensors
-            pred_pooled_complex = torch.complex(pred_real_pooled, pred_imag_pooled)
-            target_pooled_complex = torch.complex(target_real_pooled, target_imag_pooled)
-
-        else:
-            pred_pooled_complex = pred_complex
-            target_pooled_complex = target_complex
-
-        loss += spectral_convergence(pred_pooled_complex, target_pooled_complex)
-
-    return loss / len(scales)
-
-def loss_fn(pred_vocal_mask, target_vocal_spec, target_instr_spec, mixture_mag, mixture_phase, beta=0.1, prior_p=0.1):
-    # Reconstruct complex spectrograms using mixture phase
+    # Reconstruct mags
     pred_vocal_mag = pred_vocal_mask * mixture_mag
     pred_instr_mag = (1.0 - pred_vocal_mask) * mixture_mag
 
-    # Convert magnitude + phase to complex spectrograms
-    pred_vocal_spec = pred_vocal_mag * torch.exp(1j * mixture_phase)
-    pred_instr_spec = pred_instr_mag * torch.exp(1j * mixture_phase)
+    # Primary MSE losses
+    loss_v = mse(pred_vocal_mag, target_vocal_mag)
+    loss_i = mse(pred_instr_mag, target_instrumental_mag)
 
-    # Multi-scale spectral convergence loss
-    loss_v = multi_scale_spectral_loss(pred_vocal_spec, target_vocal_spec)
-    loss_i = multi_scale_spectral_loss(pred_instr_spec, target_instr_spec)
+    # Leakage penalties
+    leak_vi = torch.exp(-mse(pred_vocal_mag, target_instrumental_mag))
+    leak_iv = torch.exp(-mse(pred_instr_mag, target_vocal_mag))
+    leak_penalty = leak_vi + leak_iv
 
-    # KL divergence for sparse mask regularization
-    kl_div = pred_vocal_mask * torch.log((pred_vocal_mask / prior_p) + 1e-8) + \
-             (1 - pred_vocal_mask) * torch.log(((1 - pred_vocal_mask) / (1 - prior_p)) + 1e-8)
-    kl_loss = kl_div.mean()
-
-    # Total loss
-    total_loss = loss_v + loss_i + beta * kl_loss
-    return total_loss
+    # Everything added
+    return loss_v + loss_i + leak_penalty
 
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
@@ -237,35 +187,32 @@ class MUSDBDataset(Dataset):
         instr_spec = torch.stft(instr_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                 window=self.window, return_complex=True)
         
-        # Calculate target time bins
-        target_time_bins = 1 + (self.segment_length - self.n_fft) // self.hop_length
+        # Compute magnitudes.
+        vocal_mag = torch.abs(vocal_spec)
+        instr_mag = torch.abs(instr_spec)
         
-        # Pad or trim function for complex spectrograms
+        # Create the mixture: sum the complex spectrograms.
+        mixture_spec = vocal_spec + instr_spec
+        mixture_mag = torch.abs(mixture_spec)
+        mixture_phase = torch.angle(mixture_spec)
+
+        # Ensure fixed time dimension
+        target_time_bins = 1 + (self.segment_length - self.n_fft) // self.hop_length
         def pad_or_trim(x, target_len):
             current_len = x.shape[-1]
             if current_len < target_len:
                 pad_amt = target_len - current_len
-                # Pad along time dimension (last axis) with zeros
                 return F.pad(x, (0, pad_amt))
             elif current_len > target_len:
                 return x[..., :target_len]
             return x
 
-        # Apply padding/trimming to complex spectrograms first
-        vocal_spec = pad_or_trim(vocal_spec, target_time_bins)
-        instr_spec = pad_or_trim(instr_spec, target_time_bins)
-        
-        # Reconstruct mixture from padded complex spectrograms
-        mixture_spec = vocal_spec + instr_spec
-        
-        # Compute magnitudes and phase from padded spectrograms
-        mixture_mag = torch.abs(mixture_spec)
-        mixture_phase = torch.angle(mixture_spec)
-        vocal_mag = torch.abs(vocal_spec)
-        instr_mag = torch.abs(instr_spec)
+        mixture_mag = pad_or_trim(mixture_mag, target_time_bins)
+        vocal_mag = pad_or_trim(vocal_mag, target_time_bins)
+        instr_mag = pad_or_trim(instr_mag, target_time_bins)
+        mixture_phase = pad_or_trim(mixture_phase, target_time_bins)
 
-        # Return complex spectrograms instead of magnitudes for targets
-        return mixture_mag, mixture_phase, vocal_spec, instr_spec
+        return mixture_mag, mixture_phase, vocal_mag, instr_mag
 
 def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
     model.to(device)
@@ -285,21 +232,15 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     model.train()
     for epoch in range(epochs):
         for batch in dataloader:
-            mixture_mag, mixture_phase, vocal_spec, instr_spec = batch
+            mixture_mag, mixture_phase, vocal_mag, instrumental_mag = batch
             mixture_mag = mixture_mag.to(device)
             mixture_phase = mixture_phase.to(device)
-            vocal_spec = vocal_spec.to(device)
-            instr_spec = instr_spec.to(device)
+            vocal_mag = vocal_mag.to(device)
+            instrumental_mag = instrumental_mag.to(device)
 
             optimizer.zero_grad()
             pred_vocal_mask = model(mixture_mag)
-            loss = loss_fn(
-                pred_vocal_mask,
-                vocal_spec,
-                instr_spec,
-                mixture_mag,
-                mixture_phase
-            )
+            loss = loss_fn(pred_vocal_mask, vocal_mag, instrumental_mag, mixture_mag)
             
             if torch.isnan(loss).any():
                 print("NaN loss detected, skipping batch")
@@ -489,7 +430,7 @@ def main():
         train_dataset = MUSDBDataset(root_dir=args.data_dir,
                                      segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                      num_workers=24, pin_memory=False, persistent_workers=True)
+                                      num_workers=16, pin_memory=False, persistent_workers=True)
         total_steps = args.epochs * len(train_dataloader)
         train(model, train_dataloader, optimizer, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
