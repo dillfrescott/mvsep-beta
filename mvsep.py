@@ -29,8 +29,8 @@ class NeuralModel(nn.Module):
 
         self.encoder = Encoder(
             dim=self.embed_dim,
-            depth=12,
-            heads=8,
+            depth=42,
+            heads=12,
             ff_glu=True
         )
 
@@ -430,7 +430,7 @@ def main():
         train_dataset = MUSDBDataset(root_dir=args.data_dir,
                                      segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                      num_workers=16, pin_memory=False, persistent_workers=True)
+                                      num_workers=24, pin_memory=False, persistent_workers=True)
         total_steps = args.epochs * len(train_dataloader)
         train(model, train_dataloader, optimizer, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
