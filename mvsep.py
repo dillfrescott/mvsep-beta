@@ -66,56 +66,20 @@ class NeuralModel(nn.Module):
 def loss_fn(pred_vocal_mask,
             target_vocal_mag,
             target_instrumental_mag,
-            mixture_mag,
-            alpha=10.0,
-            beta=1.0):
+            mixture_mag):
 
-    mse = nn.MSELoss()
-    
-    # Scales: <1 means upsample (x2, x4); >1 means downsample (1/2, 1/4)
-    scales = [0.25, 0.5, 1.0, 2.0, 4.0]  
-    total_loss = 0.0
+    mse = torch.nn.MSELoss()
 
-    for scale in scales:
-        if scale == 1.0:
-            pred_mask_s = pred_vocal_mask
-            target_v_s = target_vocal_mag
-            target_i_s = target_instrumental_mag
-            mix_s = mixture_mag
-        elif scale < 1.0:  # Upsample
-            factor = int(1 / scale)
-            pred_mask_s = F.interpolate(pred_vocal_mask, scale_factor=factor, mode='bilinear', align_corners=False)
-            target_v_s = F.interpolate(target_vocal_mag, scale_factor=factor, mode='bilinear', align_corners=False)
-            target_i_s = F.interpolate(target_instrumental_mag, scale_factor=factor, mode='bilinear', align_corners=False)
-            mix_s = F.interpolate(mixture_mag, scale_factor=factor, mode='bilinear', align_corners=False)
-        else:  # Downsample
-            factor = int(scale)
-            pred_mask_s = F.avg_pool2d(pred_vocal_mask, kernel_size=factor, stride=factor)
-            target_v_s = F.avg_pool2d(target_vocal_mag, kernel_size=factor, stride=factor)
-            target_i_s = F.avg_pool2d(target_instrumental_mag, kernel_size=factor, stride=factor)
-            mix_s = F.avg_pool2d(mixture_mag, kernel_size=factor, stride=factor)
+    # Reconstruct mags
+    pred_vocal_mag = pred_vocal_mask * mixture_mag
+    pred_instr_mag = (1.0 - pred_vocal_mask) * mixture_mag
 
-        # Reconstruct magnitudes
-        pred_v_mag = pred_mask_s * mix_s
-        pred_i_mag = (1.0 - pred_mask_s) * mix_s
+    # Primary losses
+    loss_v = mse(pred_vocal_mag, target_vocal_mag)
+    loss_i = mse(pred_instr_mag, target_instrumental_mag)
 
-        # Primary MSE losses
-        loss_v = mse(pred_v_mag, target_v_s)
-        loss_i = mse(pred_i_mag, target_i_s)
-
-        # Leakage penalties
-        leak_vi = torch.exp(-mse(pred_v_mag, target_i_s))
-        leak_iv = torch.exp(-mse(pred_i_mag, target_v_s))
-        leak_penalty = leak_vi + leak_iv
-
-        # Binarization regularizer
-        bin_loss = (pred_mask_s * (1.0 - pred_mask_s)).mean()
-
-        # Combine losses for this scale
-        scale_loss = loss_v + loss_i + alpha * leak_penalty + beta * bin_loss
-        total_loss += scale_loss
-
-    return total_loss
+    # Everything added
+    return loss_v + loss_i
 
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
