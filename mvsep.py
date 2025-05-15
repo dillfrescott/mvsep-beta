@@ -129,36 +129,31 @@ class MUSDBDataset(Dataset):
         self.hop_length = 1024
         self.window = torch.hann_window(self.n_fft)
 
-        # Gather lists of available vocal and instrumental stems.
-        self.track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
-        self.vocal_paths = []   # List of file paths for vocals.
-        self.instr_paths = []   # List of tuples for instrumental components (drums, bass, other).
+        # Lists for vocals and "other" stems
+        self.vocal_paths = []
+        self.other_paths = []
 
-        print("Scanning track folders for stems...")
+        self.track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
+
+        print("Scanning track folders...")
         for td in tqdm(self.track_dirs, desc="Scanning tracks"):
             vocal_path = os.path.join(td, 'vocals.wav')
-            drum_path = os.path.join(td, 'drums.wav')
-            bass_path = os.path.join(td, 'bass.wav')
             other_path = os.path.join(td, 'other.wav')
-            
+
             if os.path.exists(vocal_path):
                 self.vocal_paths.append(vocal_path)
-            # For instrumentals, require all three components to be present.
-            if os.path.exists(drum_path) and os.path.exists(bass_path) and os.path.exists(other_path):
-                self.instr_paths.append((drum_path, bass_path, other_path))
-                
-        # Ensure we have at least some pairs.
-        if not self.vocal_paths or not self.instr_paths:
-            raise ValueError("Dataset must contain both vocal and instrumental stems.")
-        
-        # For random pairing during training, set an arbitrary large dataset size.
-        self.size = 50000
+            if os.path.exists(other_path):
+                self.other_paths.append(other_path)
+
+        if not self.vocal_paths or not self.other_paths:
+            raise ValueError("Dataset must contain both vocal and 'other' stems.")
+
+        self.size = 50000  # Arbitrary large number for training
 
     def _preprocess_audio(self, audio, sr):
         if sr != self.sample_rate:
             resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
             audio = resampler(audio)
-        # Ensure stereo: if mono then duplicate; if more than 2 channels then take first two.
         if audio.shape[0] == 1:
             audio = audio.repeat(2, 1)
         elif audio.shape[0] > 2:
@@ -167,68 +162,52 @@ class MUSDBDataset(Dataset):
 
     def _load_audio(self, filepath):
         audio, sr = torchaudio.load(filepath)
-        audio = self._preprocess_audio(audio, sr)
-        return audio
+        return self._preprocess_audio(audio, sr)
 
     def _load_vocal(self, path):
         return self._load_audio(path)
 
-    def _load_instrumental(self, paths):
-        audios = []
-        min_length = float("inf")
-        for p in paths:
-            audio = self._load_audio(p)
-            audios.append(audio)
-            min_length = min(min_length, audio.shape[1])
-        # Truncate and sum the components
-        summed_audio = sum([audio[:, :min_length] for audio in audios])
-        return summed_audio
+    def _load_instrumental(self, path):
+        return self._load_audio(path)
 
     def __len__(self):
         return self.size
 
     def __getitem__(self, idx):
-        # Randomly choose a vocal track and an instrumental track (they may be from different songs)
         vocal_path = random.choice(self.vocal_paths)
-        instr_tuple = random.choice(self.instr_paths)
-        
-        # Load raw audio
-        vocal_audio = self._load_vocal(vocal_path)      # Shape: [2, num_samples]
-        instr_audio = self._load_instrumental(instr_tuple)  # Shape: [2, num_samples]
-        
-        # Match lengths: use the minimum length available.
+        other_path = random.choice(self.other_paths)
+
+        vocal_audio = self._load_vocal(vocal_path)
+        instr_audio = self._load_instrumental(other_path)
+
         min_length = min(vocal_audio.shape[1], instr_audio.shape[1])
         if min_length == 0:
             raise ValueError("Encountered an audio file with zero length.")
-        
-        # Select a segment if needed.
+
         if self.segment and self.segment_length < min_length:
             start = random.randint(0, min_length - self.segment_length)
             end = start + self.segment_length
         else:
             start = 0
             end = min_length
-        
+
         vocal_seg = vocal_audio[:, start:end]
         instr_seg = instr_audio[:, start:end]
 
-        # Compute STFTs for each segment.
         vocal_spec = torch.stft(vocal_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                 window=self.window, return_complex=True)
         instr_spec = torch.stft(instr_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                 window=self.window, return_complex=True)
-        
-        # Compute magnitudes.
+
         vocal_mag = torch.abs(vocal_spec)
         instr_mag = torch.abs(instr_spec)
-        
-        # Create the mixture: sum the complex spectrograms.
+
         mixture_spec = vocal_spec + instr_spec
         mixture_mag = torch.abs(mixture_spec)
         mixture_phase = torch.angle(mixture_spec)
 
-        # Ensure fixed time dimension
         target_time_bins = 1 + (self.segment_length - self.n_fft) // self.hop_length
+
         def pad_or_trim(x, target_len):
             current_len = x.shape[-1]
             if current_len < target_len:
