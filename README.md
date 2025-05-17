@@ -1,5 +1,3 @@
-## MVSEP testing repo.
+<img src="https://github.com/user-attachments/assets/c3fde02e-21ca-423e-a843-d56c19d48642" width="400" alt="mvsep-beta-logo-2" />
 
-### There will be random commits of me trying different things and seeing what works best.
----
-#### Sometimes I'm too lazy to do proper commit messages. Sorry about that...
+## MVSEP testing repo.
