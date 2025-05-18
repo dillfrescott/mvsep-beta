@@ -15,37 +15,97 @@ import math
 import glob
 from torch.utils.checkpoint import checkpoint
 
-class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200):
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, depth=4, heads=8, ff_glu=True):
         super().__init__()
-        self.freq_bins = freq_bins
-        self.in_channels = in_channels
-        self.sources = sources
-        # we now predict one mask per (source × channel)
-        self.out_masks = sources * in_channels
-        self.embed_dim = 512
-        self.max_seq_len = max_seq_len
+        self.encoder = Encoder(dim=dim, depth=depth, heads=heads, ff_glu=ff_glu)
 
-        # project the flattened (channel × freq) into transformer dim
-        self.input_proj = nn.Linear(freq_bins * in_channels, self.embed_dim)
-        self.encoder = Encoder(dim=self.embed_dim, depth=12, heads=8, ff_glu=True)
-        # project back to (sources × channels × freq)
-        self.output_proj = nn.Linear(self.embed_dim, freq_bins * self.out_masks)
+    def forward(self, x):
+        return self.encoder(x)
+
+class TransformerUNet(nn.Module):
+    def __init__(self, in_dim, out_dim, embed_dim=512):
+        super().__init__()
+        self.input_proj = nn.Linear(in_dim, embed_dim)
+
+        # Downsample
+        self.encoder1 = TransformerBlock(embed_dim, depth=2)
+        self.down1 = nn.Conv1d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1)
+
+        self.encoder2 = TransformerBlock(embed_dim, depth=2)
+        self.down2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1)
+
+        # Bottleneck
+        self.bottleneck = TransformerBlock(embed_dim, depth=2)
+
+        # Upsample
+        self.up2 = nn.ConvTranspose1d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1)
+        self.decoder2 = TransformerBlock(embed_dim, depth=2)
+
+        self.up1 = nn.ConvTranspose1d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1)
+        self.decoder1 = TransformerBlock(embed_dim, depth=2)
+
+        self.output_proj = nn.Linear(embed_dim, out_dim)
+
+    def forward(self, x):
+        # x: [B, T, in_dim]
+        x1 = self.input_proj(x)
+        
+        # Encoder
+        e1 = self.encoder1(x1)  # [B, T, 512]
+        e1_t = e1.transpose(1, 2)  # [B, 512, T]
+        x2 = self.down1(e1_t)  # [B, 512, T/2]
+        
+        x2_t = x2.transpose(1, 2)  # [B, T/2, 512]
+        e2 = self.encoder2(x2_t)  # [B, T/2, 512]
+        e2_t = e2.transpose(1, 2)  # [B, 512, T/2]
+        x3 = self.down2(e2_t)  # [B, 512, T/4]
+        
+        # Bottleneck
+        x3_t = x3.transpose(1, 2)  # [B, T/4, 512]
+        x4 = self.bottleneck(x3_t)  # [B, T/4, 512]
+        x4_t = x4.transpose(1, 2)  # [B, 512, T/4]
+        
+        # Decoder
+        x5_up = self.up2(x4_t, output_size=(e2_t.shape[2],))  # Wrap in tuple: (T/2,)
+        x5 = x5_up + e2_t  # [B, 512, T/2]
+        x5_t = x5.transpose(1, 2)  # [B, T/2, 512]
+        
+        x6 = self.decoder2(x5_t)  # [B, T/2, 512]
+        x6_t = x6.transpose(1, 2)  # [B, 512, T/2]
+        
+        x7_up = self.up1(x6_t, output_size=(e1_t.shape[2],))  # Wrap in tuple: (T,)
+        x7 = x7_up + e1_t  # [B, 512, T]
+        x7_t = x7.transpose(1, 2)  # [B, T, 512]
+        
+        x8 = self.decoder1(x7_t)  # [B, T, 512]
+        out = self.output_proj(x8)  # [B, T, out_dim]
+        return out
+
+class TransformerWNet(nn.Module):
+    def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200, embed_dim=512):
+        super().__init__()
+        self.in_channels = in_channels
+        self.freq_bins = freq_bins
+        self.sources = sources
+        self.out_masks = in_channels * sources
+        self.input_dim = freq_bins * in_channels
+        self.output_dim = freq_bins * self.out_masks
+
+        self.unet1 = TransformerUNet(self.input_dim, self.output_dim, embed_dim)
+        self.unet2 = TransformerUNet(self.output_dim, self.output_dim, embed_dim)
 
     def forward(self, x):
         # x: [B, C, F, T]
         B, C, F, T = x.shape
-        assert C == self.in_channels and F == self.freq_bins and T <= self.max_seq_len
-
-        # -> [B, T, C*F]
         x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
-        x = self.input_proj(x)        # [B, T, embed_dim]
-        x = self.encoder(x)           # [B, T, embed_dim]
-        x = self.output_proj(x)       # [B, T, out_masks*F]
 
-        # reshape to [B, out_masks, F, T]
+        x = self.unet1(x)
+        x = self.unet2(x)
+        x = torch.sigmoid(x)
+
         x = x.view(B, T, self.out_masks, F).permute(0, 2, 3, 1)
-        return torch.sigmoid(x)
+        return x
 
 def loss_fn(pred_masks,
             target_vocal,
@@ -335,7 +395,7 @@ def main():
     parser.add_argument('--infer', action='store_true', help='Inference mode')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
@@ -346,7 +406,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel()
+    model = TransformerWNet()
     optimizer = Prodigy(model.parameters(), lr=1.0)
 
     if args.train:
