@@ -83,7 +83,7 @@ class TransformerUNet(nn.Module):
         return out
 
 class TransformerWNet(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=1323000, embed_dim=512):
+    def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200, embed_dim=512):
         super().__init__()
         self.in_channels = in_channels
         self.freq_bins = freq_bins
@@ -133,7 +133,7 @@ def loss_fn(pred_masks,
     return loss_v + loss_i
 
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, sample_rate=44100, segment_length=1323000, segment=True):
+    def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
         self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
@@ -297,7 +297,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
-              chunk_size=1323000, overlap=88200, device='cpu'):
+              chunk_size=529200, overlap=88200, device='cpu'):
     # Load checkpoint
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
@@ -401,7 +401,7 @@ def main():
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=1323000, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=529200, help='Segment length for training')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
