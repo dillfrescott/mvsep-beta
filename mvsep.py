@@ -107,30 +107,52 @@ class TransformerWNet(nn.Module):
         x = x.view(B, T, self.out_masks, F).permute(0, 2, 3, 1)
         return x
 
+def a_weighting(f):
+    f1, f2, f3, f4 = 20.598997, 107.65265, 737.86223, 12194.217
+    f_sq = f**2
+    A_num = (f4**2) * (f_sq)**2
+    A_den = (f_sq + f1**2) * torch.sqrt((f_sq + f2**2)*(f_sq + f3**2)) * (f_sq + f4**2)
+    A = 2.0 + 20.0 * torch.log10(A_num / (A_den + 1e-20))
+    return A
+
 def loss_fn(pred_masks,
             target_vocal,
             target_instr,
-            mixture_mag):
+            mixture_mag,
+            sr: int = 44100,
+            n_fft: int = 4096,
+            eps: float = 1e-7):
 
-    mse = nn.MSELoss()
-    B, M, F, T = pred_masks.shape
-    # split preds into (vL, vR, iL, iR)
-    vL, vR, iL, iR = pred_masks.chunk(4, dim=1)
+    # 1) Build A‑weighting per‑frequency linear gains
+    device = mixture_mag.device
+    dtype  = mixture_mag.dtype
+    freqs = torch.linspace(0, sr/2, n_fft//2 + 1, device=device, dtype=dtype)
+    A_db  = a_weighting(freqs)
+    A_lin = 10 ** (A_db / 20.0)
+    weight_f = A_lin.view(1, 1, -1, 1)
 
-    # apply each mask to its channel
-    pred_vocal = torch.cat([
-        vL * mixture_mag[:,0:1],
-        vR * mixture_mag[:,1:2]
-    ], dim=1)      # [B,2,F,T]
+    # 2) Split predicted masks
+    vL, vR, iL, iR = pred_masks.chunk(4, dim=1)  # each [B,1,F,T]
 
-    pred_instr = torch.cat([
-        iL * mixture_mag[:,0:1],
-        iR * mixture_mag[:,1:2]
-    ], dim=1)
+    # 3) Reconstruct magnitude estimates
+    pred_v = torch.cat([vL * mixture_mag[:,0:1],
+                        vR * mixture_mag[:,1:2]], dim=1)  # [B,2,F,T]
+    pred_i = torch.cat([iL * mixture_mag[:,0:1],
+                        iR * mixture_mag[:,1:2]], dim=1)
 
-    loss_v = mse(pred_vocal, target_vocal)
-    loss_i = mse(pred_instr, target_instr)
-    return loss_v + loss_i
+    # 4a) Compute A‑weighted MSE
+    sq_err_v = (pred_v - target_vocal)**2  # [B,2,F,T]
+    sq_err_i = (pred_i - target_instr)**2
+    weighted_v = weight_f * sq_err_v
+    weighted_i = weight_f * sq_err_i
+    weighted_loss = weighted_v.mean() + weighted_i.mean()
+
+    # 4b) Compute unweighted MSE
+    unweighted_loss = sq_err_v.mean() + sq_err_i.mean()
+
+    # 5) Combine unweighted + weighted
+    final_loss = 0.5 * weighted_loss + 0.5 * unweighted_loss
+    return final_loss
 
 class MUSDBDataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
