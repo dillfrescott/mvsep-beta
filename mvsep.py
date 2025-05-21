@@ -24,26 +24,26 @@ class TransformerBlock(nn.Module):
         return self.encoder(x)
 
 class TransformerUNet(nn.Module):
-    def __init__(self, in_dim, out_dim, embed_dim=512, depth=4):
+    def __init__(self, in_dim, out_dim, embed_dim=512):
         super().__init__()
         self.input_proj = nn.Linear(in_dim, embed_dim)
 
         # Downsample
-        self.encoder1 = TransformerBlock(embed_dim, depth=depth)
+        self.encoder1 = TransformerBlock(embed_dim)
         self.down1 = nn.Conv1d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1)
 
-        self.encoder2 = TransformerBlock(embed_dim, depth=depth)
+        self.encoder2 = TransformerBlock(embed_dim)
         self.down2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1)
 
         # Bottleneck
-        self.bottleneck = TransformerBlock(embed_dim, depth=depth)
+        self.bottleneck = TransformerBlock(embed_dim)
 
         # Upsample
         self.up2 = nn.ConvTranspose1d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1)
-        self.decoder2 = TransformerBlock(embed_dim, depth=depth)
+        self.decoder2 = TransformerBlock(embed_dim)
 
         self.up1 = nn.ConvTranspose1d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1)
-        self.decoder1 = TransformerBlock(embed_dim, depth=depth)
+        self.decoder1 = TransformerBlock(embed_dim)
 
         self.output_proj = nn.Linear(embed_dim, out_dim)
 
