@@ -83,7 +83,7 @@ class TransformerUNet(nn.Module):
         return out
 
 class TransformerWNet(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200, embed_dim=512):
+    def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200):
         super().__init__()
         self.in_channels = in_channels
         self.freq_bins = freq_bins
@@ -92,8 +92,8 @@ class TransformerWNet(nn.Module):
         self.input_dim = freq_bins * in_channels
         self.output_dim = freq_bins * self.out_masks
 
-        self.unet1 = TransformerUNet(self.input_dim, self.output_dim, embed_dim)
-        self.unet2 = TransformerUNet(self.output_dim, self.output_dim, embed_dim)
+        self.unet1 = TransformerUNet(self.input_dim, self.output_dim)
+        self.unet2 = TransformerUNet(self.output_dim, self.output_dim)
 
     def forward(self, x):
         # x: [B, C, F, T]
@@ -435,7 +435,7 @@ def main():
         train_dataset = MUSDBDataset(root_dir=args.data_dir,
                                      segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                      num_workers=24, pin_memory=False, persistent_workers=True)
+                                      num_workers=24, pin_memory=True, persistent_workers=True)
         total_steps = args.epochs * len(train_dataloader)
         train(model, train_dataloader, optimizer, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
