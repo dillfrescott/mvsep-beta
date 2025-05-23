@@ -17,7 +17,7 @@ from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200,
-        embed_dim=512, depth=24, heads=8):
+                 embed_dim=512, depth=24, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -25,7 +25,7 @@ class NeuralModel(nn.Module):
         self.out_masks = sources * in_channels
         self.max_seq_len = max_seq_len
 
-        self.input_proj = nn.Linear(freq_bins * in_channels, embed_dim)
+        self.input_proj = nn.Conv2d(in_channels, embed_dim, kernel_size=(freq_bins, 1), bias=True)
         self.encoder = Encoder(dim=embed_dim, depth=depth, heads=heads, ff_glu=True)
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks)
 
@@ -33,11 +33,11 @@ class NeuralModel(nn.Module):
         B, C, F, T = x.shape
         assert C == self.in_channels and F == self.freq_bins and T <= self.max_seq_len
 
-        x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj(x)
+        x = x.squeeze(2)
+        x = x.permute(0, 2, 1)
         x = self.encoder(x)
         x = self.output_proj(x)
-
         x = x.view(B, T, self.out_masks, F).permute(0, 2, 3, 1)
         return x
 
