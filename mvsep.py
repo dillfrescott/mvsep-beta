@@ -16,9 +16,9 @@ import glob
 from torch.utils.checkpoint import checkpoint
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, depth=2, heads=8, ff_glu=True):
+    def __init__(self, dim, depth=2, heads=8):
         super().__init__()
-        self.encoder = Encoder(dim=dim, depth=depth, heads=heads, ff_glu=ff_glu)
+        self.encoder = Encoder(dim=dim, depth=depth, heads=heads, ff_glu=True, rotary_pos_emb=True, attn_flash=True)
 
     def forward(self, x):
         return self.encoder(x)
