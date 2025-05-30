@@ -32,6 +32,7 @@ class NeuralModel(nn.Module):
             heads=heads,
             ff_glu=True,
             rotary_pos_emb=True,
+            sandwich_norm=True,
             attn_pre_talking_heads=True,
             attn_post_talking_heads=True
         )
@@ -41,6 +42,7 @@ class NeuralModel(nn.Module):
             heads=heads,
             ff_glu=True,
             rotary_pos_emb=True,
+            sandwich_norm=True,
             attn_pre_talking_heads=True,
             attn_post_talking_heads=True
         )
