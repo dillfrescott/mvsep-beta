@@ -3,4 +3,4 @@ numpy
 prodigyopt
 soundfile
 tqdm
-x-transformers==2.3.11
+x-transformers==2.3.12
