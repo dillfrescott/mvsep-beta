@@ -17,7 +17,7 @@ from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200,
-                embed_dim=512, depth=12, heads=8):
+                embed_dim=512, depth=12, heads=12):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -32,6 +32,8 @@ class NeuralModel(nn.Module):
             heads=heads,
             ff_glu=True,
             rotary_pos_emb=True,
+            alibi_pos_bias=True,
+            alibi_num_heads=4,
             attn_pre_talking_heads=True,
             attn_post_talking_heads=True
         )
@@ -41,6 +43,8 @@ class NeuralModel(nn.Module):
             heads=heads,
             ff_glu=True,
             rotary_pos_emb=True,
+            alibi_pos_bias=True,
+            alibi_num_heads=4,
             attn_pre_talking_heads=True,
             attn_post_talking_heads=True
         )
