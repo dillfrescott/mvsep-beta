@@ -7,53 +7,7 @@ from tqdm import tqdm
 import math
 from x_transformers import Encoder, Decoder
 
-class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200,
-                embed_dim=512, depth=12, heads=12):
-        super().__init__()
-        self.freq_bins = freq_bins
-        self.in_channels = in_channels
-        self.sources = sources
-        self.out_masks = sources * in_channels
-        self.max_seq_len = max_seq_len
-
-        self.input_proj = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.encoder = Encoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            ff_glu=True,
-            rotary_pos_emb=True,
-            alibi_pos_bias=True,
-            alibi_num_heads=4,
-            attn_pre_talking_heads=True,
-            attn_post_talking_heads=True
-        )
-        self.decoder = Decoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            ff_glu=True,
-            rotary_pos_emb=True,
-            alibi_pos_bias=True,
-            alibi_num_heads=4,
-            attn_pre_talking_heads=True,
-            attn_post_talking_heads=True
-        )
-        self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks)
-
-    def forward(self, x):
-        B, C, F, T = x.shape
-        assert C == self.in_channels and F == self.freq_bins and T <= self.max_seq_len
-
-        x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
-        x = self.input_proj(x)
-        x = self.encoder(x)
-        x = self.decoder(x)
-        x = self.output_proj(x)
-
-        x = x.view(B, T, self.out_masks, F).permute(0, 2, 3, 1)
-        return x
+# Define NeuralModel here
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
               chunk_size=529200, overlap=88200, device='cpu'):
