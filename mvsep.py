@@ -31,14 +31,18 @@ class NeuralModel(nn.Module):
             depth=depth,
             heads=heads,
             ff_glu=True,
-            rotary_pos_emb=True
+            rotary_pos_emb=True,
+            attn_pre_talking_heads=True,
+            attn_post_talking_heads=True
         )
         self.decoder = Decoder(
             dim=embed_dim,
             depth=depth,
             heads=heads,
             ff_glu=True,
-            rotary_pos_emb=True
+            rotary_pos_emb=True,
+            attn_pre_talking_heads=True,
+            attn_post_talking_heads=True
         )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks)
 
