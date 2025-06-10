@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from prodigyopt import Prodigy
 from x_transformers import Encoder, Decoder
+from titans_pytorch import NeuralMemory
 import numpy as np
 import random
 import math
@@ -17,7 +18,7 @@ from torch.utils.checkpoint import checkpoint
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200,
-                embed_dim=512, depth=12, heads=12):
+                 embed_dim=512, depth=12, heads=12):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -26,6 +27,7 @@ class NeuralModel(nn.Module):
         self.max_seq_len = max_seq_len
 
         self.input_proj = nn.Linear(freq_bins * in_channels, embed_dim)
+
         self.encoder = Encoder(
             dim=embed_dim,
             depth=depth,
@@ -37,6 +39,12 @@ class NeuralModel(nn.Module):
             attn_pre_talking_heads=True,
             attn_post_talking_heads=True
         )
+
+        self.memory1 = NeuralMemory(
+            dim=embed_dim,
+            chunk_size=512
+        )
+
         self.bottleneck = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 4),
             nn.LayerNorm(embed_dim // 4),
@@ -44,6 +52,12 @@ class NeuralModel(nn.Module):
             nn.Linear(embed_dim // 4, embed_dim),
             nn.LayerNorm(embed_dim)
         )
+        
+        self.memory2 = NeuralMemory(
+            dim=embed_dim,
+            chunk_size=512
+        )
+
         self.decoder = Decoder(
             dim=embed_dim,
             depth=depth,
@@ -55,6 +69,7 @@ class NeuralModel(nn.Module):
             attn_pre_talking_heads=True,
             attn_post_talking_heads=True
         )
+
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks)
 
     def forward(self, x):
@@ -64,7 +79,9 @@ class NeuralModel(nn.Module):
         x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj(x)
         x = self.encoder(x)
+        x, mem_state1 = self.memory1(x)
         x = self.bottleneck(x)
+        x, mem_state2 = self.memory2(x)
         x = self.decoder(x)
         x = self.output_proj(x)
 
