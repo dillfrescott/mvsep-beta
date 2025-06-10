@@ -27,11 +27,6 @@ class NeuralModel(nn.Module):
         self.max_seq_len = max_seq_len
 
         self.input_proj = nn.Linear(freq_bins * in_channels, embed_dim)
-        
-        self.memory1 = NeuralMemory(
-            dim=embed_dim,
-            chunk_size=512
-        )
 
         self.encoder = Encoder(
             dim=embed_dim,
@@ -44,11 +39,6 @@ class NeuralModel(nn.Module):
             attn_pre_talking_heads=True,
             attn_post_talking_heads=True
         )
-        
-        self.memory2 = NeuralMemory(
-            dim=embed_dim,
-            chunk_size=512
-        )
 
         self.bottleneck = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 4),
@@ -56,11 +46,6 @@ class NeuralModel(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim // 4, embed_dim),
             nn.LayerNorm(embed_dim)
-        )
-        
-        self.memory3 = NeuralMemory(
-            dim=embed_dim,
-            chunk_size=512
         )
 
         self.decoder = Decoder(
@@ -75,7 +60,7 @@ class NeuralModel(nn.Module):
             attn_post_talking_heads=True
         )
         
-        self.memory4 = NeuralMemory(
+        self.memory = NeuralMemory(
             dim=embed_dim,
             chunk_size=512
         )
@@ -88,13 +73,10 @@ class NeuralModel(nn.Module):
 
         x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj(x)
-        x, _ = self.memory1(x)
         x = self.encoder(x)
-        x, _ = self.memory2(x)
         x = self.bottleneck(x)
-        x, _ = self.memory3(x)
         x = self.decoder(x)
-        x, _ = self.memory4(x)
+        x, _ = self.memory(x)
         x = self.output_proj(x)
 
         x = x.view(B, T, self.out_masks, F).permute(0, 2, 3, 1)
