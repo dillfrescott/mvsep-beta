@@ -37,6 +37,13 @@ class NeuralModel(nn.Module):
             attn_pre_talking_heads=True,
             attn_post_talking_heads=True
         )
+        self.bottleneck = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 4),
+            nn.LayerNorm(embed_dim // 4),
+            nn.GELU(),
+            nn.Linear(embed_dim // 4, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
         self.decoder = Decoder(
             dim=embed_dim,
             depth=depth,
@@ -57,6 +64,7 @@ class NeuralModel(nn.Module):
         x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj(x)
         x = self.encoder(x)
+        x = self.bottleneck(x)
         x = self.decoder(x)
         x = self.output_proj(x)
 
