@@ -9,7 +9,6 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from prodigyopt import Prodigy
 from x_transformers import Encoder, Decoder
-from titans_pytorch import NeuralMemory
 import numpy as np
 import random
 import math
@@ -59,11 +58,6 @@ class NeuralModel(nn.Module):
             attn_pre_talking_heads=True,
             attn_post_talking_heads=True
         )
-        
-        self.memory = NeuralMemory(
-            dim=embed_dim,
-            chunk_size=512
-        )
 
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks)
 
@@ -76,7 +70,6 @@ class NeuralModel(nn.Module):
         x = self.encoder(x)
         x = self.bottleneck(x)
         x = self.decoder(x)
-        x, _ = self.memory(x)
         x = self.output_proj(x)
 
         x = x.view(B, T, self.out_masks, F).permute(0, 2, 3, 1)
