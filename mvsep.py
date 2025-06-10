@@ -79,9 +79,9 @@ class NeuralModel(nn.Module):
         x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj(x)
         x = self.encoder(x)
-        x, mem_state1 = self.memory1(x)
+        x, _ = self.memory1(x)
         x = self.bottleneck(x)
-        x, mem_state2 = self.memory2(x)
+        x, _ = self.memory2(x)
         x = self.decoder(x)
         x = self.output_proj(x)
 
