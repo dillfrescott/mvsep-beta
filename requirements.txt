@@ -2,5 +2,6 @@ librosa
 numpy
 prodigyopt
 soundfile
+titans-pytorch
 tqdm
 x-transformers==2.3.12
