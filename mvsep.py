@@ -2,22 +2,114 @@ import os
 import argparse
 import torch
 import torch.nn as nn
+from torch.nn import Module
 import torch.optim as optim
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from prodigyopt import Prodigy
-from x_transformers import Encoder, Decoder
 import numpy as np
 import random
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
+from einops import rearrange, repeat
+
+def apply_rope(x, theta=10000):
+    b, h, n, d, device = *x.shape, x.device
+    seq = torch.arange(n, device=device)
+    theta_values = 1.0 / (theta ** (torch.arange(0, d, 2, device=device).float() / d))
+    freqs = torch.einsum('n,d->nd', seq, theta_values)
+    freqs_cos = freqs.cos().unsqueeze(0).unsqueeze(0)
+    freqs_sin = freqs.sin().unsqueeze(0).unsqueeze(0)
+    x1, x2 = x.chunk(2, dim=-1)
+
+    rotated_x1 = x1 * freqs_cos - x2 * freqs_sin
+    rotated_x2 = x1 * freqs_sin + x2 * freqs_cos
+
+    return torch.cat((rotated_x1, rotated_x2), dim=-1)
+
+class TalkingHeadAttention(nn.Module):
+    def __init__(self, dim, heads=8):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+
+        self.to_qkv = nn.Linear(dim, dim * 3)
+        self.pre_softmax_proj = nn.Linear(heads, heads, bias=False)
+        self.post_softmax_proj = nn.Linear(heads, heads, bias=False)
+        self.to_out = nn.Linear(dim, dim)
+
+    def forward(self, x, mask=None):
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+
+        q = apply_rope(q)
+        k = apply_rope(k)
+
+        attn_logits = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
+        
+        attn_logits = rearrange(attn_logits, 'b h i j -> b i j h')
+        attn_logits = self.pre_softmax_proj(attn_logits)
+        attn_logits = rearrange(attn_logits, 'b i j h -> b h i j')
+
+        if mask is not None:
+            mask_value = -torch.finfo(attn_logits.dtype).max
+            attn_logits = attn_logits.masked_fill(mask, mask_value)
+
+        attn = attn_logits.softmax(dim=-1)
+
+        attn = rearrange(attn, 'b h i j -> b i j h')
+        attn = self.post_softmax_proj(attn)
+        attn = rearrange(attn, 'b i j h -> b h i j')
+
+        out = torch.einsum('bhij,bhjd->bhid', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, ff_dim, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, dim),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, dim, heads, ff_dim, dropout=0.1):
+        super().__init__()
+        self.attn = TalkingHeadAttention(dim, heads)
+        self.ff = FeedForward(dim, ff_dim, dropout)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        x = self.norm1(x + self.dropout(self.attn(x, mask=mask)))
+        x = self.norm2(x + self.ff(x))
+        return x
+
+class Transformer(nn.Module):
+    def __init__(self, dim, heads=8, num_layers=6, ff_dim=1024, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [TransformerEncoderLayer(dim, heads, ff_dim, dropout) for _ in range(num_layers)]
+        )
+
+    def forward(self, x, mask=None):
+        for layer in self.layers:
+            x = layer(x, mask=mask)
+        return x
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049, max_seq_len=529200,
-                 embed_dim=512, depth=12, heads=12):
+                 embed_dim=1024):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -27,17 +119,7 @@ class NeuralModel(nn.Module):
 
         self.input_proj = nn.Linear(freq_bins * in_channels, embed_dim)
 
-        self.encoder = Encoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            ff_glu=True,
-            rotary_pos_emb=True,
-            alibi_pos_bias=True,
-            alibi_num_heads=4,
-            attn_pre_talking_heads=True,
-            attn_post_talking_heads=True
-        )
+        self.trf1 = Transformer(embed_dim)
 
         self.bottleneck = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 4),
@@ -47,17 +129,7 @@ class NeuralModel(nn.Module):
             nn.LayerNorm(embed_dim)
         )
 
-        self.decoder = Decoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            ff_glu=True,
-            rotary_pos_emb=True,
-            alibi_pos_bias=True,
-            alibi_num_heads=4,
-            attn_pre_talking_heads=True,
-            attn_post_talking_heads=True
-        )
+        self.trf2 = Transformer(embed_dim)
 
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks)
 
@@ -67,9 +139,9 @@ class NeuralModel(nn.Module):
 
         x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj(x)
-        x = self.encoder(x)
+        x = self.trf1(x)
         x = self.bottleneck(x)
-        x = self.decoder(x)
+        x = self.trf2(x)
         x = self.output_proj(x)
 
         x = x.view(B, T, self.out_masks, F).permute(0, 2, 3, 1)
@@ -262,6 +334,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
                 continue
 
             loss.backward()
+            torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)
             optimizer.step()
 
             avg_loss = (avg_loss * step + loss.item()) / (step + 1)
