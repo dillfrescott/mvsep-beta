@@ -1,3 +1,3 @@
-<img src="https://github.com/user-attachments/assets/c3fde02e-21ca-423e-a843-d56c19d48642" width="400" alt="mvsep-beta-logo-2" />
+<img src="https://github.com/user-attachments/assets/31d7d5b7-d511-475e-bcae-5f8cf5feb109" width="400" alt="mvsep-beta-logo-2" />
 
 ## MVSEP testing repo.
