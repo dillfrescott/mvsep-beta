@@ -2,7 +2,6 @@ import os
 import argparse
 import torch
 import torch.nn as nn
-from torch.nn import Module
 import torch.optim as optim
 import torch.nn.functional as F
 import torchaudio
@@ -14,7 +13,7 @@ import random
 import math
 import glob
 from torch.utils.checkpoint import checkpoint
-from einops import rearrange, repeat
+from einops import rearrange
 
 def apply_rope(x, theta=10000):
     b, h, n, d, device = *x.shape, x.device
