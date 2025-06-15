@@ -2,17 +2,13 @@ import os
 import argparse
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from prodigyopt import Prodigy
-import numpy as np
 import random
 import math
-import glob
-from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 
 def apply_rope(x, theta=10000):
