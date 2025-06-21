@@ -1,0 +1,6 @@
+torch
+torchaudio
+prodigyopt
+s5-pytorch
+soundfile
+tqdm
