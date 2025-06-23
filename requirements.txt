@@ -1,0 +1,9 @@
+torch
+torchaudio
+einops
+librosa
+nnAudio
+prodigyopt
+s5-pytorch
+soundfile
+tqdm
