@@ -4,15 +4,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-import librosa
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from prodigyopt import Prodigy
 import random
 import math
-from einops import rearrange
 from s5 import S5Block
-from nnAudio.features import VQT
 
 class ProdigyComplex(Prodigy):
     def __init__(self, *args, **kwargs):
@@ -103,176 +100,21 @@ class ProdigyComplex(Prodigy):
 
         return loss
 
-class HarmonicBranch(nn.Module):
-    def __init__(self, sample_rate=44100, n_bins=192, embed_dim=1024, hop_length=1024):
-        super().__init__()
-        self.vqt_transform = VQT(
-            sr=sample_rate,
-            hop_length=hop_length,
-            fmin=librosa.note_to_hz('C1'),
-            n_bins=n_bins,
-            bins_per_octave=24,
-            gamma=20,
-            output_format='Complex'
-        )
-        self.vqt_proj = nn.Linear(n_bins, embed_dim)
-
-    def forward(self, x_audio):
-        x_mono = torch.mean(x_audio, dim=1)
-        vqt_spec = self.vqt_transform(x_mono)
-        vqt_mag = torch.sqrt(vqt_spec[..., 0]**2 + vqt_spec[..., 1]**2)
-        vqt_mag_permuted = vqt_mag.permute(0, 2, 1)
-        return self.vqt_proj(vqt_mag_permuted)
-
-def apply_2d_rope(x, chunk_size=256, theta=10000):
-    b, h, n, d, device = *x.shape, x.device
-
-    padding = (chunk_size - (n % chunk_size)) % chunk_size
-    if padding > 0:
-        x = F.pad(x, (0, 0, 0, padding))
-        n = n + padding
-    
-    num_chunks = n // chunk_size
-    x = rearrange(x, 'b h (c l) d -> b h c l d', c=num_chunks)
-
-    seq_local = torch.arange(chunk_size, device=device)
-    theta_local = 1.0 / (theta ** (torch.arange(0, d, 4, device=device).float() / d))
-    freqs_local = torch.einsum('l,d->ld', seq_local, theta_local)
-    freqs_cos_local = freqs_local.cos().unsqueeze(0).unsqueeze(0).unsqueeze(0)
-    freqs_sin_local = freqs_local.sin().unsqueeze(0).unsqueeze(0).unsqueeze(0)
-    
-    x1, x2, x3, x4 = x.chunk(4, dim=-1)
-    
-    rotated_x1_local = x1 * freqs_cos_local - x2 * freqs_sin_local
-    rotated_x2_local = x1 * freqs_sin_local + x2 * freqs_cos_local
-
-    seq_chunk = torch.arange(num_chunks, device=device)
-    theta_chunk = 1.0 / (theta ** (torch.arange(0, d, 4, device=device).float() / d))
-    freqs_chunk = torch.einsum('c,d->cd', seq_chunk, theta_chunk)
-    freqs_cos_chunk = freqs_chunk.cos().unsqueeze(0).unsqueeze(0).unsqueeze(-2)
-    freqs_sin_chunk = freqs_chunk.sin().unsqueeze(0).unsqueeze(0).unsqueeze(-2)
-
-    rotated_x3_chunk = x3 * freqs_cos_chunk - x4 * freqs_sin_chunk
-    rotated_x4_chunk = x3 * freqs_sin_chunk + x4 * freqs_cos_chunk
-
-    x_rotated = torch.cat((rotated_x1_local, rotated_x2_local, rotated_x3_chunk, rotated_x4_chunk), dim=-1)
-    x_rotated = rearrange(x_rotated, 'b h c l d -> b h (c l) d')
-
-    if padding > 0:
-        x_rotated = x_rotated[:, :, :-padding, :]
-
-    return x_rotated
-
-class TalkingHeadAttention(nn.Module):
-    def __init__(self, dim, heads=8):
-        super().__init__()
-        self.heads = heads
-        self.scale = (dim // heads) ** -0.5
-
-        self.to_qkv = nn.Linear(dim, dim * 3)
-        self.pre_softmax_proj = nn.Linear(heads, heads, bias=False)
-        self.post_softmax_proj = nn.Linear(heads, heads, bias=False)
-        self.to_out = nn.Linear(dim, dim)
-
-    def forward(self, x, mask=None):
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
-
-        q = apply_2d_rope(q)
-        k = apply_2d_rope(k)
-
-        attn_logits = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
-        
-        attn_logits = rearrange(attn_logits, 'b h i j -> b i j h')
-        attn_logits = self.pre_softmax_proj(attn_logits)
-        attn_logits = rearrange(attn_logits, 'b i j h -> b h i j')
-
-        if mask is not None:
-            mask_value = -torch.finfo(attn_logits.dtype).max
-            attn_logits = attn_logits.masked_fill(mask, mask_value)
-
-        attn = attn_logits.softmax(dim=-1)
-
-        attn = rearrange(attn, 'b h i j -> b i j h')
-        attn = self.post_softmax_proj(attn)
-        attn = rearrange(attn, 'b i j h -> b h i j')
-
-        out = torch.einsum('bhij,bhjd->bhid', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, ff_dim, dropout=0.1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, ff_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, dim),
-            nn.Dropout(dropout)
-        )
-    def forward(self, x):
-        return self.net(x)
-
-class TransformerEncoderLayer(nn.Module):
-    def __init__(self, dim, heads, ff_dim, dropout=0.1):
-        super().__init__()
-        self.attn = TalkingHeadAttention(dim, heads)
-        self.ff = FeedForward(dim, ff_dim, dropout)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask=None):
-        x = self.norm1(x + self.dropout(self.attn(x, mask=mask)))
-        x = self.norm2(x + self.ff(x))
-        return x
-
-class Transformer(nn.Module):
-    def __init__(self, dim, heads=8, num_layers=6, ff_dim=2048, dropout=0.1):
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [TransformerEncoderLayer(dim, heads, ff_dim, dropout) for _ in range(num_layers)]
-        )
-
-    def forward(self, x, mask=None):
-        for layer in self.layers:
-            x = layer(x, mask=mask)
-        return x
-
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=1024, s5_depth=8, 
-                 trf_depth=6, trf_heads=8, trf_ff_dim=2048,
-                 sample_rate=44100, hop_length=1024):
+                 embed_dim=1024, depth=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
-        self.embed_dim = embed_dim
+        self.depth = depth
 
         self.input_proj_stft = nn.Linear(freq_bins * in_channels, embed_dim)
 
-        self.harmonic_branch = HarmonicBranch(
-            sample_rate=sample_rate,
-            embed_dim=embed_dim,
-            hop_length=hop_length
+        self.model = nn.Sequential(
+            *[S5Block(embed_dim, embed_dim, True) for _ in range(self.depth)]
         )
-
-        self.s5_model = nn.Sequential(
-            *[S5Block(embed_dim, embed_dim, True) for _ in range(s5_depth)]
-        )
-
-        self.trf_model = Transformer(
-            dim=embed_dim,
-            heads=trf_heads,
-            num_layers=trf_depth,
-            ff_dim=trf_ff_dim
-        )
-
-        self.fusion_proj = nn.Linear(embed_dim * 2, embed_dim)
-        self.fusion_norm = nn.LayerNorm(embed_dim)
 
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
@@ -280,31 +122,17 @@ class NeuralModel(nn.Module):
         B, C, F, T = x_stft_mag.shape
 
         x_stft_mag = x_stft_mag.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
-        projected_stft = self.input_proj_stft(x_stft_mag)
+        
+        x = self.input_proj_stft(x_stft_mag)
 
-        projected_vqt = self.harmonic_branch(x_audio)
+        x = self.model(x)
 
-        if projected_stft.shape[1] != projected_vqt.shape[1]:
-            min_T = min(projected_stft.shape[1], projected_vqt.shape[1])
-            projected_stft = projected_stft[:, :min_T, :]
-            projected_vqt = projected_vqt[:, :min_T, :]
+        x = self.output_proj(x)
 
-        x = projected_stft + projected_vqt
+        current_T = x.shape[1]
+        x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
 
-        x_s5 = self.s5_model(x)
-        x_trf = self.trf_model(x)
-
-        x_combined = torch.cat((x_s5, x_trf), dim=-1)
-        x_fused = self.fusion_proj(x_combined)
-
-        x_fused = self.fusion_norm(x_fused + 0.5 * (x_s5 + x_trf))
-
-        output = self.output_proj(x_fused)
-
-        current_T = output.shape[1]
-        output = output.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
-
-        return torch.sigmoid(output)
+        return torch.sigmoid(x)
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
