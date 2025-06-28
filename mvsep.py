@@ -301,7 +301,7 @@ class Dataset(Dataset):
 
         return mixture_spec, vocal_seg, instr_seg, mixture_seg
 
-def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_steps, args, checkpoint_path=None, window=None):
+def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, checkpoint_path=None, window=None):
     model.to(device)
     step = 0
     avg_loss = 0.0
@@ -318,12 +318,12 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
         step = checkpoint_data['step']
         avg_loss = checkpoint_data['avg_loss']
+        optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
         print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
 
-    total_steps = epochs * len(dataloader)
-    progress_bar = tqdm(total=total_steps, initial=step)
+    progress_bar = tqdm(initial=step, total=None)
     model.train()
-    for epoch in range(epochs):
+    while True:
         for batch in dataloader:
             mixture_spec, vocal_audio, instr_audio, mixture_audio = batch
             
@@ -354,7 +354,7 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
             step += 1
             progress_bar.update(1)
             current_lr = optimizer.param_groups[0]['lr']
-            desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f}"
+            desc = f"Step {step} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f}"
             progress_bar.set_description(desc)
 
             if step % checkpoint_steps == 0:
@@ -370,7 +370,6 @@ def train(model, dataloader, optimizer, loss_fn, device, epochs, checkpoint_step
                     oldest_checkpoint = checkpoint_files.pop(0)
                     if os.path.exists(oldest_checkpoint):
                         os.remove(oldest_checkpoint)
-    progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
               chunk_size=529200, overlap=88200, device='cpu'):
@@ -471,7 +470,6 @@ def main():
     parser.add_argument('--train', action='store_true', help='Train the model')
     parser.add_argument('--infer', action='store_true', help='Inference mode')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
-    parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
@@ -491,8 +489,7 @@ def main():
                                       segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                        num_workers=24, pin_memory=False, persistent_workers=True)
-        total_steps = args.epochs * len(train_dataloader)
-        train(model, train_dataloader, optimizer, loss_fn, device, args.epochs, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
+        train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
