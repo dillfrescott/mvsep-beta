@@ -47,8 +47,8 @@ def inference(model, checkpoint_path, input_dir, output_instrum_dir, output_voca
     for filename in input_files:
         input_wav_path = os.path.join(input_dir, filename)
         song_id = filename.replace('_mixture.wav', '')
-        output_instrumental_path = os.path.join(output_instrum_dir, f'{song_id}_instrum.wav')
-        output_vocal_path = os.path.join(output_vocal_dir, f'{song_id}_vocals.wav')
+        output_instrumental_path = os.path.join(output_instrum_dir, f'{song_id}_instrum.flac')
+        output_vocal_path = os.path.join(output_vocal_dir, f'{song_id}_vocals.flac')
 
         input_audio, sr = torchaudio.load(input_wav_path)
         if sr != 44100:
@@ -135,8 +135,8 @@ def inference(model, checkpoint_path, input_dir, output_instrum_dir, output_voca
 
         vocals = vocals[:, :total_length].clamp(-1.0, 1.0)
         instrumentals = instrumentals[:, :total_length].clamp(-1.0, 1.0)
-        torchaudio.save(output_vocal_path, vocals.cpu(), sr)
-        torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr)
+        torchaudio.save(output_vocal_path, vocals.cpu(), sr, format='flac')
+        torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr, format='flac')
 
 def main():
     parser = argparse.ArgumentParser()
