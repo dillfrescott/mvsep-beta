@@ -32,14 +32,13 @@ class NeuralModel(nn.Module):
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return torch.sigmoid(x)
 
-def inference(model, checkpoint_path, input_dir, output_instrum_dir, output_vocal_dir,
+def inference(model, checkpoint_path, input_dir, output_dir,
               chunk_size=529200, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval().to(device)
 
-    os.makedirs(output_instrum_dir, exist_ok=True)
-    os.makedirs(output_vocal_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     input_files = [f for f in os.listdir(input_dir) if f.endswith('_mixture.wav')]
     input_files.sort()
@@ -47,8 +46,8 @@ def inference(model, checkpoint_path, input_dir, output_instrum_dir, output_voca
     for filename in input_files:
         input_wav_path = os.path.join(input_dir, filename)
         song_id = filename.replace('_mixture.wav', '')
-        output_instrumental_path = os.path.join(output_instrum_dir, f'{song_id}_instrum.flac')
-        output_vocal_path = os.path.join(output_vocal_dir, f'{song_id}_vocals.flac')
+        output_instrumental_path = os.path.join(output_dir, f'{song_id}_instrum.flac')
+        output_vocal_path = os.path.join(output_dir, f'{song_id}_vocals.flac')
 
         input_audio, sr = torchaudio.load(input_wav_path)
         if sr != 44100:
@@ -143,8 +142,7 @@ def main():
     parser.add_argument('--infer', action='store_true')
     parser.add_argument('--checkpoint_path', type=str, required=True)
     parser.add_argument('--input_dir', type=str, required=True)
-    parser.add_argument('--output_instrum_dir', type=str, default='output_instruments')
-    parser.add_argument('--output_vocal_dir', type=str, default='output_vocals')
+    parser.add_argument('--output_dir', type=str, default='output')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -152,7 +150,7 @@ def main():
 
     if args.infer:
         inference(model, args.checkpoint_path, args.input_dir,
-                  args.output_instrum_dir, args.output_vocal_dir, device=device)
+                  args.output_dir, device=device)
 
 if __name__ == '__main__':
     main()
