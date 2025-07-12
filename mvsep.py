@@ -139,18 +139,25 @@ class Dataset(Dataset):
 
         print("Scanning track folders...")
         for td in tqdm(track_dirs, desc="Scanning tracks"):
-            vocal_path = os.path.join(td, 'vocals.wav')
-            other_path = os.path.join(td, 'other.wav')
+            vocal_path = self._find_audio_file(td, 'vocals')
+            other_path = self._find_audio_file(td, 'other')
 
-            if os.path.exists(vocal_path):
+            if vocal_path:
                 self.vocal_paths.append(vocal_path)
-            if os.path.exists(other_path):
+            if other_path:
                 self.other_paths.append(other_path)
 
         if not self.vocal_paths or not self.other_paths:
             raise ValueError("Dataset must contain both vocal and 'other' stems.")
 
         self.size = 50000
+
+    def _find_audio_file(self, directory, base_name):
+        for ext in ['.wav', '.flac']:
+            path = os.path.join(directory, base_name + ext)
+            if os.path.exists(path):
+                return path
+        return None
 
     def _preprocess_audio(self, audio, sr):
         if sr != self.sample_rate:
@@ -272,13 +279,13 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                     if os.path.exists(oldest_checkpoint):
                         os.remove(oldest_checkpoint)
 
-def inference(model, checkpoint_path, input_wav_path, output_instrumental_path, output_vocal_path,
+def inference(model, checkpoint_path, input_path, output_instrumental_path, output_vocal_path,
               chunk_size=529200, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval().to(device)
 
-    input_audio, sr = torchaudio.load(input_wav_path)
+    input_audio, sr = torchaudio.load(input_path)
     if sr != 44100:
         raise ValueError(f"Input audio must be 44100Hz, but got {sr}Hz.")
     if input_audio.shape[0] == 1:
@@ -374,7 +381,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
+    parser.add_argument('--input_file', type=str, default=None, help='Path to input audio file for inference (wav or flac)')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=529200, help='Segment length for training')
@@ -392,10 +399,10 @@ def main():
                                        num_workers=16, pin_memory=False, persistent_workers=True)
         train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
     elif args.infer:
-        if args.input_wav is None:
-            print("Please specify an input WAV file for inference using --input_wav")
+        if args.input_file is None:
+            print("Please specify an input audio file for inference using --input_file")
             return
-        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, args.output_vocal, device=device)
+        inference(model, args.checkpoint_path, args.input_file, args.output_instrumental, args.output_vocal, device=device)
     else:
         print("Please specify either --train or --infer")
 
