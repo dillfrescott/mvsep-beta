@@ -209,7 +209,7 @@ class Dataset(Dataset):
 
         return mixture_spec, vocal_seg, instr_seg, mixture_seg
 
-def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, checkpoint_path=None, window=None):
+def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, checkpoint_path=None, window=None, reset_optimizer=False):
     model.to(device)
     step = 0
     avg_loss = 0.0
@@ -226,8 +226,12 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
         step = checkpoint_data['step']
         avg_loss = checkpoint_data['avg_loss']
-        optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
-        print(f"Resuming training from step {step} with average loss {avg_loss:.4f}")
+
+        if reset_optimizer:
+            print(f"Resuming training from step {step}. MODEL LOADED, OPTIMIZER RESET.")
+        else:
+            optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
+            print(f"Resuming training from step {step} with average loss {avg_loss:.4f}. MODEL AND OPTIMIZER LOADED.")
 
     progress_bar = tqdm(initial=step, total=None)
     model.train()
@@ -397,7 +401,7 @@ def main():
                                       segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                        num_workers=16, pin_memory=False, persistent_workers=True)
-        train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window)
+        train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window, reset_optimizer=args.reset_optimizer)
     elif args.infer:
         if args.input_file is None:
             print("Please specify an input audio file for inference using --input_file")
