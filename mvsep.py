@@ -389,7 +389,7 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
     parser.add_argument('--segment_length', type=int, default=529200, help='Segment length for training')
-    parser.add_argument('--reset-optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint')
+    parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
