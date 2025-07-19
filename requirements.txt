@@ -1,6 +1,6 @@
 torch
 torchaudio
-dillnet
 prodigyopt
 soundfile
+strassen-attention
 tqdm

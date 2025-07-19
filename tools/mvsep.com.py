@@ -6,11 +6,11 @@ import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
 import math
-from dillnet import DillNet
+from strassen_attention.strassen_transformer import StrassenTransformer
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=8, heads=8):
+                 embed_dim=512, depth=6):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -19,7 +19,7 @@ class NeuralModel(nn.Module):
         self.embed_dim = embed_dim
 
         self.input_proj_stft = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.model = DillNet(embed_dim, depth, heads)
+        self.model = StrassenTransformer(dim=embed_dim, depth=depth)
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft_mag, x_audio):
