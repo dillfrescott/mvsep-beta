@@ -9,11 +9,11 @@ from tqdm import tqdm
 from prodigyopt import Prodigy
 import random
 import math
-from dillnet import DillNet
+from x_transformers import Encoder
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=8, heads=8):
+                 embed_dim=512, depth=8, heads=16):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -22,7 +22,14 @@ class NeuralModel(nn.Module):
         self.embed_dim = embed_dim
 
         self.input_proj_stft = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.model = DillNet(embed_dim, depth, heads)
+        self.model = Encoder(
+            dim=embed_dim,
+            depth=depth,
+            heads=heads,
+            rotary_pos_emb=True,
+            attn_pre_talking_heads=True,
+            attn_post_talking_heads=True
+        )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft_mag, x_audio):
@@ -33,7 +40,7 @@ class NeuralModel(nn.Module):
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
-        return torch.sigmoid(x)
+        return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -70,34 +77,53 @@ def loss_fn(pred_output,
             target_vocal_audio,
             target_instr_audio,
             stft_params_for_istft):
-    
+    device = pred_output.device
     multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
         win_lengths=[1024, 2048, 8192]
-    ).to(pred_output.device)
+    ).to(device)
 
-    B, _, F, T = pred_output.shape
-    pred_masks = pred_output.view(B, 2, 4, F, T)
+    B, _, F_dim, T = pred_output.shape
+    pred_masks = pred_output.view(B, 2, 4, F_dim, T)
     pred_masks_real = pred_masks[:, 0]
     pred_masks_imag = pred_masks[:, 1]
-
     vL_cmask = pred_masks_real[:, 0] + 1j * pred_masks_imag[:, 0]
     vR_cmask = pred_masks_real[:, 1] + 1j * pred_masks_imag[:, 1]
     iL_cmask = pred_masks_real[:, 2] + 1j * pred_masks_imag[:, 2]
     iR_cmask = pred_masks_real[:, 3] + 1j * pred_masks_imag[:, 3]
-
     vL_cmask, vR_cmask = vL_cmask.unsqueeze(1), vR_cmask.unsqueeze(1)
     iL_cmask, iR_cmask = iL_cmask.unsqueeze(1), iR_cmask.unsqueeze(1)
-
     v_spec_pred = torch.cat([vL_cmask * mixture_spec[:, 0:1],
                              vR_cmask * mixture_spec[:, 1:2]], dim=1)
     i_spec_pred = torch.cat([iL_cmask * mixture_spec[:, 0:1],
                              iR_cmask * mixture_spec[:, 1:2]], dim=1)
 
+    target_vocal_spec = torch.stft(target_vocal_audio.view(-1, target_vocal_audio.shape[-1]),
+                                   n_fft=stft_params_for_istft['n_fft'],
+                                   hop_length=stft_params_for_istft['hop_length'],
+                                   window=stft_params_for_istft['window'].to(device),
+                                   return_complex=True,
+                                   center=True)
+    target_vocal_spec = target_vocal_spec.view(B, 2, F_dim, T)
+
+    target_instr_spec = torch.stft(target_instr_audio.view(-1, target_instr_audio.shape[-1]),
+                                   n_fft=stft_params_for_istft['n_fft'],
+                                   hop_length=stft_params_for_istft['hop_length'],
+                                   window=stft_params_for_istft['window'].to(device),
+                                   return_complex=True,
+                                   center=True)
+    target_instr_spec = target_instr_spec.view(B, 2, F_dim, T)
+
+    spec_vocal_loss = F.l1_loss(v_spec_pred.real, target_vocal_spec.real) + \
+                      F.l1_loss(v_spec_pred.imag, target_vocal_spec.imag)
+    spec_instr_loss = F.l1_loss(i_spec_pred.real, target_instr_spec.real) + \
+                      F.l1_loss(i_spec_pred.imag, target_instr_spec.imag)
+    spectrogram_loss = spec_vocal_loss + spec_instr_loss
+
     n_fft = stft_params_for_istft['n_fft']
     hop_length = stft_params_for_istft['hop_length']
-    window = stft_params_for_istft['window'].to(pred_output.device)
+    window = stft_params_for_istft['window'].to(device)
     recon_len = target_vocal_audio.shape[-1]
 
     B, C, freq, T_spec = v_spec_pred.shape
@@ -108,7 +134,6 @@ def loss_fn(pred_output,
         v_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
         window=window, center=True, length=recon_len
     ).reshape(B, C, -1)
-    
     pred_instr_audio = torch.istft(
         i_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
         window=window, center=True, length=recon_len
@@ -116,8 +141,9 @@ def loss_fn(pred_output,
 
     vocal_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
-    
-    total_loss = vocal_loss + instr_loss
+    audio_loss = vocal_loss + instr_loss
+
+    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss
 
     return total_loss
 
@@ -284,7 +310,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                         os.remove(oldest_checkpoint)
 
 def inference(model, checkpoint_path, input_path, output_instrumental_path, output_vocal_path,
-              chunk_size=529200, overlap=88200, device='cpu'):
+              chunk_size=352800, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval().to(device)
@@ -388,7 +414,7 @@ def main():
     parser.add_argument('--input_file', type=str, default=None, help='Path to input audio file for inference (wav or flac)')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=529200, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=352800, help='Segment length for training')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint')
     args = parser.parse_args()
 

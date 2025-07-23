@@ -6,11 +6,11 @@ import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
 import math
-from dillnet import DillNet
+from x_transformers import Encoder
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=8, heads=8):
+                 embed_dim=512, depth=8, heads=16):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -19,7 +19,14 @@ class NeuralModel(nn.Module):
         self.embed_dim = embed_dim
 
         self.input_proj_stft = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.model = DillNet(embed_dim, depth, heads)
+        self.model = Encoder(
+            dim=embed_dim,
+            depth=depth,
+            heads=heads,
+            rotary_pos_emb=True,
+            attn_pre_talking_heads=True,
+            attn_post_talking_heads=True
+        )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft_mag, x_audio):
@@ -30,7 +37,7 @@ class NeuralModel(nn.Module):
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
-        return torch.sigmoid(x)
+        return x
 
 def inference(model, checkpoint_path, input_dir, output_dir,
               chunk_size=529200, overlap=88200, device='cpu'):
