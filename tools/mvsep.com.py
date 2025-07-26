@@ -114,6 +114,7 @@ class NeuralModel(nn.Module):
         x = self.input_proj_stft(x_stft_mag)
         x = self.model(x)
         x = self.output_proj(x)
+        x = torch.tanh(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
