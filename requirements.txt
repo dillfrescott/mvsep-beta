@@ -2,4 +2,5 @@ torch
 torchaudio
 prodigyopt
 soundfile
+titans-pytorch
 tqdm
