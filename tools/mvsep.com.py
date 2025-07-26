@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
 import math
+from titans_pytorch import NeuralMemory
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim):
@@ -86,11 +87,16 @@ class RotaryTransformerEncoder(nn.Module):
         self.heads = heads
         head_dim = embed_dim // heads
         self.rope = RotaryEmbedding(dim=head_dim)
+        self.mem = NeuralMemory(
+            dim = embed_dim,
+            chunk_size = 64
+        )
         self.layers = nn.ModuleList([
             TransformerBlock(embed_dim, heads, dropout) for _ in range(depth)
         ])
 
     def forward(self, x):
+        x, _ = self.mem(x)
         for layer in self.layers:
             x = layer(x, rope=self.rope)
         return x
@@ -114,7 +120,6 @@ class NeuralModel(nn.Module):
         x = self.input_proj_stft(x_stft_mag)
         x = self.model(x)
         x = self.output_proj(x)
-        x = torch.tanh(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
