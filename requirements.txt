@@ -3,4 +3,3 @@ torchaudio
 prodigyopt
 soundfile
 tqdm
-x-transformers==2.4.14
