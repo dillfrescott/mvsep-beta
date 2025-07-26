@@ -9,27 +9,106 @@ from tqdm import tqdm
 from prodigyopt import Prodigy
 import random
 import math
-from x_transformers import Encoder
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        seq_len = x.shape[-2]
+        device = x.device
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().unsqueeze(0).unsqueeze(1)
+        sin = emb.sin().unsqueeze(0).unsqueeze(1)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        x_rot = torch.stack((-x2, x1), dim=-1).flatten(-2)
+        return x * cos + x_rot * sin * self.scale
+
+class TalkingHeadsAttention(nn.Module):
+    def __init__(self, embed_dim, heads, dropout=0.1):
+        super().__init__()
+        assert embed_dim % heads == 0, "Embedding dimension must be divisible by number of heads."
+        self.embed_dim = embed_dim
+        self.heads = heads
+        self.head_dim = embed_dim // heads
+        self.to_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
+        self.pre_softmax_proj = nn.Linear(heads, heads, bias=False)
+        self.post_softmax_proj = nn.Linear(heads, heads, bias=False)
+        self.to_out = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, rope):
+        B, T, _ = x.shape
+        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
+        q = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        
+        q = rope(q)
+        k = rope(k)
+        
+        dots = torch.einsum('b h i d, b h j d -> b h i j', q, k) * (self.head_dim ** -0.5)
+        dots = self.pre_softmax_proj(dots.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        attn = dots.softmax(dim=-1)
+        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = self.post_softmax_proj(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.embed_dim)
+        return self.dropout(self.to_out(out))
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, heads, dropout=0.1):
+        super().__init__()
+        self.attn = TalkingHeadsAttention(embed_dim, heads, dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm1 = nn.RMSNorm(embed_dim)
+        self.norm2 = nn.RMSNorm(embed_dim)
+
+    def forward(self, x, rope):
+        x = x + self.attn(self.norm1(x), rope=rope)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+class RotaryTransformerEncoder(nn.Module):
+    def __init__(self, embed_dim, depth, heads, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.depth = depth
+        self.heads = heads
+        head_dim = embed_dim // heads
+        self.rope = RotaryEmbedding(dim=head_dim)
+        self.layers = nn.ModuleList([
+            TransformerBlock(embed_dim, heads, dropout) for _ in range(depth)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x, rope=self.rope)
+        return x
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=8, heads=16):
+                 embed_dim=512, depth=8, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
-
         self.input_proj_stft = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.model = Encoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            rotary_pos_emb=True,
-            attn_pre_talking_heads=True,
-            attn_post_talking_heads=True
-        )
+        self.model = RotaryTransformerEncoder(embed_dim, depth, heads)
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft_mag, x_audio):
@@ -76,13 +155,11 @@ def loss_fn(pred_output,
             mixture_spec,
             target_vocal_audio,
             target_instr_audio,
-            stft_params_for_istft):
+            target_vocal_spec,
+            target_instr_spec,
+            stft_params_for_istft,
+            multi_res_complex_loss_calculator):
     device = pred_output.device
-    multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
-        fft_sizes=[1024, 2048, 8192],
-        hop_sizes=[256, 512, 2048],
-        win_lengths=[1024, 2048, 8192]
-    ).to(device)
 
     B, _, F_dim, T = pred_output.shape
     pred_masks = pred_output.view(B, 2, 4, F_dim, T)
@@ -98,22 +175,6 @@ def loss_fn(pred_output,
                              vR_cmask * mixture_spec[:, 1:2]], dim=1)
     i_spec_pred = torch.cat([iL_cmask * mixture_spec[:, 0:1],
                              iR_cmask * mixture_spec[:, 1:2]], dim=1)
-
-    target_vocal_spec = torch.stft(target_vocal_audio.view(-1, target_vocal_audio.shape[-1]),
-                                   n_fft=stft_params_for_istft['n_fft'],
-                                   hop_length=stft_params_for_istft['hop_length'],
-                                   window=stft_params_for_istft['window'].to(device),
-                                   return_complex=True,
-                                   center=True)
-    target_vocal_spec = target_vocal_spec.view(B, 2, F_dim, T)
-
-    target_instr_spec = torch.stft(target_instr_audio.view(-1, target_instr_audio.shape[-1]),
-                                   n_fft=stft_params_for_istft['n_fft'],
-                                   hop_length=stft_params_for_istft['hop_length'],
-                                   window=stft_params_for_istft['window'].to(device),
-                                   return_complex=True,
-                                   center=True)
-    target_instr_spec = target_instr_spec.view(B, 2, F_dim, T)
 
     spec_vocal_loss = F.l1_loss(v_spec_pred.real, target_vocal_spec.real) + \
                       F.l1_loss(v_spec_pred.imag, target_vocal_spec.imag)
@@ -232,8 +293,14 @@ class Dataset(Dataset):
 
         mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                   window=self.window, return_complex=True, center=True)
+        
+        target_vocal_spec = torch.stft(vocal_seg, n_fft=self.n_fft, hop_length=self.hop_length,
+                                  window=self.window, return_complex=True, center=True)
+        
+        target_instr_spec = torch.stft(instr_seg, n_fft=self.n_fft, hop_length=self.hop_length,
+                                  window=self.window, return_complex=True, center=True)
 
-        return mixture_spec, vocal_seg, instr_seg, mixture_seg
+        return mixture_spec, vocal_seg, instr_seg, mixture_seg, target_vocal_spec, target_instr_spec
 
 def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, checkpoint_path=None, window=None, reset_optimizer=False):
     model.to(device)
@@ -246,6 +313,12 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         'hop_length': 1024,
         'window': window.to(device)
     }
+
+    multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
+        fft_sizes=[1024, 2048, 8192],
+        hop_sizes=[256, 512, 2048],
+        win_lengths=[1024, 2048, 8192]
+    ).to(device)
 
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -263,13 +336,15 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     model.train()
     while True:
         for batch in dataloader:
-            mixture_spec, vocal_audio, instr_audio, mixture_audio = batch
+            mixture_spec, vocal_audio, instr_audio, mixture_audio, target_vocal_spec, target_instr_spec = batch
             
             mixture_mag = torch.abs(mixture_spec).to(device)
             mixture_spec = mixture_spec.to(device)
             vocal_audio = vocal_audio.to(device)
             instr_audio = instr_audio.to(device)
             mixture_audio = mixture_audio.to(device)
+            target_vocal_spec = target_vocal_spec.to(device)
+            target_instr_spec = target_instr_spec.to(device)
 
             optimizer.zero_grad()
             pred_masks = model(mixture_mag, mixture_audio)
@@ -278,7 +353,10 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                            mixture_spec,
                            vocal_audio,
                            instr_audio,
-                           stft_params_for_istft)
+                           target_vocal_spec,
+                           target_instr_spec,
+                           stft_params_for_istft,
+                           multi_res_complex_loss_calculator)
             
             if torch.isnan(loss).any():
                 print("NaN loss detected, skipping batch")
