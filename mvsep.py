@@ -9,104 +9,180 @@ from tqdm import tqdm
 from prodigyopt import Prodigy
 import random
 import math
-from titans_pytorch import NeuralMemory
+from typing import Optional, Tuple
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
+def _lengths_to_padding_mask(lengths: torch.Tensor) -> torch.Tensor:
+    b = lengths.shape[0]
+    t = int(torch.max(lengths).item())
+    return torch.arange(t, device=lengths.device, dtype=lengths.dtype).expand(b, t) >= lengths.unsqueeze(1)
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
+    return (x * cos) + (_rotate_half(x) * sin)
+
+def build_rotary_sin_cos(seq_len: int, dim: int, device: torch.device, base: float = 10000.0):
+    half = dim // 2
+    freq = torch.arange(half, device=device, dtype=torch.float32)
+    inv_freq = 1.0 / (base ** (freq / half))
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.einsum("t,f->tf", t, inv_freq)
+    sin = torch.sin(freqs)
+    cos = torch.cos(freqs)
+    sin = torch.cat([sin, sin], dim=-1).unsqueeze(0).unsqueeze(0)  # (1,1,T,dim)
+    cos = torch.cat([cos, cos], dim=-1).unsqueeze(0).unsqueeze(0)  # (1,1,T,dim)
+    return sin, cos
+
+class _ConvolutionModule(torch.nn.Module):
+    def __init__(self, input_dim: int, num_channels: int, depthwise_kernel_size: int, dropout: float = 0.0, bias: bool = False, use_group_norm: bool = False) -> None:
         super().__init__()
-        self.dim = dim
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.scale = nn.Parameter(torch.ones(1))
-
-    def forward(self, x):
-        seq_len = x.shape[-2]
-        device = x.device
-        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().unsqueeze(0).unsqueeze(1)
-        sin = emb.sin().unsqueeze(0).unsqueeze(1)
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        x_rot = torch.stack((-x2, x1), dim=-1).flatten(-2)
-        return x * cos + x_rot * sin * self.scale
-
-class TalkingHeadsAttention(nn.Module):
-    def __init__(self, embed_dim, heads, dropout=0.1):
-        super().__init__()
-        assert embed_dim % heads == 0, "Embedding dimension must be divisible by number of heads."
-        self.embed_dim = embed_dim
-        self.heads = heads
-        self.head_dim = embed_dim // heads
-        self.to_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.pre_softmax_proj = nn.Linear(heads, heads, bias=False)
-        self.post_softmax_proj = nn.Linear(heads, heads, bias=False)
-        self.to_out = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, rope):
-        B, T, _ = x.shape
-        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
-        q = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-        
-        q = rope(q)
-        k = rope(k)
-        
-        dots = torch.einsum('b h i d, b h j d -> b h i j', q, k) * (self.head_dim ** -0.5)
-        dots = self.pre_softmax_proj(dots.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        attn = dots.softmax(dim=-1)
-        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = self.post_softmax_proj(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        out = out.transpose(1, 2).contiguous().view(B, T, self.embed_dim)
-        return self.dropout(self.to_out(out))
-
-class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, heads, dropout=0.1):
-        super().__init__()
-        self.attn = TalkingHeadsAttention(embed_dim, heads, dropout)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim * 4, embed_dim),
-            nn.Dropout(dropout)
+        if (depthwise_kernel_size - 1) % 2 != 0:
+            raise ValueError("depthwise_kernel_size must be odd to achieve 'SAME' padding.")
+        self.layer_norm = torch.nn.LayerNorm(input_dim)
+        self.sequential = torch.nn.Sequential(
+            torch.nn.Conv1d(input_dim, 2 * num_channels, 1, stride=1, padding=0, bias=bias),
+            torch.nn.GLU(dim=1),
+            torch.nn.Conv1d(num_channels, num_channels, depthwise_kernel_size, stride=1, padding=(depthwise_kernel_size - 1) // 2, groups=num_channels, bias=bias),
+            (torch.nn.GroupNorm(num_groups=1, num_channels=num_channels) if use_group_norm else torch.nn.BatchNorm1d(num_channels)),
+            torch.nn.SiLU(),
+            torch.nn.Conv1d(num_channels, input_dim, kernel_size=1, stride=1, padding=0, bias=bias),
+            torch.nn.Dropout(dropout),
         )
-        self.norm1 = nn.RMSNorm(embed_dim)
-        self.norm2 = nn.RMSNorm(embed_dim)
 
-    def forward(self, x, rope):
-        x = x + self.attn(self.norm1(x), rope=rope)
-        x = x + self.ffn(self.norm2(x))
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        x = self.layer_norm(input)
+        x = x.transpose(1, 2)
+        x = self.sequential(x)
+        return x.transpose(1, 2)
+
+class _FeedForwardModule(torch.nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.sequential = torch.nn.Sequential(
+            torch.nn.LayerNorm(input_dim),
+            torch.nn.Linear(input_dim, hidden_dim, bias=True),
+            torch.nn.SiLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, input_dim, bias=True),
+            torch.nn.Dropout(dropout),
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return self.sequential(input)
+
+class RotaryMHA(torch.nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for rotary embedding.")
+        self.q_proj = torch.nn.Linear(embed_dim, embed_dim, bias=True)
+        self.k_proj = torch.nn.Linear(embed_dim, embed_dim, bias=True)
+        self.v_proj = torch.nn.Linear(embed_dim, embed_dim, bias=True)
+        self.out_proj = torch.nn.Linear(embed_dim, embed_dim, bias=True)
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        T, B, D = x.shape
+        H, Hd = self.num_heads, self.head_dim
+
+        q = self.q_proj(x).view(T, B, H, Hd).permute(1, 2, 0, 3)  # B,H,T,Hd
+        k = self.k_proj(x).view(T, B, H, Hd).permute(1, 2, 0, 3)  # B,H,T,Hd
+        v = self.v_proj(x).view(T, B, H, Hd).permute(1, 2, 0, 3)  # B,H,T,Hd
+
+        sin, cos = build_rotary_sin_cos(T, Hd, x.device)
+        q = apply_rotary_pos_emb(q, sin, cos)
+        k = apply_rotary_pos_emb(k, sin, cos)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (Hd ** 0.5)  # B,H,T,T
+
+        if key_padding_mask is not None:
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(1)  # B,1,1,T
+            attn_scores = attn_scores.masked_fill(mask, float("-inf"))
+
+        attn = torch.softmax(attn_scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)  # B,H,T,Hd
+        out = out.permute(2, 0, 1, 3).contiguous().view(T, B, D)  # T,B,D
+        out = self.out_proj(out)
+        return out
+
+class ConformerLayer(torch.nn.Module):
+    def __init__(self, input_dim: int, ffn_dim: int, num_attention_heads: int, depthwise_conv_kernel_size: int, dropout: float = 0.0, use_group_norm: bool = False, convolution_first: bool = False) -> None:
+        super().__init__()
+        self.ffn1 = _FeedForwardModule(input_dim, ffn_dim, dropout=dropout)
+        self.self_attn_layer_norm = torch.nn.LayerNorm(input_dim)
+        self.self_attn = RotaryMHA(input_dim, num_attention_heads, dropout=dropout)
+        self.self_attn_dropout = torch.nn.Dropout(dropout)
+        self.conv_module = _ConvolutionModule(input_dim=input_dim, num_channels=input_dim, depthwise_kernel_size=depthwise_conv_kernel_size, dropout=dropout, bias=True, use_group_norm=use_group_norm)
+        self.ffn2 = _FeedForwardModule(input_dim, ffn_dim, dropout=dropout)
+        self.final_layer_norm = torch.nn.LayerNorm(input_dim)
+        self.convolution_first = convolution_first
+
+    def _apply_convolution(self, input: torch.Tensor) -> torch.Tensor:
+        residual = input
+        input = input.transpose(0, 1)
+        input = self.conv_module(input)
+        input = input.transpose(0, 1)
+        return residual + input
+
+    def forward(self, input: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        residual = input
+        x = self.ffn1(input)
+        x = x * 0.5 + residual
+
+        if self.convolution_first:
+            x = self._apply_convolution(x)
+
+        residual = x
+        x = self.self_attn_layer_norm(x)
+        x = self.self_attn(x, key_padding_mask)
+        x = self.self_attn_dropout(x)
+        x = x + residual
+
+        if not self.convolution_first:
+            x = self._apply_convolution(x)
+
+        residual = x
+        x = self.ffn2(x)
+        x = x * 0.5 + residual
+        x = self.final_layer_norm(x)
         return x
 
-class RotaryTransformerEncoder(nn.Module):
-    def __init__(self, embed_dim, depth, heads, dropout=0.1):
+class Conformer(torch.nn.Module):
+    def __init__(self, input_dim: int, num_heads: int, ffn_dim: int, num_layers: int, depthwise_conv_kernel_size: int, dropout: float = 0.0, use_group_norm: bool = False, convolution_first: bool = False):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.depth = depth
-        self.heads = heads
-        head_dim = embed_dim // heads
-        self.rope = RotaryEmbedding(dim=head_dim)
-        self.mem = NeuralMemory(
-            dim = embed_dim,
-            chunk_size = 64
+        self.conformer_layers = torch.nn.ModuleList(
+            [
+                ConformerLayer(
+                    input_dim,
+                    ffn_dim,
+                    num_heads,
+                    depthwise_conv_kernel_size,
+                    dropout=dropout,
+                    use_group_norm=use_group_norm,
+                    convolution_first=convolution_first,
+                )
+                for _ in range(num_layers)
+            ]
         )
-        self.layers = nn.ModuleList([
-            TransformerBlock(embed_dim, heads, dropout) for _ in range(depth)
-        ])
 
-    def forward(self, x):
-        x, _ = self.mem(x)
-        for layer in self.layers:
-            x = layer(x, rope=self.rope)
-        return x
+    def forward(self, input: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        encoder_padding_mask = _lengths_to_padding_mask(lengths)
+        x = input.transpose(0, 1)
+        for layer in self.conformer_layers:
+            x = layer(x, encoder_padding_mask)
+        return x.transpose(0, 1), lengths
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=8, heads=8):
+                 embed_dim=512):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -114,14 +190,22 @@ class NeuralModel(nn.Module):
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
         self.input_proj_stft = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.model = RotaryTransformerEncoder(embed_dim, depth, heads)
+        self.model = Conformer(
+            input_dim=embed_dim,
+            num_heads=8,
+            ffn_dim=embed_dim * 4,
+            num_layers=8,
+            dropout=0.1,
+            depthwise_conv_kernel_size=31
+        )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft_mag, x_audio):
         B, C, F, T = x_stft_mag.shape
         x_stft_mag = x_stft_mag.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj_stft(x_stft_mag)
-        x = self.model(x)
+        lengths = torch.full((B,), T, dtype=torch.long, device=x.device)
+        x, _ = self.model(x, lengths)
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
@@ -511,7 +595,7 @@ def main():
         train_dataset = Dataset(root_dir=args.data_dir,
                                       segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                       num_workers=16, pin_memory=False, persistent_workers=True)
+                                       num_workers=16, pin_memory=True, persistent_workers=True)
         train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window, reset_optimizer=args.reset_optimizer)
     elif args.infer:
         if args.input_file is None:
