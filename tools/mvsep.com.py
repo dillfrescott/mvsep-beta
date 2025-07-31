@@ -6,104 +6,10 @@ import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
 import math
-from titans_pytorch import NeuralMemory
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.scale = nn.Parameter(torch.ones(1))
-
-    def forward(self, x):
-        seq_len = x.shape[-2]
-        device = x.device
-        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().unsqueeze(0).unsqueeze(1)
-        sin = emb.sin().unsqueeze(0).unsqueeze(1)
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        x_rot = torch.stack((-x2, x1), dim=-1).flatten(-2)
-        return x * cos + x_rot * sin * self.scale
-
-class TalkingHeadsAttention(nn.Module):
-    def __init__(self, embed_dim, heads, dropout=0.1):
-        super().__init__()
-        assert embed_dim % heads == 0, "Embedding dimension must be divisible by number of heads."
-        self.embed_dim = embed_dim
-        self.heads = heads
-        self.head_dim = embed_dim // heads
-        self.to_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.pre_softmax_proj = nn.Linear(heads, heads, bias=False)
-        self.post_softmax_proj = nn.Linear(heads, heads, bias=False)
-        self.to_out = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, rope):
-        B, T, _ = x.shape
-        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
-        q = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-        
-        q = rope(q)
-        k = rope(k)
-        
-        dots = torch.einsum('b h i d, b h j d -> b h i j', q, k) * (self.head_dim ** -0.5)
-        dots = self.pre_softmax_proj(dots.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        attn = dots.softmax(dim=-1)
-        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = self.post_softmax_proj(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        out = out.transpose(1, 2).contiguous().view(B, T, self.embed_dim)
-        return self.dropout(self.to_out(out))
-
-class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, heads, dropout=0.1):
-        super().__init__()
-        self.attn = TalkingHeadsAttention(embed_dim, heads, dropout)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim * 4, embed_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm1 = nn.RMSNorm(embed_dim)
-        self.norm2 = nn.RMSNorm(embed_dim)
-
-    def forward(self, x, rope):
-        x = x + self.attn(self.norm1(x), rope=rope)
-        x = x + self.ffn(self.norm2(x))
-        return x
-
-class RotaryTransformerEncoder(nn.Module):
-    def __init__(self, embed_dim, depth, heads, dropout=0.1):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.depth = depth
-        self.heads = heads
-        head_dim = embed_dim // heads
-        self.rope = RotaryEmbedding(dim=head_dim)
-        self.mem = NeuralMemory(
-            dim = embed_dim,
-            chunk_size = 64
-        )
-        self.layers = nn.ModuleList([
-            TransformerBlock(embed_dim, heads, dropout) for _ in range(depth)
-        ])
-
-    def forward(self, x):
-        x, _ = self.mem(x)
-        for layer in self.layers:
-            x = layer(x, rope=self.rope)
-        return x
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=8, heads=8):
+                 embed_dim=512):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -111,14 +17,22 @@ class NeuralModel(nn.Module):
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
         self.input_proj_stft = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.model = RotaryTransformerEncoder(embed_dim, depth, heads)
+        self.model = torchaudio.models.Conformer(
+            input_dim=embed_dim,
+            num_heads=8,
+            ffn_dim=embed_dim * 4,
+            num_layers=8,
+            dropout=0.1,
+            depthwise_conv_kernel_size=31
+        )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft_mag, x_audio):
         B, C, F, T = x_stft_mag.shape
         x_stft_mag = x_stft_mag.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj_stft(x_stft_mag)
-        x = self.model(x)
+        lengths = torch.full((B,), T, dtype=torch.long, device=x.device)
+        x, _ = self.model(x, lengths)
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)

@@ -12,10 +12,6 @@ furnished to do so, subject to the following conditions:
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
 
-The Software includes a modified version of the Conformer model architecture,
-which is originally from torchaudio (BSD 2-Clause License, © 2017 Facebook Inc. (Soumith Chintala)).
-The architecture was modified by Cross Nastasi to include rotary positional embeddings (RoPE).
-
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
