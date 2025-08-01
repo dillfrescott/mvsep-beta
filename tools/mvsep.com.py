@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
 import math
+from conformer import Conformer
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
@@ -17,13 +18,17 @@ class NeuralModel(nn.Module):
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
         self.input_proj_stft = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.model = torchaudio.models.Conformer(
-            input_dim=embed_dim,
-            num_heads=8,
-            ffn_dim=embed_dim * 4,
-            num_layers=8,
-            dropout=0.1,
-            depthwise_conv_kernel_size=31
+        self.model = Conformer(
+            dim = embed_dim,
+            depth = 8,
+            dim_head = 64,
+            heads = 8,
+            ff_mult = 4,
+            conv_expansion_factor = 2,
+            conv_kernel_size = 31,
+            attn_dropout = 0.1,
+            ff_dropout = 0.1,
+            conv_dropout = 0.1
         )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
@@ -31,8 +36,7 @@ class NeuralModel(nn.Module):
         B, C, F, T = x_stft_mag.shape
         x_stft_mag = x_stft_mag.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj_stft(x_stft_mag)
-        lengths = torch.full((B,), T, dtype=torch.long, device=x.device)
-        x, _ = self.model(x, lengths)
+        x = self.model(x)
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
