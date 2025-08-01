@@ -38,27 +38,26 @@ class NeuralModel(nn.Module):
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
-def inference(model, checkpoint_path, input_dir, output_dir,
-              chunk_size=529200, overlap=88200, device='cpu'):
+def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=352800, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval().to(device)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    input_files = [f for f in os.listdir(input_dir) if f.endswith('.wav')]
+    input_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.wav', '.flac'))]
     input_files.sort()
 
     for filename in input_files:
-        input_wav_path = os.path.join(input_dir, filename)
+        input_path = os.path.join(input_dir, filename)
         wav_name = os.path.splitext(filename)[0]
         song_output_dir = os.path.join(output_dir, wav_name)
         os.makedirs(song_output_dir, exist_ok=True)
-        
+
         output_instrumental_path = os.path.join(song_output_dir, 'instrumental.flac')
         output_vocal_path = os.path.join(song_output_dir, 'vocals.flac')
 
-        input_audio, sr = torchaudio.load(input_wav_path)
+        input_audio, sr = torchaudio.load(input_path)
         if sr != 44100:
             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=44100)
             input_audio = resampler(input_audio)
@@ -66,6 +65,7 @@ def inference(model, checkpoint_path, input_dir, output_dir,
         if input_audio.shape[0] == 1:
             input_audio = input_audio.repeat(2, 1)
         elif input_audio.shape[0] != 2:
+            print(f"Skipping {filename}: unsupported channels {input_audio.shape[0]}")
             continue
         input_audio = input_audio.to(device)
 
@@ -97,8 +97,7 @@ def inference(model, checkpoint_path, input_dir, output_dir,
                         pbar.update(1)
                         continue
 
-                spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length,
-                                  window=window, return_complex=True, center=True)
+                spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
                 mag = torch.abs(spec)
 
                 with torch.no_grad():
@@ -118,10 +117,8 @@ def inference(model, checkpoint_path, input_dir, output_dir,
                 instrumental_spec = torch.stack([iL_cmask * spec[0], iR_cmask * spec[1]], dim=0)
                 vocal_spec = torch.stack([vL_cmask * spec[0], vR_cmask * spec[1]], dim=0)
 
-                vocal_chunk = torch.istft(vocal_spec, n_fft=n_fft, hop_length=hop_length,
-                                          window=window, length=L, center=True)
-                inst_chunk = torch.istft(instrumental_spec, n_fft=n_fft, hop_length=hop_length,
-                                         window=window, length=L, center=True)
+                vocal_chunk = torch.istft(vocal_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=L, center=True)
+                inst_chunk = torch.istft(instrumental_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=L, center=True)
 
                 if i == 0:
                     vocals[:, :L] = vocal_chunk
@@ -160,8 +157,7 @@ def main():
     model = NeuralModel()
 
     if args.infer:
-        inference(model, args.checkpoint_path, args.input_dir,
-                  args.output_dir, device=device)
+        inference(model, args.checkpoint_path, args.input_dir, args.output_dir, device=device)
 
 if __name__ == '__main__':
     main()
