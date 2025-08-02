@@ -435,7 +435,7 @@ def main():
         if args.input_file is None:
             print("Please specify an input audio file for inference using --input_file")
             return
-        inference(model, args.checkpoint_path, args.input_file, args.output_instrumental, args.output_vocal, device=device)
+        inference(model, args.checkpoint_path, args.input_file, args.output_instrumental, args.output_vocal, chunk_size=args.segment_length, device=device)
     else:
         print("Please specify either --train or --infer")
 
