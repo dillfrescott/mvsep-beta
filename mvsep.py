@@ -262,13 +262,13 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         for batch in dataloader:
             mixture_spec, vocal_audio, instr_audio, mixture_audio, target_vocal_spec, target_instr_spec = batch
             
-            mixture_mag = torch.abs(mixture_spec).to(device)
-            mixture_spec = mixture_spec.to(device)
-            vocal_audio = vocal_audio.to(device)
-            instr_audio = instr_audio.to(device)
-            mixture_audio = mixture_audio.to(device)
-            target_vocal_spec = target_vocal_spec.to(device)
-            target_instr_spec = target_instr_spec.to(device)
+            mixture_mag = torch.abs(mixture_spec).to(device, non_blocking=True)
+            mixture_spec = mixture_spec.to(device, non_blocking=True)
+            vocal_audio = vocal_audio.to(device, non_blocking=True)
+            instr_audio = instr_audio.to(device, non_blocking=True)
+            mixture_audio = mixture_audio.to(device, non_blocking=True)
+            target_vocal_spec = target_vocal_spec.to(device, non_blocking=True)
+            target_instr_spec = target_instr_spec.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             pred_masks = model(mixture_mag, mixture_audio)
@@ -429,7 +429,7 @@ def main():
         train_dataset = Dataset(root_dir=args.data_dir,
                                       segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                       num_workers=16, pin_memory=False, persistent_workers=True)
+                                       num_workers=16, pin_memory=True, persistent_workers=True)
         train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=args.checkpoint_path, window=window, reset_optimizer=args.reset_optimizer)
     elif args.infer:
         if args.input_file is None:
