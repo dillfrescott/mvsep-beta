@@ -1,5 +1,7 @@
 torch
 torchaudio
+conformer
 prodigyopt
 soundfile
 tqdm
+
