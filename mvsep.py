@@ -346,7 +346,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if step > 0 else loss.item()
+            avg_loss = 0.999 * avg_loss + 0.001 * loss.item() if step > 0 else loss.item()
             step += 1
             progress_bar.update(1)
             progress_bar.set_description(f"Step {step} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - Best SDR: {best_sdr:.4f}")
