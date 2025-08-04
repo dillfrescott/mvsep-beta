@@ -381,18 +381,22 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 
                 best_sdr_checkpoints.sort(key=lambda x: x[0])
 
-                if len(best_sdr_checkpoints) < 3 or avg_combined_sdr > best_sdr_checkpoints[0][0]:
+                current_best_sdr = best_sdr_checkpoints[-1][0] if best_sdr_checkpoints else -float('inf')
+                if avg_combined_sdr > current_best_sdr:
                     best_sdr = max(best_sdr, avg_combined_sdr)
                     checkpoint_payload['best_sdr'] = best_sdr
                     
+                    for _, path in best_sdr_checkpoints:
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+
                     best_ckpt_filename = f"best_ckpts/checkpoint_step_{step}_sdr_{avg_combined_sdr:.4f}.pt"
                     torch.save(checkpoint_payload, best_ckpt_filename)
-                    print(f"New top-3 SDR! Saved checkpoint: {best_ckpt_filename}\n")
-
-                    if len(best_sdr_checkpoints) >= 3:
-                        os.remove(best_sdr_checkpoints[0][1])
+                    print(f"New best SDR! Saved checkpoint: {best_ckpt_filename}\n")
                 else:
-                    print(f"SDR not in top 3. Best SDR remains {best_sdr:.4f}\n")
+                    print(f"SDR did not improve. Best SDR remains {best_sdr:.4f}\n")
                 
                 model.train()
 
@@ -524,7 +528,6 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    # The NeuralModel class and other dependencies are assumed to be defined elsewhere in the script
     model = NeuralModel() 
     optimizer = Prodigy(model.parameters(), lr=1.0)
 
