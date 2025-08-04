@@ -396,6 +396,22 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 
                 model.train()
 
+def find_best_sdr_checkpoint(folder='best_ckpts'):
+    if not os.path.exists(folder) or not os.listdir(folder):
+        return None
+
+    best_sdr = -float('inf')
+    best_ckpt = None
+    for f in os.listdir(folder):
+        if f.endswith('.pt'):
+            match = re.search(r"sdr_([\d\.]+)\.pt", f)
+            if match:
+                sdr = float(match.group(1))
+                if sdr > best_sdr:
+                    best_sdr = sdr
+                    best_ckpt = os.path.join(folder, f)
+    return best_ckpt
+
 def inference(model, checkpoint_path, input_data, output_instrumental_path, output_vocal_path,
               chunk_size=485100, overlap=88200, device='cpu', return_tensors=False):
     if checkpoint_path:
@@ -469,36 +485,20 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
         torchaudio.save(output_vocal_path, vocals.cpu().clamp(-1.0, 1.0), 44100)
         torchaudio.save(output_instrumental_path, instrumentals.cpu().clamp(-1.0, 1.0), 44100)
 
-def find_latest_checkpoint(folder):
-    ckpt_files = [f for f in os.listdir(folder) if f.endswith('.pt')]
-    if not ckpt_files:
-        return None
-
-    latest_step = -1
-    latest_ckpt = None
-    for f in ckpt_files:
-        match = re.search(r'step_(\d+)', f)
-        if match:
-            step = int(match.group(1))
-            if step > latest_step:
-                latest_step = step
-                latest_ckpt = os.path.join(folder, f)
-    return latest_ckpt
-
 def main():
-    parser = argparse.ArgumentParser(description='Train a model for instrumental separation')
-    parser.add_argument('--train', action='store_true', help='Train the model')
-    parser.add_argument('--infer', action='store_true', help='Inference mode')
-    parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
-    parser.add_argument('--test_dir', type=str, default='test', help='Path to test dataset for validation')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save checkpoint every X steps')
-    parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from. Overrides auto-resume.')
-    parser.add_argument('--input_file', type=str, default=None, help='Path to input audio file for inference (wav or flac)')
-    parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
-    parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path to output vocal WAV file')
-    parser.add_argument('--segment_length', type=int, default=485100, help='Segment length for training')
-    parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint')
+    parser = argparse.ArgumentParser(description='Train or run inference on a source separation model.')
+    parser.add_argument('--train', action='store_true', help='Train the model.')
+    parser.add_argument('--infer', action='store_true', help='Run inference.')
+    parser.add_argument('--data_dir', type=str, default='train', help='Path to the training dataset.')
+    parser.add_argument('--test_dir', type=str, default='test', help='Path to the test dataset for validation.')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training.')
+    parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save a checkpoint every X steps.')
+    parser.add_argument('--checkpoint_path', type=str, default=None, help='Specific checkpoint path to resume training or for inference. Overrides automatic selection.')
+    parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
+    parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
+    parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
+    parser.add_argument('--segment_length', type=int, default=485100, help='Audio segment length for training and inference chunk size.')
+    parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     args = parser.parse_args()
 
     os.makedirs('ckpts', exist_ok=True)
@@ -506,7 +506,8 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel()
+    # The NeuralModel class and other dependencies are assumed to be defined elsewhere in the script
+    model = NeuralModel() 
     optimizer = Prodigy(model.parameters(), lr=1.0)
 
     if args.train:
@@ -519,16 +520,27 @@ def main():
         train_dataset = Dataset(root_dir=args.data_dir, segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, pin_memory=True, persistent_workers=True)
         train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
+    
     elif args.infer:
         if not args.input_file:
-            print("Please specify an input audio file for inference using --input_file")
+            print("Error: --input_file is required for inference.")
             return
-        if not args.checkpoint_path:
-            print("Please specify a checkpoint path for inference using --checkpoint_path")
-            return
-        inference(model, args.checkpoint_path, args.input_file, args.output_instrumental, args.output_vocal, chunk_size=args.segment_length, device=device)
+
+        checkpoint_to_load = args.checkpoint_path
+        if not checkpoint_to_load:
+            checkpoint_to_load = find_best_sdr_checkpoint('best_ckpts')
+            if checkpoint_to_load:
+                print(f"No checkpoint specified. Automatically using best SDR checkpoint: {checkpoint_to_load}")
+            else:
+                print("Error: No checkpoint specified with --checkpoint_path and no best SDR checkpoint was found in 'best_ckpts/'.")
+                return
+        else:
+            print(f"Using specified checkpoint: {checkpoint_to_load}")
+        
+        inference(model, checkpoint_to_load, args.input_file, args.output_instrumental, args.output_vocal, chunk_size=args.segment_length, device=device)
+    
     else:
-        print("Please specify either --train or --infer")
+        print("Please specify either --train or --infer.")
 
 if __name__ == '__main__':
     main()
