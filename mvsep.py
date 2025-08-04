@@ -396,6 +396,24 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 
                 model.train()
 
+def find_latest_checkpoint(folder='ckpts'):
+    if not os.path.exists(folder) or not os.listdir(folder):
+        return None
+
+    checkpoints = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.pt')]
+    if not checkpoints:
+        return None
+
+    def get_step_from_path(path):
+        filename = os.path.basename(path)
+        match = re.search(r'step_(\d+)', filename)
+        if match:
+            return int(match.group(1))
+        return 0
+
+    latest_checkpoint = max(checkpoints, key=get_step_from_path)
+    return latest_checkpoint
+
 def find_best_sdr_checkpoint(folder='best_ckpts'):
     if not os.path.exists(folder) or not os.listdir(folder):
         return None
