@@ -302,8 +302,8 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     avg_loss = 0.0
     
     best_sdr = -float('inf')
-    if os.path.exists('best_ckpt') and os.listdir('best_ckpt'):
-        sdr_values = [float(re.search(r"sdr_([\d\.]+)\.pt", f).group(1)) for f in os.listdir('best_ckpt') if re.search(r"sdr_([\d\.]+)\.pt", f)]
+    if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
+        sdr_values = [float(re.search(r"sdr_([\d\.]+)\.pt", f).group(1)) for f in os.listdir('best_ckpts') if re.search(r"sdr_([\d\.]+)\.pt", f)]
         if sdr_values:
             best_sdr = max(sdr_values)
 
@@ -372,12 +372,12 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 print(f"\nValidation Step {step}: Vocal SDR: {avg_vocal_sdr:.4f}, Instr SDR: {avg_instr_sdr:.4f}, Combined SDR: {avg_combined_sdr:.4f}")
 
                 best_sdr_checkpoints = []
-                if os.path.exists('best_ckpt'):
-                    for f in os.listdir('best_ckpt'):
+                if os.path.exists('best_ckpts'):
+                    for f in os.listdir('best_ckpts'):
                         match = re.search(r"sdr_([\d\.]+)\.pt", f)
                         if match:
                             sdr = float(match.group(1))
-                            best_sdr_checkpoints.append((sdr, os.path.join('best_ckpt', f)))
+                            best_sdr_checkpoints.append((sdr, os.path.join('best_ckpts', f)))
                 
                 best_sdr_checkpoints.sort(key=lambda x: x[0])
 
@@ -385,7 +385,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                     best_sdr = max(best_sdr, avg_combined_sdr)
                     checkpoint_payload['best_sdr'] = best_sdr
                     
-                    best_ckpt_filename = f"best_ckpt/checkpoint_step_{step}_sdr_{avg_combined_sdr:.4f}.pt"
+                    best_ckpt_filename = f"best_ckpts/checkpoint_step_{step}_sdr_{avg_combined_sdr:.4f}.pt"
                     torch.save(checkpoint_payload, best_ckpt_filename)
                     print(f"New top-3 SDR! Saved checkpoint: {best_ckpt_filename}\n")
 
@@ -492,7 +492,7 @@ def main():
     parser.add_argument('--data_dir', type=str, default='train', help='Path to training dataset')
     parser.add_argument('--test_dir', type=str, default='test', help='Path to test dataset for validation')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--checkpoint_steps', type=int, default=2000, help='Save checkpoint every X steps')
+    parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from. Overrides auto-resume.')
     parser.add_argument('--input_file', type=str, default=None, help='Path to input audio file for inference (wav or flac)')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
@@ -502,7 +502,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs('ckpts', exist_ok=True)
-    os.makedirs('best_ckpt', exist_ok=True)
+    os.makedirs('best_ckpts', exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
