@@ -383,7 +383,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
                 current_best_sdr = best_sdr_checkpoints[-1][0] if best_sdr_checkpoints else -float('inf')
                 if avg_combined_sdr > current_best_sdr:
-                    best_sdr = max(best_sdr, avg_combined_sdr)
+                    best_sdr = avg_combined_sdr
                     
                     for _, path in best_sdr_checkpoints:
                         try:
