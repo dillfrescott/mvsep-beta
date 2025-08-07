@@ -319,7 +319,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
         step = checkpoint_data.get('step', 0)
         avg_loss = checkpoint_data.get('avg_loss', 0.0)
-        best_sdr = max(best_sdr, checkpoint_data.get('best_sdr', -float('inf')))
+        
         if not reset_optimizer and 'optimizer_state_dict' in checkpoint_data:
             optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
             print(f"Resuming training from step {step}. MODEL AND OPTIMIZER LOADED.")
@@ -354,7 +354,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             if step > 0 and step % checkpoint_steps == 0:
                 checkpoint_payload = {
                     'step': step, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
-                    'avg_loss': avg_loss, 'best_sdr': best_sdr
+                    'avg_loss': avg_loss
                 }
 
                 reg_checkpoint_path = f"ckpts/checkpoint_step_{step}.pt"
@@ -384,7 +384,6 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 current_best_sdr = best_sdr_checkpoints[-1][0] if best_sdr_checkpoints else -float('inf')
                 if avg_combined_sdr > current_best_sdr:
                     best_sdr = max(best_sdr, avg_combined_sdr)
-                    checkpoint_payload['best_sdr'] = best_sdr
                     
                     for _, path in best_sdr_checkpoints:
                         try:
