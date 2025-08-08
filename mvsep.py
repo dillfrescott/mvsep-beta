@@ -489,8 +489,14 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
             inst_chunk = torch.istft(instrumental_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=L, center=True)
 
             fade_window = torch.ones(L, device=device)
-            if i > 0: fade_window[:overlap] = torch.linspace(0, 1, overlap, device=device)
-            if start + L < total_length: fade_window[-overlap:] = torch.linspace(1, 0, overlap, device=device)
+
+            effective_overlap = min(L, overlap)
+
+            if i > 0:
+                fade_window[:effective_overlap] = torch.linspace(0, 1, effective_overlap, device=device)
+            
+            if start + L < total_length:
+                fade_window[-effective_overlap:] = torch.linspace(1, 0, effective_overlap, device=device)
 
             vocals[:, start:end] += vocal_chunk * fade_window
             instrumentals[:, start:end] += inst_chunk * fade_window
