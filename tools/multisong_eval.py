@@ -42,8 +42,7 @@ class NeuralModel(nn.Module):
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
-def inference(model, checkpoint_path, input_dir, output_dir,
-              chunk_size=485100, overlap=88200, device='cpu'):
+def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=485100, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval().to(device)
@@ -71,43 +70,30 @@ def inference(model, checkpoint_path, input_dir, output_dir,
         total_length = input_audio.shape[1]
         vocals = torch.zeros_like(input_audio)
         instrumentals = torch.zeros_like(input_audio)
+        sum_fade_windows = torch.zeros(total_length, device=device)
 
-        n_fft = 4096
-        hop_length = 1024
+        n_fft, hop_length = 4096, 1024
         window = torch.hann_window(n_fft).to(device)
-        min_chunk = n_fft
+        step_size = chunk_size - overlap
 
-        step_size = max(1, chunk_size - overlap)
-        cross_fade = overlap // 2
-        num_chunks = math.ceil(max(0, total_length - overlap) / step_size)
+        with tqdm(total=math.ceil(total_length / step_size), desc=f"Processing {filename}", leave=False) as pbar:
+            for start in range(0, total_length, step_size):
+                end = min(start + chunk_size, total_length)
+                chunk, L = input_audio[:, start:end], end - start
 
-        with tqdm(total=num_chunks, desc=f"Processing {filename}") as pbar:
-            for i in range(0, total_length, step_size):
-                end = min(i + chunk_size, total_length)
-                chunk = input_audio[:, i:end]
-                L = chunk.shape[1]
+                if L < n_fft:
+                    pbar.update(1)
+                    continue
 
-                if L < min_chunk:
-                    if i == 0:
-                        pad_amt = min_chunk - L
-                        chunk = F.pad(chunk, (0, pad_amt))
-                        L = chunk.shape[1]
-                    else:
-                        pbar.update(1)
-                        continue
-
-                spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length,
-                                  window=window, return_complex=True, center=True)
+                spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
                 mag = torch.abs(spec)
 
                 with torch.no_grad():
-                    pred_output = model(mag.unsqueeze(0), chunk.unsqueeze(0))
-                pred_output = pred_output.squeeze(0)
+                    pred_output = model(mag.unsqueeze(0), chunk.unsqueeze(0)).squeeze(0)
 
                 _, F_spec, T_spec = pred_output.shape
                 pred_masks = pred_output.view(2, 4, F_spec, T_spec)
-                pred_masks_real = pred_masks[0]
-                pred_masks_imag = pred_masks[1]
+                pred_masks_real, pred_masks_imag = pred_masks[0], pred_masks[1]
 
                 vL_cmask = pred_masks_real[0] + 1j * pred_masks_imag[0]
                 vR_cmask = pred_masks_real[1] + 1j * pred_masks_imag[1]
@@ -117,35 +103,28 @@ def inference(model, checkpoint_path, input_dir, output_dir,
                 instrumental_spec = torch.stack([iL_cmask * spec[0], iR_cmask * spec[1]], dim=0)
                 vocal_spec = torch.stack([vL_cmask * spec[0], vR_cmask * spec[1]], dim=0)
 
-                vocal_chunk = torch.istft(vocal_spec, n_fft=n_fft, hop_length=hop_length,
-                                          window=window, length=L, center=True)
-                inst_chunk = torch.istft(instrumental_spec, n_fft=n_fft, hop_length=hop_length,
-                                         window=window, length=L, center=True)
+                vocal_chunk = torch.istft(vocal_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=L, center=True)
+                inst_chunk = torch.istft(instrumental_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=L, center=True)
 
-                if i == 0:
-                    vocals[:, :L] = vocal_chunk
-                    instrumentals[:, :L] = inst_chunk
-                else:
-                    fade_in = torch.linspace(0, 1, cross_fade, device=device)
-                    fade_out = 1 - fade_in
-                    ov_end = min(i + cross_fade, total_length)
-                    actual = ov_end - i
+                fade_window = torch.ones(L, device=device)
+                effective_overlap = min(L, overlap)
 
-                    vocals[:, i:ov_end] = vocals[:, i:ov_end] * fade_out[:actual] + vocal_chunk[:, :actual] * fade_in[:actual]
-                    instrumentals[:, i:ov_end] = instrumentals[:, i:ov_end] * fade_out[:actual] + inst_chunk[:, :actual] * fade_in[:actual]
+                if start > 0:
+                    fade_window[:effective_overlap] = torch.linspace(0, 1, effective_overlap, device=device)
+                
+                if start + L < total_length:
+                    fade_window[-effective_overlap:] = torch.linspace(1, 0, effective_overlap, device=device)
 
-                    tail_start = i + cross_fade
-                    tail_end = min(i + L, total_length)
-                    if tail_start < tail_end:
-                        vocals[:, tail_start:tail_end] = vocal_chunk[:, tail_start - i:tail_end - i]
-                        instrumentals[:, tail_start:tail_end] = inst_chunk[:, tail_start - i:tail_end - i]
-
+                vocals[:, start:end] += vocal_chunk * fade_window
+                instrumentals[:, start:end] += inst_chunk * fade_window
+                sum_fade_windows[start:end] += fade_window**2
                 pbar.update(1)
 
-        vocals = vocals[:, :total_length].clamp(-1.0, 1.0)
-        instrumentals = instrumentals[:, :total_length].clamp(-1.0, 1.0)
-        torchaudio.save(output_vocal_path, vocals.cpu(), sr, format='flac')
-        torchaudio.save(output_instrumental_path, instrumentals.cpu(), sr, format='flac')
+        vocals /= (sum_fade_windows.sqrt() + 1e-8)
+        instrumentals /= (sum_fade_windows.sqrt() + 1e-8)
+
+        torchaudio.save(output_vocal_path, vocals.cpu().clamp(-1.0, 1.0), sr, format='flac')
+        torchaudio.save(output_instrumental_path, instrumentals.cpu().clamp(-1.0, 1.0), sr, format='flac')
 
 def main():
     parser = argparse.ArgumentParser()
