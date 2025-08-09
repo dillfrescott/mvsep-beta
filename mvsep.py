@@ -115,10 +115,10 @@ def loss_fn(pred_output,
     i_spec_pred = torch.cat([iL_cmask * mixture_spec[:, 0:1],
                              iR_cmask * mixture_spec[:, 1:2]], dim=1)
 
-    spec_vocal_loss = F.mse_loss(v_spec_pred.real, target_vocal_spec.real) + \
-                      F.mse_loss(v_spec_pred.imag, target_vocal_spec.imag)
-    spec_instr_loss = F.mse_loss(i_spec_pred.real, target_instr_spec.real) + \
-                      F.mse_loss(i_spec_pred.imag, target_instr_spec.imag)
+    spec_vocal_loss = F.l1_loss(v_spec_pred.real, target_vocal_spec.real) + \
+                      F.l1_loss(v_spec_pred.imag, target_vocal_spec.imag)
+    spec_instr_loss = F.l1_loss(i_spec_pred.real, target_instr_spec.real) + \
+                      F.l1_loss(i_spec_pred.imag, target_instr_spec.imag)
     spectrogram_loss = spec_vocal_loss + spec_instr_loss
 
     n_fft = stft_params_for_istft['n_fft']
