@@ -37,6 +37,7 @@ class NeuralModel(nn.Module):
         x_stft_mag = x_stft_mag.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj_stft(x_stft_mag)
         x = self.model(x)
+        x = torch.tanh(x)
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
@@ -91,9 +92,12 @@ def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=485100, 
                 with torch.no_grad():
                     pred_output = model(mag.unsqueeze(0), chunk.unsqueeze(0)).squeeze(0)
 
-                _, F_spec, T_spec = pred_output.shape
-                pred_masks = pred_output.view(2, 4, F_spec, T_spec)
-                pred_masks_real, pred_masks_imag = pred_masks[0], pred_masks[1]
+                _, F_spec, T_spec = spec.shape
+                pred_output_reshaped = pred_output.view(2, 4, F_spec, T_spec)
+                pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
+
+                pred_masks_real = pred_real[:4]
+                pred_masks_imag = pred_imag[:4]
 
                 vL_cmask = pred_masks_real[0] + 1j * pred_masks_imag[0]
                 vR_cmask = pred_masks_real[1] + 1j * pred_masks_imag[1]
@@ -117,11 +121,14 @@ def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=485100, 
 
                 vocals[:, start:end] += vocal_chunk * fade_window
                 instrumentals[:, start:end] += inst_chunk * fade_window
-                sum_fade_windows[start:end] += fade_window**2
+                sum_fade_windows[start:end] += fade_window
                 pbar.update(1)
 
-        vocals /= (sum_fade_windows.sqrt() + 1e-8)
-        instrumentals /= (sum_fade_windows.sqrt() + 1e-8)
+        divisor = sum_fade_windows
+        divisor = divisor.clamp(min=1e-8)
+
+        vocals = vocals / divisor
+        instrumentals = instrumentals / divisor
 
         torchaudio.save(output_vocal_path, vocals.cpu().clamp(-1.0, 1.0), sr, format='flac')
         torchaudio.save(output_instrumental_path, instrumentals.cpu().clamp(-1.0, 1.0), sr, format='flac')

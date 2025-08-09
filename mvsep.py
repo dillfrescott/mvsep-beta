@@ -41,6 +41,7 @@ class NeuralModel(nn.Module):
         x_stft_mag = x_stft_mag.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj_stft(x_stft_mag)
         x = self.model(x)
+        x = torch.tanh(x)
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
@@ -59,19 +60,26 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
     def forward(self, y_pred, y_true):
         complex_loss_total = 0.0
 
-        if y_pred.dim() == 3:
-            y_pred = y_pred.reshape(y_pred.size(0), -1)
-            y_true = y_true.reshape(y_true.size(0), -1)
+        if y_pred.dim() == 2:
+            y_pred = y_pred.unsqueeze(1)
+            y_true = y_true.unsqueeze(1)
+
+        B, C, L = y_pred.shape
+        y_pred_flat = y_pred.reshape(B * C, L)
+        y_true_flat = y_true.reshape(B * C, L)
 
         for i, (n_fft, hop_length, win_length) in enumerate(zip(self.fft_sizes, self.hop_sizes, self.win_lengths)):
             window = getattr(self, f'window_{i}')
+            window = window.to(y_pred_flat.device)
 
-            stft_pred = torch.stft(y_pred, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window, return_complex=True)
-            stft_true = torch.stft(y_true, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window, return_complex=True)
+            stft_pred = torch.stft(y_pred_flat, n_fft=n_fft, hop_length=hop_length,
+                                   win_length=win_length, window=window, return_complex=True, center=True)
+            stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
+                                   win_length=win_length, window=window, return_complex=True, center=True)
 
             real_loss = F.mse_loss(stft_pred.real, stft_true.real)
             imag_loss = F.mse_loss(stft_pred.imag, stft_true.imag)
-            
+
             complex_loss_total += (real_loss + imag_loss)
 
         return complex_loss_total
@@ -87,24 +95,30 @@ def loss_fn(pred_output,
     device = pred_output.device
 
     B, _, F_dim, T = pred_output.shape
-    pred_masks = pred_output.view(B, 2, 4, F_dim, T)
-    pred_masks_real = pred_masks[:, 0]
-    pred_masks_imag = pred_masks[:, 1]
+    pred_output_reshaped = pred_output.view(B, 2, 4, F_dim, T)
+    pred_real = pred_output_reshaped[:, 0]
+    pred_imag = pred_output_reshaped[:, 1]
+
+    pred_masks_real = pred_real[:, :4]
+    pred_masks_imag = pred_imag[:, :4]
+
     vL_cmask = pred_masks_real[:, 0] + 1j * pred_masks_imag[:, 0]
     vR_cmask = pred_masks_real[:, 1] + 1j * pred_masks_imag[:, 1]
     iL_cmask = pred_masks_real[:, 2] + 1j * pred_masks_imag[:, 2]
     iR_cmask = pred_masks_real[:, 3] + 1j * pred_masks_imag[:, 3]
+
     vL_cmask, vR_cmask = vL_cmask.unsqueeze(1), vR_cmask.unsqueeze(1)
     iL_cmask, iR_cmask = iL_cmask.unsqueeze(1), iR_cmask.unsqueeze(1)
+
     v_spec_pred = torch.cat([vL_cmask * mixture_spec[:, 0:1],
                              vR_cmask * mixture_spec[:, 1:2]], dim=1)
     i_spec_pred = torch.cat([iL_cmask * mixture_spec[:, 0:1],
                              iR_cmask * mixture_spec[:, 1:2]], dim=1)
 
-    spec_vocal_loss = F.l1_loss(v_spec_pred.real, target_vocal_spec.real) + \
-                      F.l1_loss(v_spec_pred.imag, target_vocal_spec.imag)
-    spec_instr_loss = F.l1_loss(i_spec_pred.real, target_instr_spec.real) + \
-                      F.l1_loss(i_spec_pred.imag, target_instr_spec.imag)
+    spec_vocal_loss = F.mse_loss(v_spec_pred.real, target_vocal_spec.real) + \
+                      F.mse_loss(v_spec_pred.imag, target_vocal_spec.imag)
+    spec_instr_loss = F.mse_loss(i_spec_pred.real, target_instr_spec.real) + \
+                      F.mse_loss(i_spec_pred.imag, target_instr_spec.imag)
     spectrogram_loss = spec_vocal_loss + spec_instr_loss
 
     n_fft = stft_params_for_istft['n_fft']
@@ -475,12 +489,17 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
             with torch.no_grad():
                 pred_output = model(mag.unsqueeze(0), chunk.unsqueeze(0)).squeeze(0)
 
-            _, F_spec, T_spec = pred_output.shape
-            pred_masks = pred_output.view(2, 4, F_spec, T_spec)
-            pred_masks_real, pred_masks_imag = pred_masks[0], pred_masks[1]
+            _, F_spec, T_spec = spec.shape
+            pred_output_reshaped = pred_output.view(2, 4, F_spec, T_spec)
+            pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
-            vL_cmask, vR_cmask = pred_masks_real[0] + 1j*pred_masks_imag[0], pred_masks_real[1] + 1j*pred_masks_imag[1]
-            iL_cmask, iR_cmask = pred_masks_real[2] + 1j*pred_masks_imag[2], pred_masks_real[3] + 1j*pred_masks_imag[3]
+            pred_masks_real = pred_real[:4]
+            pred_masks_imag = pred_imag[:4]
+
+            vL_cmask = pred_masks_real[0] + 1j * pred_masks_imag[0]
+            vR_cmask = pred_masks_real[1] + 1j * pred_masks_imag[1]
+            iL_cmask = pred_masks_real[2] + 1j * pred_masks_imag[2]
+            iR_cmask = pred_masks_real[3] + 1j * pred_masks_imag[3]
 
             instrumental_spec = torch.stack([iL_cmask * spec[0], iR_cmask * spec[1]], dim=0)
             vocal_spec = torch.stack([vL_cmask * spec[0], vR_cmask * spec[1]], dim=0)
@@ -500,11 +519,14 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
 
             vocals[:, start:end] += vocal_chunk * fade_window
             instrumentals[:, start:end] += inst_chunk * fade_window
-            sum_fade_windows[start:end] += fade_window**2
+            sum_fade_windows[start:end] += fade_window
             pbar.update(1)
 
-    vocals /= (sum_fade_windows.sqrt() + 1e-8)
-    instrumentals /= (sum_fade_windows.sqrt() + 1e-8)
+    divisor = sum_fade_windows
+    divisor = divisor.clamp(min=1e-8)
+
+    vocals = vocals / divisor
+    instrumentals = instrumentals / divisor
 
     if return_tensors:
         return vocals.clamp(-1.0, 1.0), instrumentals.clamp(-1.0, 1.0)
@@ -562,8 +584,9 @@ def main():
                 return
         else:
             print(f"Using specified checkpoint: {checkpoint_to_load}")
-        
-        inference(model, checkpoint_to_load, args.input_file, args.output_instrumental, args.output_vocal, chunk_size=args.segment_length, device=device)
+
+        inference(model, checkpoint_to_load, args.input_file, args.output_instrumental, args.output_vocal,
+                  chunk_size=args.segment_length, device=device)
     
     else:
         print("Please specify either --train or --infer.")
