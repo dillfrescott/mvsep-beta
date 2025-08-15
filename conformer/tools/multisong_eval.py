@@ -7,6 +7,9 @@ import torchaudio
 from tqdm import tqdm
 import math
 from conformer import Conformer
+import warnings
+
+warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,

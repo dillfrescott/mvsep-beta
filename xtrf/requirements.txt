@@ -1,6 +1,0 @@
-torch
-torchaudio
-prodigyopt
-soundfile
-tqdm
-x-transformers==2.7.1
