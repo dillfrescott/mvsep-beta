@@ -1,6 +1,0 @@
-torch
-torchaudio
-neuraloperator
-prodigyopt
-soundfile
-tqdm
