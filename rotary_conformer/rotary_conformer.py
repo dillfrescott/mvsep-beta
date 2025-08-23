@@ -1,3 +1,6 @@
+# Modified from lucidrains conformer. Both of our projects have the MIT license.
+# https://github.com/lucidrains/conformer
+
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
