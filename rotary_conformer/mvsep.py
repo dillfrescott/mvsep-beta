@@ -540,7 +540,7 @@ def main():
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
-    parser.add_argument('--segment_length', type=int, default=1323000, help='Audio segment length for training and inference chunk size.')
+    parser.add_argument('--segment_length', type=int, default=485100, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     args = parser.parse_args()
 
