@@ -79,8 +79,8 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
                 y_true_flat, n_fft=n_fft, hop_length=hop_length,
                 win_length=win_length, window=window, return_complex=True, center=True
             )
-            real_loss = F.l1_loss(stft_pred.real, stft_true.real)
-            imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
+            real_loss = F.mse_loss(stft_pred.real, stft_true.real)
+            imag_loss = F.mse_loss(stft_pred.imag, stft_true.imag)
             complex_loss_total += (real_loss + imag_loss)
         return complex_loss_total
 
