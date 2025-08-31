@@ -1,8 +1,6 @@
 torch
 torchaudio
 conformer
-einops
 prodigyopt
-s5-pytorch
 soundfile
 tqdm
