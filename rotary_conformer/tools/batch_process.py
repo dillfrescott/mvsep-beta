@@ -20,7 +20,7 @@ class NeuralModel(nn.Module):
         self.sources = sources
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
-        self.input_proj_stft = nn.Linear(freq_bins * in_channels, embed_dim)
+        self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
         self.model = Conformer(
             dim = embed_dim,
             depth = 8,
@@ -35,10 +35,14 @@ class NeuralModel(nn.Module):
         )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
-    def forward(self, x_stft_mag, x_audio):
-        B, C, F, T = x_stft_mag.shape
-        x_stft_mag = x_stft_mag.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
-        x = self.input_proj_stft(x_stft_mag)
+    def forward(self, x_stft, x_audio):
+        x_stft_real = torch.real(x_stft)
+        x_stft_imag = torch.imag(x_stft)
+        x_stft = torch.cat([x_stft_real, x_stft_imag], dim=1)
+
+        B, C, F, T = x_stft.shape
+        x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
+        x = self.input_proj_stft(x_stft)
         x = self.model(x)
         x = torch.tanh(x)
         x = self.output_proj(x)
@@ -96,10 +100,9 @@ def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=1323000,
                     continue
 
                 spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
-                mag = torch.abs(spec)
 
                 with torch.no_grad():
-                    pred_output = model(mag.unsqueeze(0), chunk.unsqueeze(0)).squeeze(0)
+                    pred_output = model(spec.unsqueeze(0), chunk.unsqueeze(0)).squeeze(0)
 
                 _, F_spec, T_spec = spec.shape
                 pred_output_reshaped = pred_output.view(2, 4, F_spec, T_spec)
