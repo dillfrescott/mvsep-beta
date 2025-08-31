@@ -54,53 +54,12 @@ class NeuralModel(nn.Module):
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
-class STFTLoss(torch.nn.Module):
-    def __init__(self, fft_size=1024, hop_size=120, win_length=600):
-        super().__init__()
-        self.fft_size = fft_size
-        self.hop_size = hop_size
-        self.win_length = win_length
-        self.window = torch.hann_window(win_length)
-
-    def forward(self, x, y):
-        self.window = self.window.to(x.device)
-        x_flat = x.view(-1, x.shape[-1])
-        y_flat = y.view(-1, y.shape[-1])
-
-        x_spec = torch.stft(x_flat, self.fft_size, self.hop_size, self.win_length, self.window, return_complex=True, center=True)
-        y_spec = torch.stft(y_flat, self.fft_size, self.hop_size, self.win_length, self.window, return_complex=True, center=True)
-        
-        x_mag = torch.abs(x_spec)
-        y_mag = torch.abs(y_spec)
-
-        sc_loss = torch.norm(y_mag - x_mag, p='fro') / (torch.norm(y_mag, p='fro') + 1e-9)
-        mag_loss = torch.nn.functional.l1_loss(torch.log(y_mag.clamp(min=1e-9)), torch.log(x_mag.clamp(min=1e-9)))
-        
-        return sc_loss, mag_loss
-
-class MultiResolutionSTFTLoss(torch.nn.Module):
-    def __init__(self, fft_sizes=[1024, 2048, 8192], hop_sizes=[256, 512, 2048], win_lengths=[1024, 2048, 8192]):
-        super().__init__()
-        self.stft_losses = torch.nn.ModuleList()
-        for fs, hs, wl in zip(fft_sizes, hop_sizes, win_lengths):
-            self.stft_losses.append(STFTLoss(fs, hs, wl))
-
-    def forward(self, x, y):
-        total_loss = 0
-        for f in self.stft_losses:
-            sc_loss, mag_loss = f(x, y)
-            total_loss += sc_loss + mag_loss
-        return total_loss
-
-multi_res_stft_loss = MultiResolutionSTFTLoss()
-
 def loss_fn(pred_output,
             mixture_spec,
             target_vocal_audio,
             target_instr_audio,
             stft_params_for_istft):
     device = pred_output.device
-    multi_res_stft_loss.to(device)
 
     B, _, F_dim, T = pred_output.shape
     pred_output_reshaped = pred_output.view(B, 2, 4, F_dim, T)
@@ -141,8 +100,8 @@ def loss_fn(pred_output,
         window=window, center=True, length=recon_len
     ).reshape(B, C, -1)
 
-    vocal_loss = multi_res_stft_loss(pred_vocal_audio, target_vocal_audio)
-    instr_loss = multi_res_stft_loss(pred_instr_audio, target_instr_audio)
+    vocal_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
+    instr_loss = F.l1_loss(pred_instr_audio, target_instr_audio)
     total_loss = vocal_loss + instr_loss
 
     return total_loss
