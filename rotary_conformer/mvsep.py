@@ -54,6 +54,37 @@ class NeuralModel(nn.Module):
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
+def multi_resolution_stft_loss(pred_audio, target_audio, device):
+    resolutions = [
+        {'n_fft': 4096, 'hop_length': 1024, 'win_length': 4096},
+        {'n_fft': 2048, 'hop_length': 512, 'win_length': 2048},
+        {'n_fft': 1024, 'hop_length': 256, 'win_length': 1024},
+        {'n_fft': 512, 'hop_length': 128, 'win_length': 512}
+    ]
+    total_loss = 0.0
+    for res in resolutions:
+        n_fft = res['n_fft']
+        hop_length = res['hop_length']
+        win_length = res['win_length']
+        window = torch.hann_window(win_length, device=device)
+
+        B, C, L = pred_audio.shape
+        pred_audio_reshaped = pred_audio.view(B * C, L)
+        target_audio_reshaped = target_audio.view(B * C, L)
+
+        pred_spec = torch.stft(pred_audio_reshaped, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window, return_complex=True, center=True)
+        target_spec = torch.stft(target_audio_reshaped, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window, return_complex=True, center=True)
+
+        pred_mag = torch.abs(pred_spec)
+        target_mag = torch.abs(target_spec)
+
+        l1_mag_loss = F.l1_loss(pred_mag, target_mag)
+        sc_loss = torch.norm(target_mag - pred_mag, p='fro') / (torch.norm(target_mag, p='fro') + 1e-8)
+
+        total_loss += l1_mag_loss + sc_loss
+        
+    return total_loss
+
 def loss_fn(pred_output,
             mixture_spec,
             target_vocal_audio,
@@ -100,8 +131,8 @@ def loss_fn(pred_output,
         window=window, center=True, length=recon_len
     ).reshape(B, C, -1)
 
-    vocal_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
-    instr_loss = F.l1_loss(pred_instr_audio, target_instr_audio)
+    vocal_loss = multi_resolution_stft_loss(pred_vocal_audio, target_vocal_audio, device)
+    instr_loss = multi_resolution_stft_loss(pred_instr_audio, target_instr_audio, device)
     total_loss = vocal_loss + instr_loss
 
     return total_loss
