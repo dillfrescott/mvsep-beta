@@ -36,10 +36,7 @@ class NeuralModel(nn.Module):
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
-        x_stft_real = torch.real(x_stft)
-        x_stft_imag = torch.imag(x_stft)
-        x_stft = torch.cat([x_stft_real, x_stft_imag], dim=1)
-
+        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
         B, C, F, T = x_stft.shape
         x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj_stft(x_stft)
@@ -50,7 +47,7 @@ class NeuralModel(nn.Module):
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
-def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=1323000, overlap=88200, device='cpu'):
+def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=485100, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval().to(device)
