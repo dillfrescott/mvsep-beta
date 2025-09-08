@@ -265,12 +265,21 @@ class Dataset(Dataset):
                 print(f"Error loading item, trying next. Error: {e}")
                 continue
 
-def calculate_sdr(pred, target, epsilon=1e-8):
-    noise = pred - target
-    s_power = torch.sum(target**2, dim=-1, keepdim=True)
-    n_power = torch.sum(noise**2, dim=-1, keepdim=True)
-    sdr = 10 * torch.log10(s_power / (n_power + epsilon) + epsilon)
-    return sdr.mean().item()
+def calculate_lsd(pred, target, n_fft=2048, hop_length=512, epsilon=1e-8):
+    target = target.to(pred.device)
+
+    stft_pred = torch.stft(pred, n_fft=n_fft, hop_length=hop_length, window=torch.hann_window(n_fft, device=pred.device), return_complex=True, center=True)
+    stft_target = torch.stft(target, n_fft=n_fft, hop_length=hop_length, window=torch.hann_window(n_fft, device=pred.device), return_complex=True, center=True)
+
+    mag_pred = torch.abs(stft_pred)
+    mag_target = torch.abs(stft_target)
+
+    log_mag_pred = torch.log(mag_pred + epsilon)
+    log_mag_target = torch.log(mag_target + epsilon)
+
+    lsd = torch.sqrt(torch.mean((log_mag_pred - log_mag_target)**2, dim=(-2, -1)))
+    
+    return lsd.mean().item()
 
 def validate(model, test_dir, device, chunk_size, overlap):
     model.eval()
@@ -284,7 +293,7 @@ def validate(model, test_dir, device, chunk_size, overlap):
         print(f"No subdirectories found in test directory: {test_dir}")
         return 0.0, 0.0, 0.0
 
-    total_vocal_sdr, total_instr_sdr, count = 0.0, 0.0, 0
+    total_vocal_score, total_instr_score, count = 0.0, 0.0, 0
 
     with tqdm(track_dirs, desc="Validating", leave=False) as pbar:
         for track_dir in pbar:
@@ -309,14 +318,17 @@ def validate(model, test_dir, device, chunk_size, overlap):
                 with torch.no_grad():
                     pred_vocals, pred_instr = inference(model, None, mixture, None, None, chunk_size, overlap, device, return_tensors=True)
 
-                vocal_sdr = calculate_sdr(pred_vocals, gt_vocals)
-                instr_sdr = calculate_sdr(pred_instr, gt_instr)
+                vocal_lsd = calculate_lsd(pred_vocals, gt_vocals)
+                instr_lsd = calculate_lsd(pred_instr, gt_instr)
                 
-                total_vocal_sdr += vocal_sdr
-                total_instr_sdr += instr_sdr
+                vocal_score = -vocal_lsd
+                instr_score = -instr_lsd
+
+                total_vocal_score += vocal_score
+                total_instr_score += instr_score
                 count += 1
                 
-                pbar.set_postfix({'vocal_sdr': f"{vocal_sdr:.2f}", 'instr_sdr': f"{instr_sdr:.2f}"})
+                pbar.set_postfix({'Vocal LSD Score': f"{vocal_score:.4f}", 'Instr LSD Score': f"{instr_score:.4f}"})
             except (StopIteration, Exception) as e:
                 continue
 
@@ -324,21 +336,21 @@ def validate(model, test_dir, device, chunk_size, overlap):
         print("No valid test files processed.")
         return 0.0, 0.0, 0.0
 
-    avg_vocal_sdr = total_vocal_sdr / count
-    avg_instr_sdr = total_instr_sdr / count
-    avg_combined_sdr = (avg_vocal_sdr + avg_instr_sdr) / 2
-    return avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr
+    avg_vocal_score = total_vocal_score / count
+    avg_instr_score = total_instr_score / count
+    avg_combined_score = (avg_vocal_score + avg_instr_score) / 2
+    return avg_vocal_score, avg_instr_score, avg_combined_score
 
 def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, checkpoint_path=None, window=None, reset_optimizer=False):
     model.to(device)
     step = 0
     avg_loss = 0.0
     
-    best_sdr = -float('inf')
+    best_score = -float('inf')
     if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
-        sdr_values = [float(re.search(r"sdr_([\d\.-]+)\.pt", f).group(1)) for f in os.listdir('best_ckpts') if re.search(r"sdr_([\d\.-]+)\.pt", f)]
-        if sdr_values:
-            best_sdr = max(sdr_values)
+        score_values = [float(re.search(r"score_([\d\.-]+)\.pt", f).group(1)) for f in os.listdir('best_ckpts') if re.search(r"score_([\d\.-]+)\.pt", f)]
+        if score_values:
+            best_score = max(score_values)
 
     stft_params_for_istft = {
         'n_fft': 4096, 'hop_length': 1024, 'window': window.to(device)
@@ -381,7 +393,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             avg_loss = 0.999 * avg_loss + 0.001 * loss.item() if step > 0 else loss.item()
             step += 1
             progress_bar.update(1)
-            progress_bar.set_description(f"Step {step} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - Best SDR: {best_sdr:.4f}")
+            progress_bar.set_description(f"Step {step} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - Best LSD Score: {best_score:.4f}")
 
             if step > 0 and step % checkpoint_steps == 0:
                 checkpoint_payload = {
@@ -399,35 +411,35 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 if len(regular_checkpoints) > 3:
                     os.remove(regular_checkpoints[0])
 
-                avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr = validate(model, args.test_dir, device, args.segment_length, overlap=88200)
+                avg_vocal_score, avg_instr_score, avg_combined_score = validate(model, args.test_dir, device, args.segment_length, overlap=88200)
                 
-                print(f"\nValidation Step {step}: Vocal SDR: {avg_vocal_sdr:.4f}, Instr SDR: {avg_instr_sdr:.4f}, Combined SDR: {avg_combined_sdr:.4f}")
+                print(f"Validation Step {step}: Vocal LSD Score: {avg_vocal_score:.4f}, Instr LSD Score: {avg_instr_score:.4f}, Combined LSD Score: {avg_combined_score:.4f}")
 
-                best_sdr_checkpoints = []
+                best_score_checkpoints = []
                 if os.path.exists('best_ckpts'):
                     for f in os.listdir('best_ckpts'):
-                        match = re.search(r"sdr_([\d\.-]+)\.pt", f)
+                        match = re.search(r"score_([\d\.-]+)\.pt", f)
                         if match:
-                            sdr = float(match.group(1))
-                            best_sdr_checkpoints.append((sdr, os.path.join('best_ckpts', f)))
+                            score = float(match.group(1))
+                            best_score_checkpoints.append((score, os.path.join('best_ckpts', f)))
                 
-                best_sdr_checkpoints.sort(key=lambda x: x[0])
+                best_score_checkpoints.sort(key=lambda x: x[0])
 
-                current_best_sdr = best_sdr_checkpoints[-1][0] if best_sdr_checkpoints else -float('inf')
-                if avg_combined_sdr > current_best_sdr:
-                    best_sdr = avg_combined_sdr
+                current_best_score = best_score_checkpoints[-1][0] if best_score_checkpoints else -float('inf')
+                if avg_combined_score > current_best_score:
+                    best_score = avg_combined_score
                     
-                    for _, path in best_sdr_checkpoints:
+                    for _, path in best_score_checkpoints:
                         try:
                             os.remove(path)
                         except Exception:
                             pass
 
-                    best_ckpt_filename = f"best_ckpts/checkpoint_step_{step}_sdr_{avg_combined_sdr:.4f}.pt"
+                    best_ckpt_filename = f"best_ckpts/checkpoint_step_{step}_score_{avg_combined_score:.4f}.pt"
                     torch.save(checkpoint_payload, best_ckpt_filename)
-                    print(f"New best SDR! Saved checkpoint: {best_ckpt_filename}\n")
+                    print(f"New best LSD score! Saved checkpoint: {best_ckpt_filename}\n")
                 else:
-                    print(f"SDR did not improve. Best SDR remains {best_sdr:.4f}\n")
+                    print(f"LSD Score did not improve. Best LSD score remains {best_score:.4f}\n")
                 
                 model.train()
 
@@ -449,18 +461,18 @@ def find_latest_checkpoint(folder='ckpts'):
     latest_checkpoint = max(checkpoints, key=get_step_from_path)
     return latest_checkpoint
 
-def find_best_sdr_checkpoint(folder='best_ckpts'):
+def find_best_score_checkpoint(folder='best_ckpts'):
     if not os.path.exists(folder) or not os.listdir(folder):
         return None
 
     checkpoints = []
     for f in os.listdir(folder):
         if f.endswith('.pt'):
-            match = re.search(r"sdr_([-\d\.]+)\.pt", f)
+            match = re.search(r"score_([-\d\.]+)\.pt", f)
             if match:
                 try:
-                    sdr = float(match.group(1))
-                    checkpoints.append((sdr, os.path.join(folder, f)))
+                    score = float(match.group(1))
+                    checkpoints.append((score, os.path.join(folder, f)))
                 except (ValueError, IndexError):
                     continue
     
@@ -605,11 +617,11 @@ def main():
 
         checkpoint_to_load = args.checkpoint_path
         if not checkpoint_to_load:
-            checkpoint_to_load = find_best_sdr_checkpoint('best_ckpts')
+            checkpoint_to_load = find_best_score_checkpoint('best_ckpts')
             if checkpoint_to_load:
-                print(f"No checkpoint specified. Automatically using best SDR checkpoint: {checkpoint_to_load}")
+                print(f"No checkpoint specified. Automatically using best score checkpoint: {checkpoint_to_load}")
             else:
-                print("Error: No checkpoint specified with --checkpoint_path and no best SDR checkpoint was found in 'best_ckpts/'.")
+                print("Error: No checkpoint specified with --checkpoint_path and no best score checkpoint was found in 'best_ckpts/'.")
                 return
         else:
             print(f"Using specified checkpoint: {checkpoint_to_load}")
