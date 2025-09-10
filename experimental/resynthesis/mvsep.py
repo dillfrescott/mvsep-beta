@@ -586,7 +586,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
     model = NeuralModel() 
-    optimizer = Prodigy(model.parameters(), lr=1e-3)
+    optimizer = Prodigy(model.parameters(), lr=1.0)
 
     if args.train:
         checkpoint_to_load = args.checkpoint_path
