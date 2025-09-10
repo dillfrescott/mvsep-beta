@@ -308,9 +308,8 @@ def validate(model, test_dir, device, chunk_size, overlap):
 
                 with torch.no_grad():
                     pred_vocals, pred_instr = inference(model, None, mixture, None, None, chunk_size, overlap, device, return_tensors=True)
-
-                vocal_sdr = calculate_sdr(pred_vocals, gt_vocals)
-                instr_sdr = calculate_sdr(pred_instr, gt_instr)
+                    vocal_sdr = calculate_sdr(pred_vocals, gt_vocals)
+                    instr_sdr = calculate_sdr(pred_instr, gt_instr)
                 
                 total_vocal_sdr += vocal_sdr
                 total_instr_sdr += instr_sdr
@@ -327,6 +326,8 @@ def validate(model, test_dir, device, chunk_size, overlap):
     avg_vocal_sdr = total_vocal_sdr / count
     avg_instr_sdr = total_instr_sdr / count
     avg_combined_sdr = (avg_vocal_sdr + avg_instr_sdr) / 2
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     return avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr
 
 def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, checkpoint_path=None, window=None, reset_optimizer=False):
