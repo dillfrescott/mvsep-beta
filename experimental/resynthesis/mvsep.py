@@ -162,18 +162,18 @@ def loss_fn(pred_output,
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
     audio_loss = vocal_loss + instr_loss
 
-    silence_threshold = 1e-4
-    vocal_energy = torch.mean(target_vocal_audio**2, dim=[-1, -2])
-    instr_energy = torch.mean(target_instr_audio**2, dim=[-1, -2])
-    vocal_silent_mask = (vocal_energy < silence_threshold).float()
-    instr_silent_mask = (instr_energy < silence_threshold).float()
-    pred_vocal_energy = torch.mean(pred_vocal_audio**2, dim=[-1, -2])
-    pred_instr_energy = torch.mean(pred_instr_audio**2, dim=[-1, -2])
-    silence_loss = (vocal_silent_mask * pred_vocal_energy).mean() + (instr_silent_mask * pred_instr_energy).mean()
+    silence_threshold = 1e-8
+    target_vocal_energy_frame = torch.mean(torch.abs(target_vocal_spec)**2, dim=[1, 2])
+    vocal_silent_mask = (target_vocal_energy_frame < silence_threshold).float()
+    pred_vocal_energy_frame = torch.mean(torch.abs(v_spec_pred)**2, dim=[1, 2])
+    vocal_silence_loss = (vocal_silent_mask * pred_vocal_energy_frame).mean()
+    target_instr_energy_frame = torch.mean(torch.abs(target_instr_spec)**2, dim=[1, 2])
+    instr_silent_mask = (target_instr_energy_frame < silence_threshold).float()
+    pred_instr_energy_frame = torch.mean(torch.abs(i_spec_pred)**2, dim=[1, 2])
+    instr_silence_loss = (instr_silent_mask * pred_instr_energy_frame).mean()
+    silence_loss = vocal_silence_loss + instr_silence_loss
 
-    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss + silence_loss
-
-    return total_loss
+    return spectrogram_loss, audio_loss, silence_loss
 
 class Dataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
@@ -348,6 +348,11 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     model.to(device)
     step = 0
     avg_loss = 0.0
+
+    avg_spec_loss = 1.0
+    avg_audio_loss = 1.0
+    avg_silence_loss = 1.0
+    loss_alpha = 0.99
     
     best_si_sdr = -float('inf')
     if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
@@ -386,8 +391,21 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
             optimizer.zero_grad()
             pred_output = model(mixture_spec, mixture_audio)
-            loss = loss_fn(pred_output, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
+            spectrogram_loss, audio_loss, silence_loss = loss_fn(pred_output, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
             
+            spec_loss_val = spectrogram_loss.item()
+            audio_loss_val = audio_loss.item()
+            silence_loss_val = silence_loss.item()
+
+            if not (math.isnan(spec_loss_val) or math.isnan(audio_loss_val) or math.isnan(silence_loss_val)):
+                avg_spec_loss = loss_alpha * avg_spec_loss + (1 - loss_alpha) * spec_loss_val
+                avg_audio_loss = loss_alpha * avg_audio_loss + (1 - loss_alpha) * audio_loss_val
+                avg_silence_loss = loss_alpha * avg_silence_loss + (1 - loss_alpha) * silence_loss_val
+
+            loss = (spectrogram_loss / (avg_spec_loss + 1e-7)) + \
+                   (audio_loss / (avg_audio_loss + 1e-7)) + \
+                   (silence_loss / (avg_silence_loss + 1e-7))
+
             if torch.isnan(loss).any(): continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
