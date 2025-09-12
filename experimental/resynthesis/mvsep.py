@@ -162,7 +162,16 @@ def loss_fn(pred_output,
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
     audio_loss = vocal_loss + instr_loss
 
-    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss
+    silence_threshold = 1e-4
+    vocal_energy = torch.mean(target_vocal_audio**2, dim=[-1, -2])
+    instr_energy = torch.mean(target_instr_audio**2, dim=[-1, -2])
+    vocal_silent_mask = (vocal_energy < silence_threshold).float()
+    instr_silent_mask = (instr_energy < silence_threshold).float()
+    pred_vocal_energy = torch.mean(pred_vocal_audio**2, dim=[-1, -2])
+    pred_instr_energy = torch.mean(pred_instr_audio**2, dim=[-1, -2])
+    silence_loss = (vocal_silent_mask * pred_vocal_energy).mean() +                    (instr_silent_mask * pred_instr_energy).mean()
+
+    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss + silence_loss
 
     return total_loss
 
