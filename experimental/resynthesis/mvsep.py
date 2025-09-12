@@ -610,6 +610,7 @@ def main():
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
     parser.add_argument('--segment_length', type=int, default=485100, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
+    parser.add_argument('--best', action='store_true', help='Use the best SI-SDR checkpoint from best_ckpts for inference.')
     args = parser.parse_args()
 
     os.makedirs('ckpts', exist_ok=True)
@@ -638,12 +639,20 @@ def main():
 
         checkpoint_to_load = args.checkpoint_path
         if not checkpoint_to_load:
-            checkpoint_to_load = find_best_si_sdr_checkpoint('best_ckpts')
-            if checkpoint_to_load:
-                print(f"No checkpoint specified. Automatically using best SI-SDR checkpoint: {checkpoint_to_load}")
+            if args.best:
+                checkpoint_to_load = find_best_si_sdr_checkpoint('best_ckpts')
+                if checkpoint_to_load:
+                    print(f"Using best SI-SDR checkpoint: {checkpoint_to_load}")
+                else:
+                    print("Error: --best flag was used, but no best SI-SDR checkpoint was found in 'best_ckpts/'.")
+                    return
             else:
-                print("Error: No checkpoint specified with --checkpoint_path and no best SI-SDR checkpoint was found in 'best_ckpts/'.")
-                return
+                checkpoint_to_load = find_latest_checkpoint('ckpts')
+                if checkpoint_to_load:
+                    print(f"Using latest step checkpoint: {checkpoint_to_load}")
+                else:
+                    print("Error: No checkpoint specified and no checkpoint was found in 'ckpts/'.")
+                    return
         else:
             print(f"Using specified checkpoint: {checkpoint_to_load}")
 
