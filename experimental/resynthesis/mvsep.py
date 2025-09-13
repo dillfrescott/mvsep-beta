@@ -162,15 +162,18 @@ def loss_fn(pred_output,
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
     audio_loss = vocal_loss + instr_loss
 
-    silence_threshold = 1e-8
-    target_vocal_energy_frame = torch.mean(torch.abs(target_vocal_spec)**2, dim=[1, 2])
-    vocal_silent_mask = (target_vocal_energy_frame < silence_threshold).float()
-    pred_vocal_energy_frame = torch.mean(torch.abs(v_spec_pred)**2, dim=[1, 2])
-    vocal_silence_loss = (vocal_silent_mask * pred_vocal_energy_frame).mean()
-    target_instr_energy_frame = torch.mean(torch.abs(target_instr_spec)**2, dim=[1, 2])
-    instr_silent_mask = (target_instr_energy_frame < silence_threshold).float()
-    pred_instr_energy_frame = torch.mean(torch.abs(i_spec_pred)**2, dim=[1, 2])
-    instr_silence_loss = (instr_silent_mask * pred_instr_energy_frame).mean()
+    silence_constant = 693000  # Half-life at energy of 1e-6
+
+    target_vocal_energy_bin = torch.abs(target_vocal_spec)**2
+    vocal_silence_weights = torch.exp(-target_vocal_energy_bin * silence_constant)
+    pred_vocal_energy_bin = torch.abs(v_spec_pred)**2
+    vocal_silence_loss = (vocal_silence_weights * pred_vocal_energy_bin).mean()
+
+    target_instr_energy_bin = torch.abs(target_instr_spec)**2
+    instr_silence_weights = torch.exp(-target_instr_energy_bin * silence_constant)
+    pred_instr_energy_bin = torch.abs(i_spec_pred)**2
+    instr_silence_loss = (instr_silence_weights * pred_instr_energy_bin).mean()
+
     silence_loss = vocal_silence_loss + instr_silence_loss
 
     return spectrogram_loss, audio_loss, silence_loss
