@@ -162,21 +162,9 @@ def loss_fn(pred_output,
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
     audio_loss = vocal_loss + instr_loss
 
-    silence_constant = 693000  # Half-life at energy of 1e-6
+    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss
 
-    target_vocal_energy_bin = torch.abs(target_vocal_spec)**2
-    vocal_silence_weights = torch.exp(-target_vocal_energy_bin * silence_constant)
-    pred_vocal_energy_bin = torch.abs(v_spec_pred)**2
-    vocal_silence_loss = (vocal_silence_weights * pred_vocal_energy_bin).mean()
-
-    target_instr_energy_bin = torch.abs(target_instr_spec)**2
-    instr_silence_weights = torch.exp(-target_instr_energy_bin * silence_constant)
-    pred_instr_energy_bin = torch.abs(i_spec_pred)**2
-    instr_silence_loss = (instr_silence_weights * pred_instr_energy_bin).mean()
-
-    silence_loss = vocal_silence_loss + instr_silence_loss
-
-    return spectrogram_loss, audio_loss, silence_loss
+    return total_loss
 
 class Dataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
@@ -351,11 +339,6 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     model.to(device)
     step = 0
     avg_loss = 0.0
-
-    avg_spec_loss = 1.0
-    avg_audio_loss = 1.0
-    avg_silence_loss = 1.0
-    loss_alpha = 0.99
     
     best_si_sdr = -float('inf')
     if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
@@ -394,21 +377,8 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
             optimizer.zero_grad()
             pred_output = model(mixture_spec, mixture_audio)
-            spectrogram_loss, audio_loss, silence_loss = loss_fn(pred_output, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
+            loss = loss_fn(pred_output, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
             
-            spec_loss_val = spectrogram_loss.item()
-            audio_loss_val = audio_loss.item()
-            silence_loss_val = silence_loss.item()
-
-            if not (math.isnan(spec_loss_val) or math.isnan(audio_loss_val) or math.isnan(silence_loss_val)):
-                avg_spec_loss = loss_alpha * avg_spec_loss + (1 - loss_alpha) * spec_loss_val
-                avg_audio_loss = loss_alpha * avg_audio_loss + (1 - loss_alpha) * audio_loss_val
-                avg_silence_loss = loss_alpha * avg_silence_loss + (1 - loss_alpha) * silence_loss_val
-
-            loss = (spectrogram_loss / (avg_spec_loss + 1e-7)) + \
-                   (audio_loss / (avg_audio_loss + 1e-7)) + \
-                   (silence_loss / (avg_silence_loss + 1e-7))
-
             if torch.isnan(loss).any(): continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -613,7 +583,6 @@ def main():
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
     parser.add_argument('--segment_length', type=int, default=485100, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
-    parser.add_argument('--best', action='store_true', help='Use the best SI-SDR checkpoint from best_ckpts for inference.')
     args = parser.parse_args()
 
     os.makedirs('ckpts', exist_ok=True)
@@ -642,20 +611,12 @@ def main():
 
         checkpoint_to_load = args.checkpoint_path
         if not checkpoint_to_load:
-            if args.best:
-                checkpoint_to_load = find_best_si_sdr_checkpoint('best_ckpts')
-                if checkpoint_to_load:
-                    print(f"Using best SI-SDR checkpoint: {checkpoint_to_load}")
-                else:
-                    print("Error: --best flag was used, but no best SI-SDR checkpoint was found in 'best_ckpts/'.")
-                    return
+            checkpoint_to_load = find_best_si_sdr_checkpoint('best_ckpts')
+            if checkpoint_to_load:
+                print(f"No checkpoint specified. Automatically using best SI-SDR checkpoint: {checkpoint_to_load}")
             else:
-                checkpoint_to_load = find_latest_checkpoint('ckpts')
-                if checkpoint_to_load:
-                    print(f"Using latest step checkpoint: {checkpoint_to_load}")
-                else:
-                    print("Error: No checkpoint specified and no checkpoint was found in 'ckpts/'.")
-                    return
+                print("Error: No checkpoint specified with --checkpoint_path and no best SI-SDR checkpoint was found in 'best_ckpts/'.")
+                return
         else:
             print(f"Using specified checkpoint: {checkpoint_to_load}")
 
