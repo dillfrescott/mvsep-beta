@@ -249,6 +249,9 @@ class Dataset(Dataset):
                     vocal_seg = vocal_audio
                     instr_seg = instr_audio
 
+                if random.random() < 0.1:
+                    vocal_seg = torch.zeros_like(vocal_seg)
+                    instr_seg = torch.zeros_like(instr_seg)
                 mixture_seg = vocal_seg + instr_seg
 
                 mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
