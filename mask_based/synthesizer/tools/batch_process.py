@@ -10,52 +10,22 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
-
-    def forward(self, x, seq_dim=1):
-        t = torch.arange(x.shape[seq_dim], device=x.device).type_as(self.inv_freq)
-        freqs = torch.einsum('i, j -> i j', t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        if x.dim() == 4:
-            emb = emb.unsqueeze(0).unsqueeze(0)
-        return x * emb.cos() + rotate_half(x) * emb.sin()
-
-class SynthesizerAttention(nn.Module):
-    def __init__(self, dim, heads=8, rotary_emb=None):
+class DenseSynthesizerAttention(nn.Module):
+    def __init__(self, dim, heads=8):
         super().__init__()
         self.heads = heads
-        self.scale = (dim // heads) ** -0.5
-        self.rotary_emb = rotary_emb
-
-        self.to_q = nn.Linear(dim, dim, bias=False)
         self.to_v = nn.Linear(dim, dim, bias=False)
+        self.score_net = nn.Linear(dim, dim, bias=False)
         self.to_out = nn.Linear(dim, dim)
 
     def forward(self, x):
         B, T, D = x.shape
         H = self.heads
         D_h = D // H
-
-        q = self.to_q(x).view(B, T, H, D_h).transpose(1, 2)
         v = self.to_v(x).view(B, T, H, D_h).transpose(1, 2)
-
-        if self.rotary_emb is not None:
-            q = self.rotary_emb(q, seq_dim=2)
-
-        k_base = torch.ones(B, H, T, D_h, device=x.device)
-        k_pos = self.rotary_emb(k_base, seq_dim=2)
-
-        sim = torch.einsum('bhid,bhjd->bhij', q, k_pos) * self.scale
-        attn = sim.softmax(dim=-1)
-        
+        scores = self.score_net(x).view(B, T, H, D_h).transpose(1, 2)
+        scores = torch.einsum('bhid,bhjd->bhij', scores, torch.ones_like(scores)) / D_h**0.5
+        attn = scores.softmax(dim=-1)
         out = torch.einsum('bhij,bhjd->bhid', attn, v)
         out = out.transpose(1, 2).reshape(B, T, D)
         return self.to_out(out)
@@ -82,14 +52,12 @@ class PreNorm(nn.Module):
 class SynthesizerEncoder(nn.Module):
     def __init__(self, dim, depth, heads):
         super().__init__()
-        self.rotary_emb = RotaryEmbedding(dim=dim // heads)
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                PreNorm(dim, SynthesizerAttention(dim, heads=heads, rotary_emb=self.rotary_emb)),
+                PreNorm(dim, DenseSynthesizerAttention(dim, heads=heads)),
                 PreNorm(dim, FeedForward(dim))
             ]))
-
     def forward(self, x):
         for attn, ff in self.layers:
             x = attn(x) + x
