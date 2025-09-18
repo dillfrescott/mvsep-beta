@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=1024, depth=8, heads=8):
+                 embed_dim=1024, depth=8, heads=16):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -29,10 +29,7 @@ class NeuralModel(nn.Module):
             dim=embed_dim,
             depth=depth,
             heads=heads,
-            ff_glu=True,
-            rotary_pos_emb=True,
-            attn_pre_talking_heads=True,
-            attn_post_talking_heads=True
+            rotary_pos_emb=True
         )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.num_streams * 2)
 
