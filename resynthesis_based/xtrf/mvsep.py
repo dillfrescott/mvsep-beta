@@ -107,7 +107,7 @@ def loss_fn(pred_output,
     pred_mag_raw = pred_output_reshaped[:, 0]
     pred_phase_raw = pred_output_reshaped[:, 1]
 
-    pred_mag_log1p = F.relu(pred_mag_raw)
+    pred_mag_log1p = F.gelu(pred_mag_raw)
 
     pred_vocal_phase_raw_split = pred_phase_raw[:, :2]
     pred_instr_phase_raw_split = pred_phase_raw[:, 2:]
@@ -518,7 +518,7 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
             pred_output_reshaped = _reshape_pred(pred_output, F_spec, T_spec)
             pred_mag_raw, pred_phase_raw = pred_output_reshaped[0], pred_output_reshaped[1]
 
-            pred_mag_log1p = F.relu(pred_mag_raw)
+            pred_mag_log1p = F.gelu(pred_mag_raw)
             
             pred_vocal_phase_raw_split = pred_phase_raw[:2]
             pred_instr_phase_raw_split = pred_phase_raw[2:]
