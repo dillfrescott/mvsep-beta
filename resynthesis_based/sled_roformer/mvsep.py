@@ -110,7 +110,7 @@ class SledEncoder(nn.Module):
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=8, heads=8):
+                 embed_dim=512, depth=12, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
