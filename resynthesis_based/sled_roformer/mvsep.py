@@ -17,13 +17,14 @@ warnings.filterwarnings("ignore")
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        assert dim % 2 == 0, "Rotary embedding dimension must be even"
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
 
     def forward(self, max_seq_len, device):
         t = torch.arange(max_seq_len, device=device).type_as(self.inv_freq)
         freqs = torch.einsum("i , j -> i j", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
+        emb = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         return emb.unsqueeze(0)
 
 def rotate_half(x):
