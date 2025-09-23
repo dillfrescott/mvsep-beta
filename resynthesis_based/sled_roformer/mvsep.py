@@ -35,7 +35,7 @@ def apply_rotary_pos_emb(pos, t):
     return (t * pos.cos()) + (rotate_half(t) * pos.sin())
 
 class SledAttention(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.1):
         super().__init__()
         inner_dim = dim_head * heads
         self.heads = heads
@@ -63,7 +63,7 @@ class SledAttention(nn.Module):
         return self.to_out(out)
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.0):
+    def __init__(self, dim, hidden_dim, dropout=0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, hidden_dim),
@@ -76,7 +76,7 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class SledTransformerBlock(nn.Module):
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = SledAttention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
@@ -89,7 +89,7 @@ class SledTransformerBlock(nn.Module):
         return x
 
 class SledEncoder(nn.Module):
-    def __init__(self, dim, depth, heads, mlp_dim, dim_head=64, dropout=0.0):
+    def __init__(self, dim, depth, heads, mlp_dim, dim_head=64, dropout=0.1):
         super().__init__()
         self.layers = nn.ModuleList([])
         for _ in range(depth):
