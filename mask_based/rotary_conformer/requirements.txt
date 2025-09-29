@@ -1,6 +1,0 @@
-torch
-torchaudio
-einops
-prodigyopt
-soundfile
-tqdm
