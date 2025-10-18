@@ -11,7 +11,7 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-class InputProcessor(nn.Module):
+class FurnaceEncoder(nn.Module):
     def __init__(self, dim, depth=12, heads=8, rotary_pos_emb=True, max_mem_len=8192, decay=0.0):
         super().__init__()
         self.core = Encoder(dim=dim, depth=depth, heads=heads, rotary_pos_emb=rotary_pos_emb, cross_attend=True)
@@ -79,74 +79,6 @@ class InputProcessor(nn.Module):
             else:
                 self._memory = new_mem
 
-class MemoryProcessor(nn.Module):
-    def __init__(self, dim, depth=12, heads=8, rotary_pos_emb=True, max_mem_len=8192, decay=0.0):
-        super().__init__()
-        self.core = Encoder(dim=dim, depth=depth, heads=heads, rotary_pos_emb=rotary_pos_emb, cross_attend=True)
-        self.max_mem_len = max_mem_len
-        self.register_buffer('_memory', None, persistent=False)
-        self.decay = float(decay)
-
-    def reset_state(self):
-        self._memory = None
-
-    def _ensure_memory_for_batch(self, x):
-        B = x.size(0)
-        if self._memory is None:
-            return None
-        if self._memory.size(0) != B:
-            self._memory = None
-            return None
-        return self._memory
-
-    def forward(self, input_mem, reset_state=False):
-        if reset_state:
-            self.reset_state()
-            
-        B, T_in, D = input_mem.shape
-        mem = self._ensure_memory_for_batch(input_mem)
-
-        if mem is None or mem.size(1) == 0:
-            dummy_context = torch.zeros(B, 1, D, device=input_mem.device)
-            out = self.core(input_mem, context=dummy_context)
-            new_mem = out[:, -self.max_mem_len:, :].detach()
-            self._memory = new_mem
-            return out
-
-        out = self.core(input_mem, context=mem)
-
-        new_mem = out[:, -self.max_mem_len:, :].detach()
-        if self.decay and self._memory is not None:
-            prev = self._memory
-            if prev.size(1) < new_mem.size(1):
-                pad = new_mem.size(1) - prev.size(1)
-                prev = torch.cat([input_mem.new_zeros(B, pad, D), prev], dim=1)
-            elif prev.size(1) > new_mem.size(1):
-                prev = prev[:, -new_mem.size(1):, :]
-            blended = self.decay * prev + (1.0 - self.decay) * new_mem
-            self._memory = blended.detach()
-        else:
-            self._memory = new_mem
-        return out
-
-    def think(self, steps=1):
-        if self._memory is None or self._memory.size(1) == 0:
-            return
-        for _ in range(int(steps)):
-            mem = self._memory
-            out = self.core(mem, context=mem)
-            new_mem = out[:, -self.max_mem_len:, :].detach()
-            if self.decay:
-                prev = mem
-                if prev.size(1) < new_mem.size(1):
-                    pad = new_mem.size(1) - prev.size(1)
-                    prev = torch.cat([mem.new_zeros(mem.size(0), pad, mem.size(2)), prev], dim=1)
-                elif prev.size(1) > new_mem.size(1):
-                    prev = prev[:, -new_mem.size(1):, :]
-                self._memory = (self.decay * prev + (1.0 - self.decay) * new_mem).detach()
-            else:
-                self._memory = new_mem
-
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
                  embed_dim=512, depth=12, heads=8,
@@ -158,15 +90,7 @@ class NeuralModel(nn.Module):
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
         self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
-        self.input_encoder = InputProcessor(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            rotary_pos_emb=True,
-            max_mem_len=max_mem_len,
-            decay=memory_decay
-        )
-        self.memory_encoder = MemoryProcessor(
+        self.model = FurnaceEncoder(
             dim=embed_dim,
             depth=depth,
             heads=heads,
@@ -177,29 +101,19 @@ class NeuralModel(nn.Module):
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def reset_memory(self):
-        self.input_encoder.reset_state()
-        self.memory_encoder.reset_state()
+        if hasattr(self.model, 'reset_state'):
+            self.model.reset_state()
 
     def think(self, steps=1):
-        self.input_encoder.think(steps)
-        self.memory_encoder.think(steps)
+        if hasattr(self.model, 'think'):
+            self.model.think(steps)
 
     def forward(self, x_stft, x_audio, reset_state=False):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
         B, C, F, T = x_stft.shape
         x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj_stft(x_stft)
-        
-        input_output = self.input_encoder(x, reset_state=reset_state)
-        
-        input_mem = self.input_encoder._memory
-        
-        if input_mem is not None and input_mem.size(1) > 0:
-            memory_output = self.memory_encoder(input_mem, reset_state=reset_state)
-            x = memory_output
-        else:
-            x = input_output
-            
+        x = self.model(x, reset_state=reset_state)
         x = torch.tanh(x)
         x = self.output_proj(x)
         current_T = x.shape[1]
