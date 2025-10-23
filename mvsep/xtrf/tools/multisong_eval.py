@@ -25,8 +25,7 @@ class NeuralModel(nn.Module):
             dim=embed_dim,
             depth=depth,
             heads=heads,
-            rotary_pos_emb=True,
-            attn_cog_signed=True
+            rotary_pos_emb=True
         )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
