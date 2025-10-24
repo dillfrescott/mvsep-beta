@@ -16,26 +16,69 @@ import warnings
 warnings.filterwarnings("ignore")
 
 class DPRNN_XTransformer(nn.Module):
-    def __init__(self, dim, hidden=None, heads=8):
+    def __init__(self, dim, hidden=None, heads=8, chunk_size=512):
         super().__init__()
         self.dim = dim
+        self.chunk_size = chunk_size
+
         self.intra = Encoder(dim=dim, depth=1, heads=heads, rotary_pos_emb=True, attn_flash=True)
         self.inter = Encoder(dim=dim, depth=1, heads=heads, rotary_pos_emb=True, attn_flash=True)
+
         self.intra_proj = nn.Linear(dim, dim)
         self.inter_proj = nn.Linear(dim, dim)
+        
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
-        y = self.intra(x)
-        y = self.intra_proj(y)
-        x = x + y
-        y = self.inter(x)
-        y = self.inter_proj(y)
-        return self.norm(y + x)
+        B, T, D = x.shape
+
+        remainder = T % self.chunk_size
+        if remainder != 0:
+            pad_size = self.chunk_size - remainder
+            x_padded = nn.functional.pad(x, (0, 0, 0, pad_size))
+        else:
+            pad_size = 0
+            x_padded = x
+            
+        T_padded = x_padded.shape[1]
+        num_chunks = T_padded // self.chunk_size
+
+        x_intra_in = x_padded.reshape(B, num_chunks, self.chunk_size, D)
+        x_intra_in = x_intra_in.reshape(B * num_chunks, self.chunk_size, D)
+        
+        y_intra = self.intra(x_intra_in)
+        y_intra = self.intra_proj(y_intra)
+        
+        y_intra = y_intra.reshape(B, num_chunks, self.chunk_size, D).reshape(B, T_padded, D)
+        
+        x_post_intra = x_padded + y_intra
+
+        x_inter_in = x_post_intra.reshape(B, num_chunks, self.chunk_size, D)
+        x_inter_in = x_inter_in.permute(0, 2, 1, 3)
+        x_inter_in = x_inter_in.reshape(B * self.chunk_size, num_chunks, D)
+        
+        y_inter = self.inter(x_inter_in)
+        y_inter = self.inter_proj(y_inter)
+        
+        y_inter = y_inter.reshape(B, self.chunk_size, num_chunks, D)
+        y_inter = y_inter.permute(0, 2, 1, 3)
+        y_inter = y_inter.reshape(B, T_padded, D)
+        
+        x_out_padded = x_post_intra + y_inter
+        
+        x_normed = self.norm(x_out_padded)
+        
+        if pad_size > 0:
+            x_out = x_normed[:, :T, :]
+        else:
+            x_out = x_normed
+            
+        return x_out
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=8, heads=8):
+                 embed_dim=512, depth=8, heads=8, 
+                 chunk_size=512):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -46,7 +89,7 @@ class NeuralModel(nn.Module):
         self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
 
         self.layers = nn.ModuleList([
-            DPRNN_XTransformer(embed_dim, hidden=embed_dim, heads=heads)
+            DPRNN_XTransformer(embed_dim, hidden=embed_dim, heads=heads, chunk_size=chunk_size)
             for _ in range(depth)
         ])
 
@@ -55,6 +98,7 @@ class NeuralModel(nn.Module):
     def forward(self, x_stft, x_audio=None):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
         B, C, F, T = x_stft.shape
+        
         x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
 
         x = self.input_proj_stft(x_stft)
@@ -62,8 +106,10 @@ class NeuralModel(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
-        x = torch.tanh(x)
+        x = torch.tanh(x) 
+        
         x = self.output_proj(x)
+        
         x = x.view(B, T, self.out_masks * 2, F).permute(0, 2, 3, 1)
 
         return x
