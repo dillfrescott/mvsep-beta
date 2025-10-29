@@ -17,14 +17,19 @@ warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=12, heads=8):
+                 embed_dim=512, depth=8, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
-        self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
+
+        self.freq_groups = 8
+        self.grouped_freq_bins = freq_bins - 1
+        self.group_size = self.grouped_freq_bins // self.freq_groups
+
+        self.input_proj_stft = nn.Linear(self.group_size * in_channels * 2, embed_dim)
         self.model = Conformer(
             dim = embed_dim,
             depth = depth,
@@ -37,18 +42,31 @@ class NeuralModel(nn.Module):
             ff_dropout = 0.1,
             conv_dropout = 0.1
         )
-        self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
+        self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        B, C, F, T = x_stft.shape
-        x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
-        x = self.input_proj_stft(x_stft)
+        
+        x_stft = x_stft[:, :, :-1, :]
+
+        B, C_real_imag, F_grouped, T = x_stft.shape
+        
+        x_stft_reshaped = x_stft.view(B, C_real_imag, self.freq_groups, self.group_size, T)
+        x_stft_reshaped = x_stft_reshaped.permute(0, 2, 4, 1, 3).contiguous()
+        x_stft_reshaped = x_stft_reshaped.view(B * self.freq_groups, T, C_real_imag * self.group_size)
+
+        x = self.input_proj_stft(x_stft_reshaped)
         x = self.model(x)
         x = torch.tanh(x)
         x = self.output_proj(x)
+        
         current_T = x.shape[1]
-        x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
+        x = x.view(B, self.freq_groups, current_T, self.out_masks * 2, self.group_size)
+        x = x.permute(0, 3, 1, 4, 2).contiguous()
+        x = x.view(B, self.out_masks * 2, self.grouped_freq_bins, current_T)
+        
+        x = F.pad(x, (0, 0, 0, 1), "constant", 0)
+
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
