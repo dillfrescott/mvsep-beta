@@ -15,57 +15,101 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+class FreqMixerBlock(nn.Module):
+    def __init__(self, channels, k=5, dilation=1, p_drop=0.1):
+        super().__init__()
+        pad = ((k - 1) // 2) * dilation
+        self.dw = nn.Conv2d(channels, channels, (k, 1), padding=(pad, 0), dilation=(dilation, 1), groups=channels, bias=False)
+        self.pw = nn.Conv2d(channels, channels, 1, bias=False)
+        self.norm = nn.GroupNorm(min(32, channels), channels)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(p_drop)
+
+    def forward(self, x):
+        r = x
+        x = self.dw(x)
+        x = self.pw(x)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.drop(x)
+        return x + r
+
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=8, heads=8):
+    def __init__(self, in_channels=2, sources=2, freq_bins=2049, embed_dim=512, depth=8, heads=8,
+                 freq_groups=8, drop_nyquist=True, mixer_blocks=2, mixer_kernel=7,
+                 mixer_dilations=(1, 2), mixer_dropout=0.1):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
+        self.freq_groups = freq_groups
+        self.drop_nyquist = drop_nyquist
 
-        self.freq_groups = 8
-        self.grouped_freq_bins = freq_bins - 1
-        self.group_size = self.grouped_freq_bins // self.freq_groups
+        grouped_freq_bins = freq_bins - 1 if drop_nyquist else freq_bins
+        self.grouped_freq_bins = grouped_freq_bins
+        self.group_size = math.ceil(grouped_freq_bins / freq_groups)
+        self.grouped_target_bins = self.group_size * freq_groups
+        self.freq_pad = self.grouped_target_bins - grouped_freq_bins
 
         self.input_proj_stft = nn.Linear(self.group_size * in_channels * 2, embed_dim)
         self.model = Conformer(
-            dim = embed_dim,
-            depth = depth,
-            dim_head = embed_dim // heads,
-            heads = heads,
-            ff_mult = 4,
-            conv_expansion_factor = 2,
-            conv_kernel_size = 31,
-            attn_dropout = 0.1,
-            ff_dropout = 0.1,
-            conv_dropout = 0.1
+            dim=embed_dim,
+            depth=depth,
+            dim_head=embed_dim // heads,
+            heads=heads,
+            ff_mult=4,
+            conv_expansion_factor=2,
+            conv_kernel_size=31,
+            attn_dropout=0.1,
+            ff_dropout=0.1,
+            conv_dropout=0.1
         )
         self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2)
 
-    def forward(self, x_stft, x_audio):
+        layers = []
+        c = self.out_masks * 2
+        if not mixer_dilations:
+            mixer_dilations = (1,) * mixer_blocks
+        for i in range(mixer_blocks):
+            d = mixer_dilations[i] if i < len(mixer_dilations) else 1
+            layers.append(FreqMixerBlock(c, k=mixer_kernel, dilation=d, p_drop=mixer_dropout))
+        self.freq_mixer = nn.Sequential(*layers)
+
+    def forward(self, x_stft, x_audio=None):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        
-        x_stft = x_stft[:, :, :-1, :]
+        if self.drop_nyquist:
+            x_mag = x_stft[:, :, :self.grouped_freq_bins, :]
+        else:
+            x_mag = x_stft
+        B, C2, Fg, T = x_mag.shape
 
-        B, C_real_imag, F_grouped, T = x_stft.shape
-        
-        x_stft_reshaped = x_stft.view(B, C_real_imag, self.freq_groups, self.group_size, T)
-        x_stft_reshaped = x_stft_reshaped.permute(0, 2, 4, 1, 3).contiguous()
-        x_stft_reshaped = x_stft_reshaped.view(B * self.freq_groups, T, C_real_imag * self.group_size)
+        if self.freq_pad > 0:
+            x_mag = F.pad(x_mag, (0, 0, 0, self.freq_pad))
+            Fg_p = Fg + self.freq_pad
+        else:
+            Fg_p = Fg
 
-        x = self.input_proj_stft(x_stft_reshaped)
+        x_mag = x_mag.view(B, C2, self.freq_groups, self.group_size, T)
+        x_tok = x_mag.permute(0, 2, 4, 1, 3).contiguous().view(B * self.freq_groups, T, C2 * self.group_size)
+
+        x = self.input_proj_stft(x_tok)
         x = self.model(x)
         x = torch.tanh(x)
         x = self.output_proj(x)
-        
-        current_T = x.shape[1]
-        x = x.view(B, self.freq_groups, current_T, self.out_masks * 2, self.group_size)
-        x = x.permute(0, 3, 1, 4, 2).contiguous()
-        x = x.view(B, self.out_masks * 2, self.grouped_freq_bins, current_T)
-        
-        x = F.pad(x, (0, 0, 0, 1), "constant", 0)
+
+        x = x.view(B, self.freq_groups, T, self.out_masks * 2, self.group_size)
+        x = x.permute(0, 3, 1, 4, 2).contiguous().view(B, self.out_masks * 2, Fg_p, T)
+
+        if self.freq_pad > 0:
+            x = x[:, :, :self.grouped_freq_bins, :]
+
+        x = self.freq_mixer(x)
+
+        if self.drop_nyquist:
+            nyq = x[:, :, -1:, :].clone()
+            x = torch.cat([x, nyq], dim=2)
 
         return x
 
