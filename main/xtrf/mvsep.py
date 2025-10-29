@@ -24,6 +24,7 @@ class FreqMixerBlock(nn.Module):
         self.norm = nn.GroupNorm(min(32, channels), channels)
         self.act = nn.GELU()
         self.drop = nn.Dropout(p_drop)
+        self.res_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x):
         r = x
@@ -32,7 +33,7 @@ class FreqMixerBlock(nn.Module):
         x = self.norm(x)
         x = self.act(x)
         x = self.drop(x)
-        return x + r
+        return r + self.res_scale * x
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049, embed_dim=512, depth=8, heads=8,
@@ -60,7 +61,7 @@ class NeuralModel(nn.Module):
             heads=heads,
             rotary_pos_emb=True
         )
-        self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2)
+        self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2, bias=False)
 
         layers = []
         c = self.out_masks * 2
@@ -71,12 +72,11 @@ class NeuralModel(nn.Module):
             layers.append(FreqMixerBlock(c, k=mixer_kernel, dilation=d, p_drop=mixer_dropout))
         self.freq_mixer = nn.Sequential(*layers)
 
+        self.final_activation = nn.Tanh()
+
     def forward(self, x_stft, x_audio=None):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        if self.drop_nyquist:
-            x_mag = x_stft[:, :, :self.grouped_freq_bins, :]
-        else:
-            x_mag = x_stft
+        x_mag = x_stft[:, :, :self.grouped_freq_bins, :] if self.drop_nyquist else x_stft
         B, C2, Fg, T = x_mag.shape
 
         if self.freq_pad > 0:
@@ -90,7 +90,6 @@ class NeuralModel(nn.Module):
 
         x = self.input_proj_stft(x_tok)
         x = self.model(x)
-        x = torch.tanh(x)
         x = self.output_proj(x)
 
         x = x.view(B, self.freq_groups, T, self.out_masks * 2, self.group_size)
@@ -100,6 +99,7 @@ class NeuralModel(nn.Module):
             x = x[:, :, :self.grouped_freq_bins, :]
 
         x = self.freq_mixer(x)
+        x = self.final_activation(x)
 
         if self.drop_nyquist:
             nyq = x[:, :, -1:, :].clone()
