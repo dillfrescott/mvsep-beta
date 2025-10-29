@@ -16,30 +16,9 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-class FreqMixerBlock(nn.Module):
-    def __init__(self, channels, k=5, dilation=1, p_drop=0.1):
-        super().__init__()
-        pad = ((k - 1) // 2) * dilation
-        self.dw = nn.Conv2d(channels, channels, (k, 1), padding=(pad, 0), dilation=(dilation, 1), groups=channels, bias=False)
-        self.pw = nn.Conv2d(channels, channels, 1, bias=False)
-        self.norm = nn.GroupNorm(min(32, channels), channels)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(p_drop)
-        self.res_scale = nn.Parameter(torch.tensor(0.1))
-
-    def forward(self, x):
-        r = x
-        x = self.dw(x)
-        x = self.pw(x)
-        x = self.norm(x)
-        x = self.act(x)
-        x = self.drop(x)
-        return r + self.res_scale * x
-
 class NeuralModel(nn.Module):
-    def __init__(self, model_type='conformer', in_channels=2, sources=2, freq_bins=2049, embed_dim=512, depth=8, heads=8,
-                 freq_groups=8, mixer_blocks=2, mixer_kernel=7,
-                 mixer_dilations=(1, 2), mixer_dropout=0.1):
+    def __init__(self, model_type='conformer', in_channels=2, sources=2, freq_bins=2049,
+                embed_dim=512, depth=6, heads=8, freq_groups=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -80,16 +59,6 @@ class NeuralModel(nn.Module):
             raise ValueError(f"Unknown model type: {model_type}")
 
         self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2, bias=False)
-
-        layers = []
-        c = self.out_masks * 2
-        if not mixer_dilations:
-            mixer_dilations = (1,) * mixer_blocks
-        for i in range(mixer_blocks):
-            d = mixer_dilations[i] if i < len(mixer_dilations) else 1
-            layers.append(FreqMixerBlock(c, k=mixer_kernel, dilation=d, p_drop=mixer_dropout))
-        self.freq_mixer = nn.Sequential(*layers)
-
         self.final_activation = nn.Tanh()
 
     def forward(self, x_stft, x_audio=None):
@@ -104,19 +73,19 @@ class NeuralModel(nn.Module):
             Fg_p = Fg
 
         x_mag = x_mag.view(B, C2, self.freq_groups, self.group_size, T)
-        x_tok = x_mag.permute(0, 2, 4, 1, 3).contiguous().view(B * self.freq_groups, T, C2 * self.group_size)
+        
+        x_tok = x_mag.permute(0, 4, 2, 1, 3).contiguous().view(B, T * self.freq_groups, C2 * self.group_size)
 
         x = self.input_proj_stft(x_tok)
         x = self.model(x)
         x = self.output_proj(x)
 
-        x = x.view(B, self.freq_groups, T, self.out_masks * 2, self.group_size)
-        x = x.permute(0, 3, 1, 4, 2).contiguous().view(B, self.out_masks * 2, Fg_p, T)
+        x = x.view(B, T, self.freq_groups, self.out_masks * 2, self.group_size)
+        x = x.permute(0, 3, 2, 4, 1).contiguous().view(B, self.out_masks * 2, Fg_p, T)
 
         if self.freq_pad > 0:
             x = x[:, :, :self.grouped_freq_bins, :]
 
-        x = self.freq_mixer(x)
         x = self.final_activation(x)
 
         nyq = x[:, :, -1:, :].clone()
@@ -524,7 +493,7 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
     return best_ckpt
 
 def inference(model, checkpoint_path, input_data, output_instrumental_path, output_vocal_path,
-              chunk_size=485100, overlap=88200, device='cpu', return_tensors=False):
+              chunk_size=264600, overlap=88200, device='cpu', return_tensors=False):
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
@@ -616,13 +585,13 @@ def main():
     parser.add_argument('--infer', action='store_true', help='Run inference.')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to the training dataset.')
     parser.add_argument('--test_dir', type=str, default='test', help='Path to the test dataset for validation.')
-    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training.')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training.')
     parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save a checkpoint every X steps.')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Specific checkpoint path to resume training or for inference. Overrides automatic selection.')
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
-    parser.add_argument('--segment_length', type=int, default=485100, help='Audio segment length for training and inference chunk size.')
+    parser.add_argument('--segment_length', type=int, default=264600, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     args = parser.parse_args()
 
