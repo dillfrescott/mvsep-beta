@@ -11,6 +11,7 @@ import random
 import math
 import re
 from conformer import Conformer
+from x_transformers import Encoder
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -36,7 +37,7 @@ class FreqMixerBlock(nn.Module):
         return r + self.res_scale * x
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049, embed_dim=512, depth=8, heads=8,
+    def __init__(self, model_type='conformer', in_channels=2, sources=2, freq_bins=2049, embed_dim=512, depth=8, heads=8,
                  freq_groups=8, mixer_blocks=2, mixer_kernel=7,
                  mixer_dilations=(1, 2), mixer_dropout=0.1):
         super().__init__()
@@ -54,18 +55,30 @@ class NeuralModel(nn.Module):
         self.freq_pad = self.grouped_target_bins - grouped_freq_bins
 
         self.input_proj_stft = nn.Linear(self.group_size * in_channels * 2, embed_dim)
-        self.model = Conformer(
-            dim=embed_dim,
-            depth=depth,
-            dim_head=embed_dim // heads,
-            heads=heads,
-            ff_mult=4,
-            conv_expansion_factor=2,
-            conv_kernel_size=31,
-            attn_dropout=0.1,
-            ff_dropout=0.1,
-            conv_dropout=0.1
-        )
+        
+        if model_type == 'conformer':
+            self.model = Conformer(
+                dim=embed_dim,
+                depth=depth,
+                dim_head=embed_dim // heads,
+                heads=heads,
+                ff_mult=4,
+                conv_expansion_factor=2,
+                conv_kernel_size=31,
+                attn_dropout=0.1,
+                ff_dropout=0.1,
+                conv_dropout=0.1
+            )
+        elif model_type == 'xtrf':
+            self.model = Encoder(
+                dim=embed_dim,
+                depth=depth,
+                heads=heads,
+                rotary_pos_emb=True
+            )
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+
         self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2, bias=False)
 
         layers = []
@@ -598,6 +611,7 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
 
 def main():
     parser = argparse.ArgumentParser(description='Train or run inference on a source separation model.')
+    parser.add_argument('--model_type', type=str, default='conformer', choices=['conformer', 'xtrf'], help='Model architecture to use.')
     parser.add_argument('--train', action='store_true', help='Train the model.')
     parser.add_argument('--infer', action='store_true', help='Run inference.')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to the training dataset.')
@@ -612,12 +626,14 @@ def main():
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     args = parser.parse_args()
 
+    print(f"Using model type: {args.model_type}")
+
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel() 
+    model = NeuralModel(model_type=args.model_type) 
     optimizer = Prodigy(model.parameters(), lr=1.0)
 
     if args.train:
