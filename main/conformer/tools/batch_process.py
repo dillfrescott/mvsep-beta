@@ -33,7 +33,7 @@ class FreqMixerBlock(nn.Module):
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049, embed_dim=512, depth=8, heads=8,
-                 freq_groups=8, drop_nyquist=True, mixer_blocks=2, mixer_kernel=7,
+                 freq_groups=8, mixer_blocks=2, mixer_kernel=7,
                  mixer_dilations=(1, 2), mixer_dropout=0.1):
         super().__init__()
         self.freq_bins = freq_bins
@@ -42,9 +42,8 @@ class NeuralModel(nn.Module):
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
         self.freq_groups = freq_groups
-        self.drop_nyquist = drop_nyquist
 
-        grouped_freq_bins = freq_bins - 1 if drop_nyquist else freq_bins
+        grouped_freq_bins = freq_bins - 1
         self.grouped_freq_bins = grouped_freq_bins
         self.group_size = math.ceil(grouped_freq_bins / freq_groups)
         self.grouped_target_bins = self.group_size * freq_groups
@@ -78,7 +77,7 @@ class NeuralModel(nn.Module):
 
     def forward(self, x_stft, x_audio=None):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        x_mag = x_stft[:, :, :self.grouped_freq_bins, :] if self.drop_nyquist else x_stft
+        x_mag = x_stft[:, :, :self.grouped_freq_bins, :]
         B, C2, Fg, T = x_mag.shape
 
         if self.freq_pad > 0:
@@ -103,9 +102,8 @@ class NeuralModel(nn.Module):
         x = self.freq_mixer(x)
         x = self.final_activation(x)
 
-        if self.drop_nyquist:
-            nyq = x[:, :, -1:, :].clone()
-            x = torch.cat([x, nyq], dim=2)
+        nyq = x[:, :, -1:, :].clone()
+        x = torch.cat([x, nyq], dim=2)
 
         return x
 
