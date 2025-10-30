@@ -10,14 +10,14 @@ from prodigyopt import Prodigy
 import random
 import math
 import re
-from conformer import Conformer
+from x_transformers import Encoder
 import warnings
 
 warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                embed_dim=512, depth=6, heads=8, freq_groups=8):
+                embed_dim=512, depth=12, heads=8, freq_groups=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -34,17 +34,11 @@ class NeuralModel(nn.Module):
 
         self.input_proj_stft = nn.Linear(self.group_size * in_channels * 2, embed_dim)
         
-        self.model = Conformer(
+        self.model = Encoder(
             dim=embed_dim,
             depth=depth,
-            dim_head=embed_dim // heads,
             heads=heads,
-            ff_mult=4,
-            conv_expansion_factor=2,
-            conv_kernel_size=31,
-            attn_dropout=0.1,
-            ff_dropout=0.1,
-            conv_dropout=0.1
+            rotary_pos_emb=True
         )
 
         self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2, bias=False)
@@ -482,7 +476,7 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
     return best_ckpt
 
 def inference(model, checkpoint_path, input_data, output_instrumental_path, output_vocal_path,
-              chunk_size=264600, overlap=88200, device='cpu', return_tensors=False):
+              chunk_size=485100, overlap=88200, device='cpu', return_tensors=False):
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
@@ -579,7 +573,7 @@ def main():
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
-    parser.add_argument('--segment_length', type=int, default=264600, help='Audio segment length for training and inference chunk size.')
+    parser.add_argument('--segment_length', type=int, default=485100, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     args = parser.parse_args()
 
