@@ -108,7 +108,6 @@ def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=485100, 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_type', type=str, default='conformer', choices=['conformer', 'xtrf'], help='Model architecture to use.')
     parser.add_argument('--infer', action='store_true')
     parser.add_argument('--checkpoint_path', type=str, required=True)
     parser.add_argument('--input_dir', type=str, required=True)
@@ -116,7 +115,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = NeuralModel(model_type=args.model_type)
+    model = NeuralModel()
 
     if args.infer:
         inference(model, args.checkpoint_path, args.input_dir, args.output_dir, device=device)
