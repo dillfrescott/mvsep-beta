@@ -3,4 +3,4 @@ torchaudio
 prodigyopt
 soundfile
 tqdm
-conformer
+x-transformers
