@@ -34,7 +34,7 @@ class NeuralModel(nn.Module):
 
         self.input_proj_stft = nn.Linear(self.group_size * in_channels * 2, embed_dim)
         
-        self.pre_dropout = nn.Dropout(p=0.3)
+        self.pre_dropout = nn.Dropout(p=0.2)
         
         self.model = Encoder(
             dim=embed_dim,
@@ -43,7 +43,7 @@ class NeuralModel(nn.Module):
             rotary_pos_emb=True
         )
         
-        self.post_dropout = nn.Dropout(p=0.3)
+        self.post_dropout = nn.Dropout(p=0.2)
 
         self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2, bias=False)
         self.final_activation = nn.Tanh()
