@@ -34,12 +34,16 @@ class NeuralModel(nn.Module):
 
         self.input_proj_stft = nn.Linear(self.group_size * in_channels * 2, embed_dim)
         
+        self.pre_dropout = nn.Dropout(p=0.3)
+        
         self.model = Encoder(
             dim=embed_dim,
             depth=depth,
             heads=heads,
             rotary_pos_emb=True
         )
+        
+        self.post_dropout = nn.Dropout(p=0.3)
 
         self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2, bias=False)
         self.final_activation = nn.Tanh()
@@ -60,7 +64,9 @@ class NeuralModel(nn.Module):
         x_tok = x_mag.permute(0, 4, 2, 1, 3).contiguous().view(B, T * self.freq_groups, C2 * self.group_size)
 
         x = self.input_proj_stft(x_tok)
+        x = self.pre_dropout(x)
         x = self.model(x)
+        x = self.post_dropout(x)
         x = self.output_proj(x)
 
         x = x.view(B, T, self.freq_groups, self.out_masks * 2, self.group_size)
