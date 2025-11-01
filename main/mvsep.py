@@ -15,9 +15,53 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+class SpatialAttention(nn.Module):
+    def __init__(self, dim, heads=4):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv_time = nn.Linear(dim, dim * 3, bias=False)
+        self.qkv_freq = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+
+        self.ln_time = nn.LayerNorm(dim)
+        self.ln_freq = nn.LayerNorm(dim)
+
+    def forward(self, x, freq_groups, T):
+        B, N, C = x.shape
+        x = x.view(B, T, freq_groups, C)
+
+        xt = self.ln_time(x)
+        qkv = self.qkv_time(xt).view(B, T, freq_groups, 3, self.heads, self.head_dim)
+        q, k, v = qkv[:, :, :, 0], qkv[:, :, :, 1], qkv[:, :, :, 2]
+        q = q.permute(0, 2, 3, 1, 4)
+        k = k.permute(0, 2, 3, 1, 4)
+        v = v.permute(0, 2, 3, 1, 4)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        x_time = (attn @ v).permute(0, 3, 1, 2, 4).reshape(B, T, freq_groups, C)
+        x = x + x_time
+
+        xf = self.ln_freq(x)
+        qkv = self.qkv_freq(xf).view(B, T, freq_groups, 3, self.heads, self.head_dim)
+        q, k, v = qkv[:, :, :, 0], qkv[:, :, :, 1], qkv[:, :, :, 2]
+        q = q.permute(0, 1, 3, 2, 4)
+        k = k.permute(0, 1, 3, 2, 4)
+        v = v.permute(0, 1, 3, 2, 4)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        x_freq = (attn @ v).permute(0, 1, 3, 2, 4).reshape(B, T, freq_groups, C)
+        x = x + x_freq
+
+        x = x.view(B, N, C)
+        return self.proj(x)
+
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                embed_dim=512, depth=12, heads=8, freq_groups=8):
+                 embed_dim=512, depth=12, heads=8, freq_groups=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -33,17 +77,15 @@ class NeuralModel(nn.Module):
         self.freq_pad = self.grouped_target_bins - grouped_freq_bins
 
         self.input_proj_stft = nn.Linear(self.group_size * in_channels * 2, embed_dim)
-        
-        self.pre_dropout = nn.Dropout(p=0.2)
-        
+
+        self.spatial_attn = SpatialAttention(embed_dim, heads=heads)
+
         self.model = Encoder(
             dim=embed_dim,
             depth=depth,
             heads=heads,
             rotary_pos_emb=True
         )
-        
-        self.post_dropout = nn.Dropout(p=0.2)
 
         self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2, bias=False)
         self.final_activation = nn.Tanh()
@@ -51,6 +93,7 @@ class NeuralModel(nn.Module):
     def forward(self, x_stft, x_audio=None):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
         x_mag = x_stft[:, :, :self.grouped_freq_bins, :]
+
         B, C2, Fg, T = x_mag.shape
 
         if self.freq_pad > 0:
@@ -60,17 +103,17 @@ class NeuralModel(nn.Module):
             Fg_p = Fg
 
         x_mag = x_mag.view(B, C2, self.freq_groups, self.group_size, T)
-        
-        x_tok = x_mag.permute(0, 4, 2, 1, 3).contiguous().view(B, T * self.freq_groups, C2 * self.group_size)
+        x_tok = x_mag.permute(0, 4, 2, 1, 3).contiguous()
+        x_tok = x_tok.view(B, T * self.freq_groups, C2 * self.group_size)
 
         x = self.input_proj_stft(x_tok)
-        x = self.pre_dropout(x)
+        x = self.spatial_attn(x, self.freq_groups, T)
         x = self.model(x)
-        x = self.post_dropout(x)
         x = self.output_proj(x)
 
         x = x.view(B, T, self.freq_groups, self.out_masks * 2, self.group_size)
-        x = x.permute(0, 3, 2, 4, 1).contiguous().view(B, self.out_masks * 2, Fg_p, T)
+        x = x.permute(0, 3, 2, 4, 1).contiguous()
+        x = x.view(B, self.out_masks * 2, Fg_p, T)
 
         if self.freq_pad > 0:
             x = x[:, :, :self.grouped_freq_bins, :]
@@ -79,7 +122,6 @@ class NeuralModel(nn.Module):
 
         nyq = x[:, :, -1:, :].clone()
         x = torch.cat([x, nyq], dim=2)
-
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
