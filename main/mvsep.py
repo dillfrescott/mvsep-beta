@@ -15,71 +15,72 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+class AxialAttention(nn.Module):
+    def __init__(self, dim, heads=8, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.t_attn = nn.MultiheadAttention(dim, heads, dropout=attn_drop, batch_first=True)
+        self.f_attn = nn.MultiheadAttention(dim, heads, dropout=attn_drop, batch_first=True)
+        self.t_ln = nn.LayerNorm(dim)
+        self.f_ln = nn.LayerNorm(dim)
+        self.t_ffn = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim*4), nn.GELU(), nn.Linear(dim*4, dim))
+        self.f_ffn = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim*4), nn.GELU(), nn.Linear(dim*4, dim))
+
+    def forward(self, x_t, x_f):
+        t = self.t_ln(x_t)
+        t_out, _ = self.t_attn(t, t, t, need_weights=False)
+        x_t = x_t + t_out
+        x_t = x_t + self.t_ffn(x_t)
+        f = self.f_ln(x_f)
+        f_out, _ = self.f_attn(f, f, f, need_weights=False)
+        x_f = x_f + f_out
+        x_f = x_f + self.f_ffn(x_f)
+        return x_t, x_f
+
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                embed_dim=512, depth=12, heads=8, freq_groups=8):
+                 embed_dim=512, depth=24, heads=8, axial_heads=8, cross_every=1):
         super().__init__()
         self.freq_bins = freq_bins
-        self.in_channels = in_channels
-        self.sources = sources
         self.out_masks = sources * in_channels
-        self.embed_dim = embed_dim
-        self.freq_groups = freq_groups
+        self.cross_every = max(1, cross_every)
+        self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
+        self.input_proj_freq = nn.Linear(in_channels * 2, embed_dim)
 
-        grouped_freq_bins = freq_bins - 1
-        self.grouped_freq_bins = grouped_freq_bins
-        self.group_size = math.ceil(grouped_freq_bins / freq_groups)
-        self.grouped_target_bins = self.group_size * freq_groups
-        self.freq_pad = self.grouped_target_bins - grouped_freq_bins
+        groups = []
+        d = depth
+        while d > 0:
+            n = min(self.cross_every, d)
+            groups.append(Encoder(dim=embed_dim, depth=n, heads=heads, rotary_pos_emb=True))
+            d -= n
+        self.encoder_groups = nn.ModuleList(groups)
 
-        self.input_proj_stft = nn.Linear(self.group_size * in_channels * 2, embed_dim)
-        
-        self.pre_dropout = nn.Dropout(p=0.1)
-        
-        self.model = Encoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            rotary_pos_emb=True
-        )
-        
-        self.post_dropout = nn.Dropout(p=0.1)
+        self.axial_blocks = nn.ModuleList([AxialAttention(embed_dim, heads=axial_heads) for _ in range(len(groups)-1)])
+        self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
-        self.output_proj = nn.Linear(embed_dim, self.group_size * self.out_masks * 2, bias=False)
-        self.final_activation = nn.Tanh()
+    def _build_time_tokens(self, x_stft):
+        B, C2, F, T = x_stft.shape
+        x_time = x_stft.permute(0, 3, 1, 2).reshape(B, T, C2 * F)
+        return self.input_proj_stft(x_time)
 
-    def forward(self, x_stft, x_audio=None):
+    def _build_freq_tokens(self, x_stft):
+        x_freq = x_stft.mean(dim=-1).permute(0, 2, 1)
+        return self.input_proj_freq(x_freq)
+
+    def forward(self, x_stft, x_audio):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        x_mag = x_stft[:, :, :self.grouped_freq_bins, :]
-        B, C2, Fg, T = x_mag.shape
+        x_t = self._build_time_tokens(x_stft)
+        x_f = self._build_freq_tokens(x_stft)
 
-        if self.freq_pad > 0:
-            x_mag = F.pad(x_mag, (0, 0, 0, self.freq_pad))
-            Fg_p = Fg + self.freq_pad
-        else:
-            Fg_p = Fg
+        for i, group in enumerate(self.encoder_groups):
+            x_t = group(x_t)
+            if i < len(self.axial_blocks):
+                x_t, x_f = self.axial_blocks[i](x_t, x_f)
 
-        x_mag = x_mag.view(B, C2, self.freq_groups, self.group_size, T)
-        
-        x_tok = x_mag.permute(0, 4, 2, 1, 3).contiguous().view(B, T * self.freq_groups, C2 * self.group_size)
-
-        x = self.input_proj_stft(x_tok)
-        x = self.pre_dropout(x)
-        x = self.model(x)
-        x = self.post_dropout(x)
-        x = self.output_proj(x)
-
-        x = x.view(B, T, self.freq_groups, self.out_masks * 2, self.group_size)
-        x = x.permute(0, 3, 2, 4, 1).contiguous().view(B, self.out_masks * 2, Fg_p, T)
-
-        if self.freq_pad > 0:
-            x = x[:, :, :self.grouped_freq_bins, :]
-
-        x = self.final_activation(x)
-
-        nyq = x[:, :, -1:, :].clone()
-        x = torch.cat([x, nyq], dim=2)
-
+        x_t = torch.tanh(x_t)
+        x = self.output_proj(x_t)
+        B, T, _ = x.shape
+        F = self.freq_bins
+        x = x.view(B, T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
@@ -573,8 +574,8 @@ def main():
     parser.add_argument('--infer', action='store_true', help='Run inference.')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to the training dataset.')
     parser.add_argument('--test_dir', type=str, default='test', help='Path to the test dataset for validation.')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training.')
-    parser.add_argument('--checkpoint_steps', type=int, default=8000, help='Save a checkpoint every X steps.')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training.')
+    parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save a checkpoint every X steps.')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Specific checkpoint path to resume training or for inference. Overrides automatic selection.')
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
