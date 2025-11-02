@@ -15,72 +15,34 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-class AxialAttention(nn.Module):
-    def __init__(self, dim, heads=8, attn_drop=0.0, proj_drop=0.0):
-        super().__init__()
-        self.t_attn = nn.MultiheadAttention(dim, heads, dropout=attn_drop, batch_first=True)
-        self.f_attn = nn.MultiheadAttention(dim, heads, dropout=attn_drop, batch_first=True)
-        self.t_ln = nn.LayerNorm(dim)
-        self.f_ln = nn.LayerNorm(dim)
-        self.t_ffn = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim*4), nn.GELU(), nn.Linear(dim*4, dim))
-        self.f_ffn = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim*4), nn.GELU(), nn.Linear(dim*4, dim))
-
-    def forward(self, x_t, x_f):
-        t = self.t_ln(x_t)
-        t_out, _ = self.t_attn(t, t, t, need_weights=False)
-        x_t = x_t + t_out
-        x_t = x_t + self.t_ffn(x_t)
-        f = self.f_ln(x_f)
-        f_out, _ = self.f_attn(f, f, f, need_weights=False)
-        x_f = x_f + f_out
-        x_f = x_f + self.f_ffn(x_f)
-        return x_t, x_f
-
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=12, heads=8, axial_heads=8, cross_every=1):
+                 embed_dim=512, depth=24, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
+        self.in_channels = in_channels
+        self.sources = sources
         self.out_masks = sources * in_channels
-        self.cross_every = max(1, cross_every)
+        self.embed_dim = embed_dim
         self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
-        self.input_proj_freq = nn.Linear(in_channels * 2, embed_dim)
-
-        groups = []
-        d = depth
-        while d > 0:
-            n = min(self.cross_every, d)
-            groups.append(Encoder(dim=embed_dim, depth=n, heads=heads, rotary_pos_emb=True))
-            d -= n
-        self.encoder_groups = nn.ModuleList(groups)
-
-        self.axial_blocks = nn.ModuleList([AxialAttention(embed_dim, heads=axial_heads) for _ in range(len(groups)-1)])
+        self.model = Encoder(
+            dim=embed_dim,
+            depth=depth,
+            heads=heads,
+            rotary_pos_emb=True
+        )
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
-
-    def _build_time_tokens(self, x_stft):
-        B, C2, F, T = x_stft.shape
-        x_time = x_stft.permute(0, 3, 1, 2).reshape(B, T, C2 * F)
-        return self.input_proj_stft(x_time)
-
-    def _build_freq_tokens(self, x_stft):
-        x_freq = x_stft.mean(dim=-1).permute(0, 2, 1)
-        return self.input_proj_freq(x_freq)
 
     def forward(self, x_stft, x_audio):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        x_t = self._build_time_tokens(x_stft)
-        x_f = self._build_freq_tokens(x_stft)
-
-        for i, group in enumerate(self.encoder_groups):
-            x_t = group(x_t)
-            if i < len(self.axial_blocks):
-                x_t, x_f = self.axial_blocks[i](x_t, x_f)
-
-        x_t = torch.tanh(x_t)
-        x = self.output_proj(x_t)
-        B, T, _ = x.shape
-        F = self.freq_bins
-        x = x.view(B, T, self.out_masks * 2, F).permute(0, 2, 3, 1)
+        B, C, F, T = x_stft.shape
+        x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
+        x = self.input_proj_stft(x_stft)
+        x = self.model(x)
+        x = torch.tanh(x)
+        x = self.output_proj(x)
+        current_T = x.shape[1]
+        x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
