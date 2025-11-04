@@ -4,4 +4,4 @@ torchcodec
 prodigyopt
 soundfile
 tqdm
-x-transformers
+x-transformers==2.10.2
