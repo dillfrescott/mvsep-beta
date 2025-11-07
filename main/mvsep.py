@@ -15,34 +15,50 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+class CoordAtt(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        hidden = max(64, in_channels)
+        self.conv1 = nn.Conv2d(in_channels, hidden, 1)
+        self.bn1 = nn.BatchNorm2d(hidden)
+        self.act = nn.GELU()
+        self.conv_h = nn.Conv2d(hidden, in_channels, 1)
+        self.conv_w = nn.Conv2d(hidden, in_channels, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_h = F.adaptive_avg_pool2d(x, (H, 1))
+        x_w = F.adaptive_avg_pool2d(x, (1, W)).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.act(self.bn1(self.conv1(y)))
+        x_h, x_w = y.split([H, W], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = torch.sigmoid(self.conv_h(x_h))
+        a_w = torch.sigmoid(self.conv_w(x_w))
+        return x * a_h * a_w
+
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=256, depth=32, heads=8):
+    def __init__(self, in_channels=2, sources=2, freq_bins=2049, embed_dim=256, depth=18, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
-        self.embed_dim = embed_dim
-        self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
-        self.model = Encoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            rotary_pos_emb=True
-        )
+        self.coord_att = CoordAtt(in_channels * 2)
+        self.input_proj_stft = nn.Linear(freq_bins * (in_channels * 2), embed_dim)
+        self.model = Encoder(dim=embed_dim, depth=depth, heads=heads, rotary_pos_emb=True)
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        B, C, F, T = x_stft.shape
-        x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
-        x = self.input_proj_stft(x_stft)
+        B, C, Freq, T = x_stft.shape
+        x_stft = self.coord_att(x_stft)
+        x_stft = x_stft.permute(0, 3, 2, 1).contiguous().view(B, T, Freq * C)
+        x = F.gelu(self.input_proj_stft(x_stft))
         x = self.model(x)
-        x = torch.tanh(x)
         x = self.output_proj(x)
-        current_T = x.shape[1]
-        x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
+        T_out = x.shape[1]
+        x = x.view(B, T_out, self.out_masks * 2, Freq).permute(0, 2, 3, 1)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
@@ -536,13 +552,13 @@ def main():
     parser.add_argument('--infer', action='store_true', help='Run inference.')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to the training dataset.')
     parser.add_argument('--test_dir', type=str, default='test', help='Path to the test dataset for validation.')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training.')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training.')
     parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save a checkpoint every X steps.')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Specific checkpoint path to resume training or for inference. Overrides automatic selection.')
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
-    parser.add_argument('--segment_length', type=int, default=1764000, help='Audio segment length for training and inference chunk size.')
+    parser.add_argument('--segment_length', type=int, default=882000, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     args = parser.parse_args()
 
