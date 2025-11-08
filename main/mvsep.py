@@ -15,48 +15,70 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-class CoordAtt(nn.Module):
-    def __init__(self, in_channels):
+class TimeFreqCrossTransformer(nn.Module):
+    def __init__(self,
+                 freq_bins=2049,
+                 embed_dim=256,
+                 time_depth=6,
+                 freq_depth=6,
+                 cross_tf_depth=4,
+                 cross_ft_depth=4,
+                 fusion_depth=3,
+                 heads=8,
+                 in_channels=4):
         super().__init__()
-        hidden = max(64, in_channels)
-        self.conv1 = nn.Conv2d(in_channels, hidden, 1)
-        self.bn1 = nn.BatchNorm2d(hidden)
-        self.act = nn.GELU()
-        self.conv_h = nn.Conv2d(hidden, in_channels, 1)
-        self.conv_w = nn.Conv2d(hidden, in_channels, 1)
+        self.freq_bins = freq_bins
+        self.embed_dim = embed_dim
+        self.time_proj = nn.Linear(freq_bins * in_channels, embed_dim)
+        self.freq_proj = nn.Linear(100 * in_channels, embed_dim)
+        self.time_encoder = Encoder(dim=embed_dim, depth=time_depth, heads=heads, rotary_pos_emb=True)
+        self.freq_encoder = Encoder(dim=embed_dim, depth=freq_depth, heads=heads, rotary_pos_emb=True)
+        self.cross_time_to_freq = Encoder(dim=embed_dim, depth=cross_tf_depth,
+                        heads=heads, cross_attend=True, rotary_pos_emb=True)
+        self.cross_freq_to_time = Encoder(dim=embed_dim, depth=cross_ft_depth,
+                        heads=heads, cross_attend=True, rotary_pos_emb=True)
+        self.fusion = Encoder(dim=embed_dim * 2, depth=fusion_depth, heads=heads, rotary_pos_emb=True)
+        self.output_proj = nn.Linear(embed_dim * 2, freq_bins * 8)
 
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x_h = F.adaptive_avg_pool2d(x, (H, 1))
-        x_w = F.adaptive_avg_pool2d(x, (1, W)).permute(0, 1, 3, 2)
-        y = torch.cat([x_h, x_w], dim=2)
-        y = self.act(self.bn1(self.conv1(y)))
-        x_h, x_w = y.split([H, W], dim=2)
-        x_w = x_w.permute(0, 1, 3, 2)
-        a_h = torch.sigmoid(self.conv_h(x_h))
-        a_w = torch.sigmoid(self.conv_w(x_w))
-        return x * a_h * a_w
+    def forward(self, x_stft):
+        B, C, Freq, T = x_stft.shape
+        time_tokens = x_stft.permute(0, 3, 2, 1).contiguous().view(B, T, Freq * C)
+        time_embed = self.time_proj(time_tokens)
+        time_window = 100
+        if T != time_window:
+            x_resampled = F.interpolate(x_stft, size=(Freq, time_window), mode='bilinear', align_corners=False)
+        else:
+            x_resampled = x_stft
+        freq_tokens = x_resampled.permute(0, 2, 3, 1).contiguous().view(B, Freq, time_window * C)
+        freq_embed = self.freq_proj(freq_tokens)
+        time_features = self.time_encoder(time_embed)
+        freq_features = self.freq_encoder(freq_embed)
+        freq_with_time = self.cross_time_to_freq(freq_features, context=time_features)
+        time_with_freq = self.cross_freq_to_time(time_features, context=freq_features)
+        if freq_with_time.size(1) != T:
+            freq_with_time = F.interpolate(freq_with_time.transpose(1, 2),
+                            size=T, mode='linear', align_corners=False).transpose(1, 2)
+        fused = torch.cat([time_with_freq, freq_with_time], dim=-1)
+        fused_out = self.fusion(fused)
+        output = self.output_proj(fused_out)
+        return output
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049, embed_dim=256, depth=18, heads=8):
+    def __init__(self, in_channels=2, sources=2, freq_bins=2049):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
-        self.coord_att = CoordAtt(in_channels * 2)
-        self.input_proj_stft = nn.Linear(freq_bins * (in_channels * 2), embed_dim)
-        self.model = Encoder(dim=embed_dim, depth=depth, heads=heads, rotary_pos_emb=True)
-        self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
+        self.transformer = TimeFreqCrossTransformer(
+            freq_bins=2049,
+            in_channels=4
+        )
 
     def forward(self, x_stft, x_audio):
-        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
         B, C, Freq, T = x_stft.shape
-        x_stft = self.coord_att(x_stft)
-        x_stft = x_stft.permute(0, 3, 2, 1).contiguous().view(B, T, Freq * C)
-        x = F.gelu(self.input_proj_stft(x_stft))
-        x = self.model(x)
-        x = self.output_proj(x)
+        x = torch.cat([x_stft.real, x_stft.imag], dim=1)
+        x = self.transformer(x)
         T_out = x.shape[1]
         x = x.view(B, T_out, self.out_masks * 2, Freq).permute(0, 2, 3, 1)
         return x
@@ -98,52 +120,37 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
 
         return complex_loss_total
 
-def loss_fn(pred_output,
-            mixture_spec,
-            target_vocal_audio,
-            target_instr_audio,
-            target_vocal_spec,
-            target_instr_spec,
-            stft_params_for_istft,
-            multi_res_complex_loss_calculator):
+def loss_fn(pred_output, mixture_spec, target_vocal_audio, target_instr_audio,
+            target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator):
     device = pred_output.device
-
     B, _, F_dim, T = pred_output.shape
     pred_output_reshaped = pred_output.view(B, 2, 4, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
-
-    pred_masks_real = pred_real[:, :4]
-    pred_masks_imag = pred_imag[:, :4]
-
-    vL_cmask = pred_masks_real[:, 0] + 1j * pred_masks_imag[:, 0]
-    vR_cmask = pred_masks_real[:, 1] + 1j * pred_masks_imag[:, 1]
-    iL_cmask = pred_masks_real[:, 2] + 1j * pred_masks_imag[:, 2]
-    iR_cmask = pred_masks_real[:, 3] + 1j * pred_masks_imag[:, 3]
-
-    vL_cmask, vR_cmask = vL_cmask.unsqueeze(1), vR_cmask.unsqueeze(1)
-    iL_cmask, iR_cmask = iL_cmask.unsqueeze(1), iR_cmask.unsqueeze(1)
-
-    v_spec_pred = torch.cat([vL_cmask * mixture_spec[:, 0:1],
-                             vR_cmask * mixture_spec[:, 1:2]], dim=1)
-    i_spec_pred = torch.cat([iL_cmask * mixture_spec[:, 0:1],
-                             iR_cmask * mixture_spec[:, 1:2]], dim=1)
-
-    spec_vocal_loss = F.l1_loss(v_spec_pred.real, target_vocal_spec.real) + \
-                      F.l1_loss(v_spec_pred.imag, target_vocal_spec.imag)
-    spec_instr_loss = F.l1_loss(i_spec_pred.real, target_instr_spec.real) + \
-                      F.l1_loss(i_spec_pred.imag, target_instr_spec.imag)
+    pred_mag = torch.sqrt(pred_real**2 + pred_imag**2 + 1e-8)
+    pred_phase_offset = torch.atan2(pred_imag, pred_real)
+    v_mag = pred_mag[:, 0:2] * torch.abs(mixture_spec)
+    v_phase = torch.angle(mixture_spec) + pred_phase_offset[:, 0:2] * 0.5
+    i_mag = pred_mag[:, 2:4] * torch.abs(mixture_spec)
+    i_phase = torch.angle(mixture_spec) + pred_phase_offset[:, 2:4] * 0.5
+    v_spec_pred = torch.polar(v_mag, v_phase)
+    i_spec_pred = torch.polar(i_mag, i_phase)
+    spec_vocal_loss = F.mse_loss(
+        torch.abs(v_spec_pred) * torch.cos(torch.angle(v_spec_pred) - torch.angle(target_vocal_spec)),
+        torch.abs(target_vocal_spec)
+    )
+    spec_instr_loss = F.mse_loss(
+        torch.abs(i_spec_pred) * torch.cos(torch.angle(i_spec_pred) - torch.angle(target_instr_spec)),
+        torch.abs(target_instr_spec)
+    )
     spectrogram_loss = spec_vocal_loss + spec_instr_loss
-
     n_fft = stft_params_for_istft['n_fft']
     hop_length = stft_params_for_istft['hop_length']
     window = stft_params_for_istft['window'].to(device)
     recon_len = target_vocal_audio.shape[-1]
-
     B, C, freq, T_spec = v_spec_pred.shape
     v_spec_pred_reshaped = v_spec_pred.reshape(B * C, freq, T_spec)
     i_spec_pred_reshaped = i_spec_pred.reshape(B * C, freq, T_spec)
-
     pred_vocal_audio = torch.istft(
         v_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
         window=window, center=True, length=recon_len
@@ -152,13 +159,10 @@ def loss_fn(pred_output,
         i_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
         window=window, center=True, length=recon_len
     ).reshape(B, C, -1)
-
     vocal_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
     audio_loss = vocal_loss + instr_loss
-
     total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss
-
     return total_loss
 
 class Dataset(Dataset):
