@@ -120,37 +120,52 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
 
         return complex_loss_total
 
-def loss_fn(pred_output, mixture_spec, target_vocal_audio, target_instr_audio,
-            target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator):
+def loss_fn(pred_output,
+            mixture_spec,
+            target_vocal_audio,
+            target_instr_audio,
+            target_vocal_spec,
+            target_instr_spec,
+            stft_params_for_istft,
+            multi_res_complex_loss_calculator):
     device = pred_output.device
+
     B, _, F_dim, T = pred_output.shape
     pred_output_reshaped = pred_output.view(B, 2, 4, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
-    pred_mag = torch.sqrt(pred_real**2 + pred_imag**2 + 1e-8)
-    pred_phase_offset = torch.atan2(pred_imag, pred_real)
-    v_mag = pred_mag[:, 0:2] * torch.abs(mixture_spec)
-    v_phase = torch.angle(mixture_spec) + pred_phase_offset[:, 0:2] * 0.5
-    i_mag = pred_mag[:, 2:4] * torch.abs(mixture_spec)
-    i_phase = torch.angle(mixture_spec) + pred_phase_offset[:, 2:4] * 0.5
-    v_spec_pred = torch.polar(v_mag, v_phase)
-    i_spec_pred = torch.polar(i_mag, i_phase)
-    spec_vocal_loss = F.mse_loss(
-        torch.abs(v_spec_pred) * torch.cos(torch.angle(v_spec_pred) - torch.angle(target_vocal_spec)),
-        torch.abs(target_vocal_spec)
-    )
-    spec_instr_loss = F.mse_loss(
-        torch.abs(i_spec_pred) * torch.cos(torch.angle(i_spec_pred) - torch.angle(target_instr_spec)),
-        torch.abs(target_instr_spec)
-    )
+
+    pred_masks_real = pred_real[:, :4]
+    pred_masks_imag = pred_imag[:, :4]
+
+    vL_cmask = pred_masks_real[:, 0] + 1j * pred_masks_imag[:, 0]
+    vR_cmask = pred_masks_real[:, 1] + 1j * pred_masks_imag[:, 1]
+    iL_cmask = pred_masks_real[:, 2] + 1j * pred_masks_imag[:, 2]
+    iR_cmask = pred_masks_real[:, 3] + 1j * pred_masks_imag[:, 3]
+
+    vL_cmask, vR_cmask = vL_cmask.unsqueeze(1), vR_cmask.unsqueeze(1)
+    iL_cmask, iR_cmask = iL_cmask.unsqueeze(1), iR_cmask.unsqueeze(1)
+
+    v_spec_pred = torch.cat([vL_cmask * mixture_spec[:, 0:1],
+                             vR_cmask * mixture_spec[:, 1:2]], dim=1)
+    i_spec_pred = torch.cat([iL_cmask * mixture_spec[:, 0:1],
+                             iR_cmask * mixture_spec[:, 1:2]], dim=1)
+
+    spec_vocal_loss = F.l1_loss(v_spec_pred.real, target_vocal_spec.real) + \
+                      F.l1_loss(v_spec_pred.imag, target_vocal_spec.imag)
+    spec_instr_loss = F.l1_loss(i_spec_pred.real, target_instr_spec.real) + \
+                      F.l1_loss(i_spec_pred.imag, target_instr_spec.imag)
     spectrogram_loss = spec_vocal_loss + spec_instr_loss
+
     n_fft = stft_params_for_istft['n_fft']
     hop_length = stft_params_for_istft['hop_length']
     window = stft_params_for_istft['window'].to(device)
     recon_len = target_vocal_audio.shape[-1]
+
     B, C, freq, T_spec = v_spec_pred.shape
     v_spec_pred_reshaped = v_spec_pred.reshape(B * C, freq, T_spec)
     i_spec_pred_reshaped = i_spec_pred.reshape(B * C, freq, T_spec)
+
     pred_vocal_audio = torch.istft(
         v_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
         window=window, center=True, length=recon_len
@@ -159,10 +174,13 @@ def loss_fn(pred_output, mixture_spec, target_vocal_audio, target_instr_audio,
         i_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
         window=window, center=True, length=recon_len
     ).reshape(B, C, -1)
+
     vocal_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
     audio_loss = vocal_loss + instr_loss
+
     total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss
+
     return total_loss
 
 class Dataset(Dataset):
