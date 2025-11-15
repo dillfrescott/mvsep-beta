@@ -30,7 +30,7 @@ class TimeFreqCrossTransformer(nn.Module):
         self.freq_bins = freq_bins
         self.embed_dim = embed_dim
         self.time_proj = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.freq_proj = nn.Linear(100 * in_channels, embed_dim)
+        self.freq_proj = nn.LazyLinear(embed_dim)
         self.time_encoder = Encoder(dim=embed_dim, depth=time_depth, heads=heads, rotary_pos_emb=True)
         self.freq_encoder = Encoder(dim=embed_dim, depth=freq_depth, heads=heads, rotary_pos_emb=True)
         self.cross_time_to_freq = Encoder(dim=embed_dim, depth=cross_tf_depth,
@@ -44,12 +44,7 @@ class TimeFreqCrossTransformer(nn.Module):
         B, C, Freq, T = x_stft.shape
         time_tokens = x_stft.permute(0, 3, 2, 1).contiguous().view(B, T, Freq * C)
         time_embed = self.time_proj(time_tokens)
-        time_window = 100
-        if T != time_window:
-            x_resampled = F.interpolate(x_stft, size=(Freq, time_window), mode='bilinear', align_corners=False)
-        else:
-            x_resampled = x_stft
-        freq_tokens = x_resampled.permute(0, 2, 3, 1).contiguous().view(B, Freq, time_window * C)
+        freq_tokens = x_stft.permute(0, 2, 3, 1).contiguous().view(B, Freq, T * C)
         freq_embed = self.freq_proj(freq_tokens)
         time_features = self.time_encoder(time_embed)
         freq_features = self.freq_encoder(freq_embed)
@@ -76,11 +71,11 @@ class NeuralModel(nn.Module):
         )
 
     def forward(self, x_stft, x_audio):
-        B, C, Freq, T = x_stft.shape
+        B, C, F, T = x_stft.shape
         x = torch.cat([x_stft.real, x_stft.imag], dim=1)
         x = self.transformer(x)
         T_out = x.shape[1]
-        x = x.view(B, T_out, self.out_masks * 2, Freq).permute(0, 2, 3, 1)
+        x = x.view(B, T_out, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
@@ -574,13 +569,13 @@ def main():
     parser.add_argument('--infer', action='store_true', help='Run inference.')
     parser.add_argument('--data_dir', type=str, default='train', help='Path to the training dataset.')
     parser.add_argument('--test_dir', type=str, default='test', help='Path to the test dataset for validation.')
-    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training.')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training.')
     parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save a checkpoint every X steps.')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Specific checkpoint path to resume training or for inference. Overrides automatic selection.')
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
-    parser.add_argument('--segment_length', type=int, default=882000, help='Audio segment length for training and inference chunk size.')
+    parser.add_argument('--segment_length', type=int, default=2646000, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     args = parser.parse_args()
 
