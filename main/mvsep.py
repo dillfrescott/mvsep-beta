@@ -113,8 +113,8 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
                                    win_length=win_length, window=window, return_complex=True, center=True)
 
-            real_loss = F.mse_loss(stft_pred.real, stft_true.real)
-            imag_loss = F.mse_loss(stft_pred.imag, stft_true.imag)
+            real_loss = F.l1_loss(stft_pred.real, stft_true.real)
+            imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
 
             complex_loss_total += (real_loss + imag_loss)
 
@@ -184,7 +184,7 @@ def loss_fn(pred_output,
     opposite_instr_loss = -multi_res_complex_loss_calculator(pred_instr_audio, target_vocal_audio)
     separation_loss = opposite_vocal_loss + opposite_instr_loss
 
-    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss + 0.2 * separation_loss
+    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss + 0.5 * separation_loss
 
     return total_loss
 
