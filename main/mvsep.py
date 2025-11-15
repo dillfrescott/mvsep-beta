@@ -113,8 +113,8 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
                                    win_length=win_length, window=window, return_complex=True, center=True)
 
-            real_loss = F.l1_loss(stft_pred.real, stft_true.real)
-            imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
+            real_loss = F.mse_loss(stft_pred.real, stft_true.real)
+            imag_loss = F.mse_loss(stft_pred.imag, stft_true.imag)
 
             complex_loss_total += (real_loss + imag_loss)
 
@@ -128,7 +128,6 @@ def loss_fn(pred_output,
             target_instr_spec,
             stft_params_for_istft,
             multi_res_complex_loss_calculator):
-
     device = pred_output.device
 
     B, _, F_dim, T = pred_output.shape
@@ -180,11 +179,7 @@ def loss_fn(pred_output,
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
     audio_loss = vocal_loss + instr_loss
 
-    opposite_vocal_loss = -multi_res_complex_loss_calculator(pred_vocal_audio, target_instr_audio)
-    opposite_instr_loss = -multi_res_complex_loss_calculator(pred_instr_audio, target_vocal_audio)
-    separation_loss = opposite_vocal_loss + opposite_instr_loss
-
-    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss + 0.5 * separation_loss
+    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss
 
     return total_loss
 
