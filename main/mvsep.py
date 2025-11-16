@@ -10,7 +10,7 @@ from prodigyopt import Prodigy
 import random
 import math
 import re
-from x_transformers import Encoder
+from x_transformers import Encoder, Decoder
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -23,7 +23,8 @@ class TimeFreqCrossTransformer(nn.Module):
                  freq_depth=6,
                  cross_tf_depth=4,
                  cross_ft_depth=4,
-                 fusion_depth=3,
+                 fusion_depth=4,
+                 decoder_depth=4,
                  heads=8,
                  in_channels=4):
         super().__init__()
@@ -38,6 +39,8 @@ class TimeFreqCrossTransformer(nn.Module):
         self.cross_freq_to_time = Encoder(dim=embed_dim, depth=cross_ft_depth,
                         heads=heads, cross_attend=True, rotary_pos_emb=True)
         self.fusion = Encoder(dim=embed_dim * 2, depth=fusion_depth, heads=heads, rotary_pos_emb=True)
+        self.decoder = Decoder(dim=embed_dim * 2, depth=decoder_depth, heads=heads, cross_attend=True,
+                        rotary_pos_emb=True)
         self.output_proj = nn.Linear(embed_dim * 2, freq_bins * 8)
 
     def forward(self, x_stft):
@@ -55,7 +58,8 @@ class TimeFreqCrossTransformer(nn.Module):
                             size=T, mode='linear', align_corners=False).transpose(1, 2)
         fused = torch.cat([time_with_freq, freq_with_time], dim=-1)
         fused_out = self.fusion(fused)
-        output = self.output_proj(fused_out)
+        decoded = self.decoder(fused_out, context=fused_out)
+        output = self.output_proj(decoded)
         return output
 
 class NeuralModel(nn.Module):
@@ -585,7 +589,7 @@ def main():
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
-    parser.add_argument('--segment_length', type=int, default=2646000, help='Audio segment length for training and inference chunk size.')
+    parser.add_argument('--segment_length', type=int, default=1764000, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     args = parser.parse_args()
 
