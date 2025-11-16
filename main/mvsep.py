@@ -507,16 +507,23 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
     with tqdm(total=math.ceil(total_length / step_size), desc="Processing audio", leave=False) as pbar:
         for i in range(0, total_length, step_size):
             start, end = i, min(i + chunk_size, total_length)
-            chunk, L = input_audio[:, start:end], end - start
-            
+            chunk = input_audio[:, start:end]
+            L = chunk.shape[1]
+
             if L < n_fft:
                 pbar.update(1)
                 continue
 
-            spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
+            target_length = chunk_size
+            padded_chunk = chunk
+            if L < target_length:
+                padding_amount = target_length - L
+                padded_chunk = F.pad(chunk, (0, padding_amount), 'constant', 0)
+
+            spec = torch.stft(padded_chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
 
             with torch.no_grad():
-                pred_output = model(spec.unsqueeze(0), chunk.unsqueeze(0)).squeeze(0)
+                pred_output = model(spec.unsqueeze(0), padded_chunk.unsqueeze(0)).squeeze(0)
 
             _, F_spec, T_spec = spec.shape
             pred_output_reshaped = pred_output.view(2, 4, F_spec, T_spec)
@@ -533,8 +540,11 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
             instrumental_spec = torch.stack([iL_cmask * spec[0], iR_cmask * spec[1]], dim=0)
             vocal_spec = torch.stack([vL_cmask * spec[0], vR_cmask * spec[1]], dim=0)
 
-            vocal_chunk = torch.istft(vocal_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=L, center=True)
-            inst_chunk = torch.istft(instrumental_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=L, center=True)
+            vocal_chunk_padded = torch.istft(vocal_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
+            inst_chunk_padded = torch.istft(instrumental_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
+
+            vocal_chunk = vocal_chunk_padded[:, :L]
+            inst_chunk = inst_chunk_padded[:, :L]
 
             fade_window = torch.ones(L, device=device)
 
