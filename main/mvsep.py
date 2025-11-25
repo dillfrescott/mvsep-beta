@@ -15,70 +15,34 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-class TimeFreqCrossTransformer(nn.Module):
-    def __init__(self,
-                 freq_bins=2049,
-                 embed_dim=256,
-                 time_depth=6,
-                 freq_depth=6,
-                 cross_tf_depth=4,
-                 cross_ft_depth=4,
-                 fusion_depth=4,
-                 refiner_depth=4,
-                 heads=8,
-                 in_channels=4):
-        super().__init__()
-        self.freq_bins = freq_bins
-        self.embed_dim = embed_dim
-        self.time_proj = nn.Linear(freq_bins * in_channels, embed_dim)
-        self.freq_proj = nn.LazyLinear(embed_dim)
-        self.time_encoder = Encoder(dim=embed_dim, depth=time_depth, heads=heads, rotary_pos_emb=True)
-        self.freq_encoder = Encoder(dim=embed_dim, depth=freq_depth, heads=heads, rotary_pos_emb=True)
-        self.cross_time_to_freq = Encoder(dim=embed_dim, depth=cross_tf_depth,
-                        heads=heads, cross_attend=True, rotary_pos_emb=True)
-        self.cross_freq_to_time = Encoder(dim=embed_dim, depth=cross_ft_depth,
-                        heads=heads, cross_attend=True, rotary_pos_emb=True)
-        self.fusion = Encoder(dim=embed_dim * 2, depth=fusion_depth, heads=heads, rotary_pos_emb=True)
-        self.refiner = Encoder(dim=embed_dim * 2, depth=refiner_depth, heads=heads, rotary_pos_emb=True)
-        self.output_proj = nn.Linear(embed_dim * 2, freq_bins * 8)
-
-    def forward(self, x_stft):
-        B, C, Freq, T = x_stft.shape
-        time_tokens = x_stft.permute(0, 3, 2, 1).contiguous().view(B, T, Freq * C)
-        time_embed = self.time_proj(time_tokens)
-        freq_tokens = x_stft.permute(0, 2, 3, 1).contiguous().view(B, Freq, T * C)
-        freq_embed = self.freq_proj(freq_tokens)
-        time_features = self.time_encoder(time_embed)
-        freq_features = self.freq_encoder(freq_embed)
-        freq_with_time = self.cross_time_to_freq(freq_features, context=time_features)
-        time_with_freq = self.cross_freq_to_time(time_features, context=freq_features)
-        if freq_with_time.size(1) != T:
-            freq_with_time = F.interpolate(freq_with_time.transpose(1, 2),
-                            size=T, mode='linear', align_corners=False).transpose(1, 2)
-        fused = torch.cat([time_with_freq, freq_with_time], dim=-1)
-        fused_out = self.fusion(fused)
-        refined = self.refiner(fused_out)
-        output = self.output_proj(refined)
-        return output
-
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049):
+    def __init__(self, in_channels=2, sources=2, freq_bins=2049,
+                 embed_dim=256, depth=24, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
-        self.transformer = TimeFreqCrossTransformer(
-            freq_bins=2049,
-            in_channels=4
+        self.embed_dim = embed_dim
+        self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
+        self.model = Encoder(
+            dim=embed_dim,
+            depth=depth,
+            heads=heads,
+            rotary_pos_emb=True
         )
+        self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
+        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
         B, C, F, T = x_stft.shape
-        x = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        x = self.transformer(x)
-        T_out = x.shape[1]
-        x = x.view(B, T_out, self.out_masks * 2, F).permute(0, 2, 3, 1)
+        x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
+        x = self.input_proj_stft(x_stft)
+        x = self.model(x)
+        x = torch.tanh(x)
+        x = self.output_proj(x)
+        current_T = x.shape[1]
+        x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
