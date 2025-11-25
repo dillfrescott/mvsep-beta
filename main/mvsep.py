@@ -111,63 +111,74 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
                                    win_length=win_length, window=window, return_complex=True, center=True)
 
-            real_loss = F.mse_loss(stft_pred.real, stft_true.real)
-            imag_loss = F.mse_loss(stft_pred.imag, stft_true.imag)
+            real_loss = F.l1_loss(stft_pred.real, stft_true.real)
+            imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
 
             complex_loss_total += (real_loss + imag_loss)
 
         return complex_loss_total
 
-def loss_fn(pred_output, mixture_spec, target_vocal_audio, target_instr_audio, 
-            target_vocal_spec, target_instr_spec, stft_params_for_istft, 
-            loss_type='multires', multi_res_loss_calculator=None):
-    
+def loss_fn(pred_output,
+            mixture_spec,
+            target_vocal_audio,
+            target_instr_audio,
+            target_vocal_spec,
+            target_instr_spec,
+            stft_params_for_istft,
+            multi_res_complex_loss_calculator):
     device = pred_output.device
+
     B, _, F_dim, T = pred_output.shape
     pred_output_reshaped = pred_output.view(B, 2, 4, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
-    
+
     pred_masks_real = pred_real[:, :4]
     pred_masks_imag = pred_imag[:, :4]
-    
+
     vL_cmask = pred_masks_real[:, 0] + 1j * pred_masks_imag[:, 0]
     vR_cmask = pred_masks_real[:, 1] + 1j * pred_masks_imag[:, 1]
     iL_cmask = pred_masks_real[:, 2] + 1j * pred_masks_imag[:, 2]
     iR_cmask = pred_masks_real[:, 3] + 1j * pred_masks_imag[:, 3]
-    
+
     vL_cmask, vR_cmask = vL_cmask.unsqueeze(1), vR_cmask.unsqueeze(1)
     iL_cmask, iR_cmask = iL_cmask.unsqueeze(1), iR_cmask.unsqueeze(1)
-    
-    v_spec_pred = torch.cat([vL_cmask * mixture_spec[:, 0:1], vR_cmask * mixture_spec[:, 1:2]], dim=1)
-    i_spec_pred = torch.cat([iL_cmask * mixture_spec[:, 0:1], iR_cmask * mixture_spec[:, 1:2]], dim=1)
-    
-    spec_vocal_loss = F.l1_loss(v_spec_pred.real, target_vocal_spec.real) + F.l1_loss(v_spec_pred.imag, target_vocal_spec.imag)
-    spec_instr_loss = F.l1_loss(i_spec_pred.real, target_instr_spec.real) + F.l1_loss(i_spec_pred.imag, target_instr_spec.imag)
+
+    v_spec_pred = torch.cat([vL_cmask * mixture_spec[:, 0:1],
+                             vR_cmask * mixture_spec[:, 1:2]], dim=1)
+    i_spec_pred = torch.cat([iL_cmask * mixture_spec[:, 0:1],
+                             iR_cmask * mixture_spec[:, 1:2]], dim=1)
+
+    spec_vocal_loss = F.l1_loss(v_spec_pred.real, target_vocal_spec.real) + \
+                      F.l1_loss(v_spec_pred.imag, target_vocal_spec.imag)
+    spec_instr_loss = F.l1_loss(i_spec_pred.real, target_instr_spec.real) + \
+                      F.l1_loss(i_spec_pred.imag, target_instr_spec.imag)
     spectrogram_loss = spec_vocal_loss + spec_instr_loss
-    
+
     n_fft = stft_params_for_istft['n_fft']
     hop_length = stft_params_for_istft['hop_length']
     window = stft_params_for_istft['window'].to(device)
     recon_len = target_vocal_audio.shape[-1]
-    
+
     B, C, freq, T_spec = v_spec_pred.shape
     v_spec_pred_reshaped = v_spec_pred.reshape(B * C, freq, T_spec)
     i_spec_pred_reshaped = i_spec_pred.reshape(B * C, freq, T_spec)
-    
-    pred_vocal_audio = torch.istft(v_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length, window=window, center=True, length=recon_len).reshape(B, C, -1)
-    pred_instr_audio = torch.istft(i_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length, window=window, center=True, length=recon_len).reshape(B, C, -1)
-    
-    if loss_type == 'l1':
-        audio_vocal_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
-        audio_instr_loss = F.l1_loss(pred_instr_audio, target_instr_audio)
-        audio_loss = audio_vocal_loss + audio_instr_loss
-    else:
-        vocal_loss = multi_res_loss_calculator(pred_vocal_audio, target_vocal_audio)
-        instr_loss = multi_res_loss_calculator(pred_instr_audio, target_instr_audio)
-        audio_loss = vocal_loss + instr_loss
-    
+
+    pred_vocal_audio = torch.istft(
+        v_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
+        window=window, center=True, length=recon_len
+    ).reshape(B, C, -1)
+    pred_instr_audio = torch.istft(
+        i_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
+        window=window, center=True, length=recon_len
+    ).reshape(B, C, -1)
+
+    vocal_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
+    instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
+    audio_loss = vocal_loss + instr_loss
+
     total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss
+
     return total_loss
 
 class Dataset(Dataset):
@@ -333,29 +344,24 @@ def validate(model, test_dir, device, chunk_size, overlap):
     avg_combined_sdr = (avg_vocal_sdr + avg_instr_sdr) / 2
     return avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr
 
-def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps,
-        args, checkpoint_path=None, window=None, reset_optimizer=False):
+def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, checkpoint_path=None, window=None, reset_optimizer=False):
     model.to(device)
     step = 0
     avg_loss = 0.0
-    best_sdr = -float('inf')
     
+    best_sdr = -float('inf')
     if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
         sdr_values = [float(re.search(r"sdr_([\d\.]+)\.pt", f).group(1)) for f in os.listdir('best_ckpts') if re.search(r"sdr_([\d\.]+)\.pt", f)]
         if sdr_values:
             best_sdr = max(sdr_values)
-            
-    stft_params_for_istft = {'n_fft': 4096, 'hop_length': 1024, 'window': window.to(device)}
 
-    multi_res_loss_calculator = None
-    if args.loss == 'multires':
-        print("Active Loss: Multi-Resolution STFT")
-        multi_res_loss_calculator = MultiResolutionComplexSTFTLoss(
-            fft_sizes=[1024, 2048, 8192], hop_sizes=[256, 512, 2048], win_lengths=[1024, 2048, 8192]
-        ).to(device)
-    else:
-        print("Active Loss: L1")
-    
+    stft_params_for_istft = {
+        'n_fft': 4096, 'hop_length': 1024, 'window': window.to(device)
+    }
+    multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
+        fft_sizes=[1024, 2048, 8192], hop_sizes=[256, 512, 2048], win_lengths=[1024, 2048, 8192]
+    ).to(device)
+
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
@@ -367,49 +373,51 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps,
             print(f"Resuming training from step {step}. MODEL AND OPTIMIZER LOADED.")
         else:
             print(f"Resuming training from step {step}. MODEL LOADED, OPTIMIZER RESET.")
-            
+
     progress_bar = tqdm(initial=step, total=None, dynamic_ncols=True)
     
     while True:
         model.train()
         for batch in dataloader:
             mixture_spec, vocal_audio, instr_audio, mixture_audio, target_vocal_spec, target_instr_spec = batch
-            mixture_spec = mixture_spec.to(device, non_blocking=True)
-            vocal_audio = vocal_audio.to(device, non_blocking=True)
-            instr_audio = instr_audio.to(device, non_blocking=True)
-            mixture_audio = mixture_audio.to(device, non_blocking=True)
-            target_vocal_spec = target_vocal_spec.to(device, non_blocking=True)
-            target_instr_spec = target_instr_spec.to(device, non_blocking=True)
             
+            mixture_spec, vocal_audio, instr_audio, mixture_audio = mixture_spec.to(device, non_blocking=True), vocal_audio.to(device, non_blocking=True), instr_audio.to(device, non_blocking=True), mixture_audio.to(device, non_blocking=True)
+            target_vocal_spec, target_instr_spec = target_vocal_spec.to(device, non_blocking=True), target_instr_spec.to(device, non_blocking=True)
+
             optimizer.zero_grad()
             pred_masks = model(mixture_spec, mixture_audio)
-            
-            loss = loss_fn(pred_masks, mixture_spec, vocal_audio, instr_audio, 
-                           target_vocal_spec, target_instr_spec, stft_params_for_istft, 
-                           loss_type=args.loss, multi_res_loss_calculator=multi_res_loss_calculator)
+            loss = loss_fn(pred_masks, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
             
             if torch.isnan(loss).any(): continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            
+
             avg_loss = 0.999 * avg_loss + 0.001 * loss.item() if step > 0 else loss.item()
             step += 1
             progress_bar.update(1)
             progress_bar.set_description(f"Step {step} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - Best SDR: {best_sdr:.4f}")
-            
+
             if step > 0 and step % checkpoint_steps == 0:
-                checkpoint_payload = {'step': step, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'avg_loss': avg_loss}
+                checkpoint_payload = {
+                    'step': step, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
+                    'avg_loss': avg_loss
+                }
+
                 reg_checkpoint_path = f"ckpts/checkpoint_step_{step}.pt"
                 torch.save(checkpoint_payload, reg_checkpoint_path)
-                
-                regular_checkpoints = sorted([os.path.join('ckpts', f) for f in os.listdir('ckpts') if f.endswith('.pt')], key=os.path.getmtime)
+
+                regular_checkpoints = sorted(
+                    [os.path.join('ckpts', f) for f in os.listdir('ckpts') if f.endswith('.pt')],
+                    key=os.path.getmtime
+                )
                 if len(regular_checkpoints) > 3:
                     os.remove(regular_checkpoints[0])
-                    
+
                 avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr = validate(model, args.test_dir, device, args.segment_length, overlap=88200)
-                print(f"\nValidation Step {step}: Vocal SDR: {avg_vocal_sdr:.4f}, Instr SDR: {avg_instr_sdr:.4f}, Combined SDR: {avg_combined_sdr:.4f}")
                 
+                print(f"\nValidation Step {step}: Vocal SDR: {avg_vocal_sdr:.4f}, Instr SDR: {avg_instr_sdr:.4f}, Combined SDR: {avg_combined_sdr:.4f}")
+
                 best_sdr_checkpoints = []
                 if os.path.exists('best_ckpts'):
                     for f in os.listdir('best_ckpts'):
@@ -417,21 +425,25 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps,
                         if match:
                             sdr = float(match.group(1))
                             best_sdr_checkpoints.append((sdr, os.path.join('best_ckpts', f)))
-                best_sdr_checkpoints.sort(key=lambda x: x[0])
                 
+                best_sdr_checkpoints.sort(key=lambda x: x[0])
+
                 current_best_sdr = best_sdr_checkpoints[-1][0] if best_sdr_checkpoints else -float('inf')
                 if avg_combined_sdr > current_best_sdr:
                     best_sdr = avg_combined_sdr
+                    
                     for _, path in best_sdr_checkpoints:
                         try:
                             os.remove(path)
                         except Exception:
                             pass
+
                     best_ckpt_filename = f"best_ckpts/checkpoint_step_{step}_sdr_{avg_combined_sdr:.4f}.pt"
                     torch.save(checkpoint_payload, best_ckpt_filename)
                     print(f"New best SDR! Saved checkpoint: {best_ckpt_filename}\n")
                 else:
                     print(f"SDR did not improve. Best SDR remains {best_sdr:.4f}\n")
+                
                 model.train()
 
 def find_latest_checkpoint(folder='ckpts'):
@@ -578,7 +590,6 @@ def main():
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
     parser.add_argument('--segment_length', type=int, default=1764000, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
-    parser.add_argument('--loss', type=str, default='multires', choices=['multires', 'l1'], help='Loss function to use: multires or l1')
     args = parser.parse_args()
 
     os.makedirs('ckpts', exist_ok=True)
@@ -595,7 +606,7 @@ def main():
             checkpoint_to_load = find_latest_checkpoint('ckpts')
             if checkpoint_to_load:
                 print(f"Automatically resuming from latest checkpoint: {checkpoint_to_load}")
-        
+
         train_dataset = Dataset(root_dir=args.data_dir, segment_length=args.segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, pin_memory=True, persistent_workers=True)
         train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
