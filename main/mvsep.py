@@ -10,14 +10,14 @@ from prodigyopt import Prodigy
 import random
 import math
 import re
-from x_transformers import Encoder
+from s5 import S5Block
 import warnings
 
 warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=18, heads=8):
+                 embed_dim=1024, depth=6):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -25,12 +25,9 @@ class NeuralModel(nn.Module):
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
         self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
-        self.model = Encoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            rotary_pos_emb=True
-        )
+        self.model = nn.Sequential(*[
+            S5Block(embed_dim, embed_dim, True) for _ in range(depth)
+        ])
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
@@ -75,8 +72,8 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
                                    win_length=win_length, window=window, return_complex=True, center=True)
 
-            real_loss = F.l1_loss(stft_pred.real, stft_true.real)
-            imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
+            real_loss = F.mse_loss(stft_pred.real, stft_true.real)
+            imag_loss = F.mse_loss(stft_pred.imag, stft_true.imag)
 
             complex_loss_total += (real_loss + imag_loss)
 
@@ -113,12 +110,6 @@ def loss_fn(pred_output,
     i_spec_pred = torch.cat([iL_cmask * mixture_spec[:, 0:1],
                              iR_cmask * mixture_spec[:, 1:2]], dim=1)
 
-    spec_vocal_loss = F.l1_loss(v_spec_pred.real, target_vocal_spec.real) + \
-                      F.l1_loss(v_spec_pred.imag, target_vocal_spec.imag)
-    spec_instr_loss = F.l1_loss(i_spec_pred.real, target_instr_spec.real) + \
-                      F.l1_loss(i_spec_pred.imag, target_instr_spec.imag)
-    spectrogram_loss = spec_vocal_loss + spec_instr_loss
-
     n_fft = stft_params_for_istft['n_fft']
     hop_length = stft_params_for_istft['hop_length']
     window = stft_params_for_istft['window'].to(device)
@@ -139,9 +130,8 @@ def loss_fn(pred_output,
 
     vocal_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
-    audio_loss = vocal_loss + instr_loss
-
-    total_loss = 0.5 * spectrogram_loss + 0.5 * audio_loss
+    
+    total_loss = vocal_loss + instr_loss
 
     return total_loss
 
