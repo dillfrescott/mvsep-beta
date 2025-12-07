@@ -554,6 +554,7 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
     parser.add_argument('--segment_length', type=int, default=1764000, help='Audio segment length for training and inference chunk size.')
+    parser.add_argument('--num_workers', type=int, default=16, help='Number of data loading workers.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     parser.add_argument('--noise_level', type=float, default=0.01, help='Amplitude of Gaussian noise to add to stems during training.')
     args = parser.parse_args()
@@ -574,7 +575,7 @@ def main():
                 print(f"Automatically resuming from latest checkpoint: {checkpoint_to_load}")
 
         train_dataset = Dataset(root_dir=args.data_dir, segment_length=args.segment_length, segment=True, noise_level=args.noise_level)
-        train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, pin_memory=True, persistent_workers=True)
+        train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
         train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
     
     elif args.infer:
