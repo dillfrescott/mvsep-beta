@@ -113,7 +113,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--infer', action='store_true')
     parser.add_argument('--checkpoint_path', type=str, required=True)
-    parser.add_argument('--input_dir', type=str, required=_True)
+    parser.add_argument('--input_dir', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='output')
     args = parser.parse_args()
 
