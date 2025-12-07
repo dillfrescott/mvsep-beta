@@ -309,7 +309,7 @@ def validate(model, test_dir, device, chunk_size, overlap):
     avg_combined_sdr = (avg_vocal_sdr + avg_instr_sdr) / 2
     return avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr
 
-def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, checkpoint_path=None, window=None, reset_optimizer=False):
+def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, segment_length, checkpoint_path=None, window=None, reset_optimizer=False):
     model.to(device)
     step = 0
     avg_loss = 0.0
@@ -578,7 +578,7 @@ def main():
 
         train_dataset = Dataset(root_dir=args.data_dir, segment_length=segment_length, segment=True, noise_level=noise_level)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
-        train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
+        train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, segment_length, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
     
     elif args.infer:
         if not args.input_file:
