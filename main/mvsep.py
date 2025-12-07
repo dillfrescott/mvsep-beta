@@ -139,11 +139,12 @@ def loss_fn(pred_output,
     return total_loss
 
 class Dataset(Dataset):
-    def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True):
+    def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True, noise_level=0.0):
         self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
         self.segment = segment
+        self.noise_level = noise_level
 
         self.n_fft = 4096
         self.hop_length = 1024
@@ -220,6 +221,13 @@ class Dataset(Dataset):
                 else:
                     vocal_seg = vocal_audio
                     instr_seg = instr_audio
+
+                if self.noise_level > 0:
+                    noise_factor = self.noise_level * (1 + (torch.rand(1).item() * 2 - 1) * 0.5)
+                    vocal_noise = torch.randn_like(vocal_seg) * noise_factor
+                    instr_noise = torch.randn_like(instr_seg) * noise_factor
+                    vocal_seg = vocal_seg + vocal_noise
+                    instr_seg = instr_seg + instr_noise
 
                 mixture_seg = vocal_seg + instr_seg
 
@@ -547,6 +555,7 @@ def main():
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
     parser.add_argument('--segment_length', type=int, default=1764000, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
+    parser.add_argument('--noise_level', type=float, default=0.01, help='Amplitude of Gaussian noise to add to stems during training.')
     args = parser.parse_args()
 
     os.makedirs('ckpts', exist_ok=True)
@@ -564,7 +573,7 @@ def main():
             if checkpoint_to_load:
                 print(f"Automatically resuming from latest checkpoint: {checkpoint_to_load}")
 
-        train_dataset = Dataset(root_dir=args.data_dir, segment_length=args.segment_length, segment=True)
+        train_dataset = Dataset(root_dir=args.data_dir, segment_length=args.segment_length, segment=True, noise_level=args.noise_level)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, pin_memory=True, persistent_workers=True)
         train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
     
