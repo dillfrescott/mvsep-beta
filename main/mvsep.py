@@ -379,7 +379,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 if len(regular_checkpoints) > 3:
                     os.remove(regular_checkpoints[0])
 
-                avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr = validate(model, args.test_dir, device, args.segment_length, overlap=88200)
+                avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
                 
                 print(f"\nValidation Step {step}: Vocal SDR: {avg_vocal_sdr:.4f}, Instr SDR: {avg_instr_sdr:.4f}, Combined SDR: {avg_combined_sdr:.4f}")
 
@@ -553,11 +553,13 @@ def main():
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
-    parser.add_argument('--segment_length', type=int, default=1764000, help='Audio segment length for training and inference chunk size.')
     parser.add_argument('--num_workers', type=int, default=16, help='Number of data loading workers.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
-    parser.add_argument('--noise_level', type=float, default=0.01, help='Amplitude of Gaussian noise to add to stems during training.')
+
     args = parser.parse_args()
+
+    noise_level = 0.01
+    segment_length = 1764000
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
@@ -574,7 +576,7 @@ def main():
             if checkpoint_to_load:
                 print(f"Automatically resuming from latest checkpoint: {checkpoint_to_load}")
 
-        train_dataset = Dataset(root_dir=args.data_dir, segment_length=args.segment_length, segment=True, noise_level=args.noise_level)
+        train_dataset = Dataset(root_dir=args.data_dir, segment_length=segment_length, segment=True, noise_level=noise_level)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
         train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
     
@@ -595,7 +597,7 @@ def main():
             print(f"Using specified checkpoint: {checkpoint_to_load}")
 
         inference(model, checkpoint_to_load, args.input_file, args.output_instrumental, args.output_vocal,
-                  chunk_size=args.segment_length, device=device)
+                  chunk_size=segment_length, device=device)
     
     else:
         print("Please specify either --train or --infer.")
