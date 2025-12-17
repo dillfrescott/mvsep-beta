@@ -10,7 +10,6 @@ from prodigyopt import Prodigy
 import random
 import math
 import re
-from x_transformers import Encoder
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -29,12 +28,14 @@ class NeuralModel(nn.Module):
 
         self.norm = nn.LayerNorm(embed_dim)
         
-        self.model = Encoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            rotary_pos_emb=True
+        self.model = torchaudio.models.Conformer(
+            input_dim = embed_dim,
+            num_heads = heads,
+            ffn_dim = embed_dim * 4,
+            num_layers = depth,
+            depthwise_conv_kernel_size = 31
         )
+
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
@@ -43,7 +44,8 @@ class NeuralModel(nn.Module):
         x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj_stft(x_stft)
         x = self.norm(x)
-        x = self.model(x)
+        lengths = torch.full((x.shape[0],), x.shape[1], dtype=torch.long, device=x.device)
+        x, _ = self.model(x, lengths)
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
