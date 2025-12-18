@@ -14,6 +14,19 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
                  embed_dim=512, depth=12, heads=8):
@@ -27,6 +40,7 @@ class NeuralModel(nn.Module):
         self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
 
         self.norm = nn.LayerNorm(embed_dim)
+        self.pos_encoder = SinusoidalPositionalEncoding(embed_dim)
         
         self.model = torchaudio.models.Conformer(
             input_dim = embed_dim,
@@ -42,10 +56,14 @@ class NeuralModel(nn.Module):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
         B, C, F, T = x_stft.shape
         x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
+        
         x = self.input_proj_stft(x_stft)
         x = self.norm(x)
+        x = self.pos_encoder(x)
+
         lengths = torch.full((x.shape[0],), x.shape[1], dtype=torch.long, device=x.device)
         x, _ = self.model(x, lengths)
+        
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
