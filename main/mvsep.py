@@ -10,22 +10,10 @@ from prodigyopt import Prodigy
 import random
 import math
 import re
+from x_transformers import Encoder
 import warnings
 
 warnings.filterwarnings("ignore")
-
-class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1), :]
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
@@ -40,30 +28,22 @@ class NeuralModel(nn.Module):
         self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
 
         self.norm = nn.LayerNorm(embed_dim)
-        self.pos_encoder = SinusoidalPositionalEncoding(embed_dim)
         
-        self.model = torchaudio.models.Conformer(
-            input_dim = embed_dim,
-            num_heads = heads,
-            ffn_dim = embed_dim * 4,
-            num_layers = depth,
-            depthwise_conv_kernel_size = 31
+        self.model = Encoder(
+            dim=embed_dim,
+            depth=depth,
+            heads=heads,
+            rotary_pos_emb=True
         )
-
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
         B, C, F, T = x_stft.shape
         x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
-        
         x = self.input_proj_stft(x_stft)
         x = self.norm(x)
-        x = self.pos_encoder(x)
-
-        lengths = torch.full((x.shape[0],), x.shape[1], dtype=torch.long, device=x.device)
-        x, _ = self.model(x, lengths)
-        
+        x = self.model(x)
         x = self.output_proj(x)
         current_T = x.shape[1]
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
@@ -340,7 +320,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     
     best_sdr = -float('inf')
     if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
-        sdr_values = [float(re.search(r"sdr_([-\d\.]+)\.pt", f).group(1)) for f in os.listdir('best_ckpts') if re.search(r"sdr_([-\d\.]+)\.pt", f)]
+        sdr_values = [float(re.search(r"sdr_([\d\.]+)\.pt", f).group(1)) for f in os.listdir('best_ckpts') if re.search(r"sdr_([\d\.]+)\.pt", f)]
         if sdr_values:
             best_sdr = max(sdr_values)
 
@@ -410,7 +390,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 best_sdr_checkpoints = []
                 if os.path.exists('best_ckpts'):
                     for f in os.listdir('best_ckpts'):
-                        match = re.search(r"sdr_([-\d\.]+)\.pt", f)
+                        match = re.search(r"sdr_([\d\.]+)\.pt", f)
                         if match:
                             sdr = float(match.group(1))
                             best_sdr_checkpoints.append((sdr, os.path.join('best_ckpts', f)))
@@ -461,7 +441,7 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
     best_ckpt = None
     for f in os.listdir(folder):
         if f.endswith('.pt'):
-            match = re.search(r"sdr_([-\d\.]+)\.pt", f)
+            match = re.search(r"sdr_([\d\.]+)\.pt", f)
             if match:
                 sdr = float(match.group(1))
                 if sdr > best_sdr:
