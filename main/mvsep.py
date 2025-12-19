@@ -340,7 +340,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     
     best_sdr = -float('inf')
     if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
-        sdr_values = [float(re.search(r"sdr_([\d\.]+)\.pt", f).group(1)) for f in os.listdir('best_ckpts') if re.search(r"sdr_([\d\.]+)\.pt", f)]
+        sdr_values = [float(re.search(r"sdr_([-\d\.]+)\.pt", f).group(1)) for f in os.listdir('best_ckpts') if re.search(r"sdr_([-\d\.]+)\.pt", f)]
         if sdr_values:
             best_sdr = max(sdr_values)
 
@@ -410,7 +410,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 best_sdr_checkpoints = []
                 if os.path.exists('best_ckpts'):
                     for f in os.listdir('best_ckpts'):
-                        match = re.search(r"sdr_([\d\.]+)\.pt", f)
+                        match = re.search(r"sdr_([-\d\.]+)\.pt", f)
                         if match:
                             sdr = float(match.group(1))
                             best_sdr_checkpoints.append((sdr, os.path.join('best_ckpts', f)))
@@ -461,7 +461,7 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
     best_ckpt = None
     for f in os.listdir(folder):
         if f.endswith('.pt'):
-            match = re.search(r"sdr_([\d\.]+)\.pt", f)
+            match = re.search(r"sdr_([-\d\.]+)\.pt", f)
             if match:
                 sdr = float(match.group(1))
                 if sdr > best_sdr:
