@@ -10,44 +10,92 @@ from prodigyopt import Prodigy
 import random
 import math
 import re
-from x_transformers import Encoder
+from x_transformers import Encoder, Attention
 import warnings
 
 warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=12, heads=8):
+                 embed_dim=512, depth=12, heads=8, num_bands=16):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
+        self.num_bands = num_bands
         
-        self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
+        self.band_indices = torch.linspace(0, freq_bins, steps=num_bands + 1).long()
+        
+        self.vocal_band_encoders = nn.ModuleList([
+            nn.Linear((self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2, embed_dim)
+            for i in range(num_bands)
+        ])
+        
+        self.instr_band_encoders = nn.ModuleList([
+            nn.Linear((self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2, embed_dim)
+            for i in range(num_bands)
+        ])
 
-        self.norm = nn.LayerNorm(embed_dim)
+        self.vocal_transformer = Encoder(dim=embed_dim, depth=depth, heads=heads, rotary_pos_emb=True)
+        self.instr_transformer = Encoder(dim=embed_dim, depth=depth, heads=heads, rotary_pos_emb=True)
+
+        self.vocal_to_instr_attn = Attention(dim=embed_dim, heads=heads)
+        self.instr_to_vocal_attn = Attention(dim=embed_dim, heads=heads)
+
+        self.vocal_norm = nn.LayerNorm(embed_dim)
+        self.instr_norm = nn.LayerNorm(embed_dim)
         
-        self.model = Encoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads,
-            rotary_pos_emb=True
-        )
-        self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
+        self.vocal_band_decoders = nn.ModuleList([
+            nn.Linear(embed_dim, (self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2)
+            for i in range(num_bands)
+        ])
+        
+        self.instr_band_decoders = nn.ModuleList([
+            nn.Linear(embed_dim, (self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2)
+            for i in range(num_bands)
+        ])
 
     def forward(self, x_stft, x_audio):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
         B, C, F, T = x_stft.shape
-        x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
-        x = self.input_proj_stft(x_stft)
-        x = self.norm(x)
-        x = self.model(x)
-        x = self.output_proj(x)
-        current_T = x.shape[1]
-        x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
-        return x
+        
+        v_feats = []
+        i_feats = []
+        
+        for i in range(self.num_bands):
+            start, end = self.band_indices[i], self.band_indices[i+1]
+            band = x_stft[:, :, start:end, :].permute(0, 3, 1, 2).contiguous().view(B, T, -1)
+            v_feats.append(self.vocal_band_encoders[i](band))
+            i_feats.append(self.instr_band_encoders[i](band))
+            
+        v_stack = torch.stack(v_feats, dim=2).view(B, T * self.num_bands, self.embed_dim)
+        i_stack = torch.stack(i_feats, dim=2).view(B, T * self.num_bands, self.embed_dim)
+        
+        v_stack = self.vocal_norm(v_stack)
+        i_stack = self.instr_norm(i_stack)
+
+        v_trf = self.vocal_transformer(v_stack)
+        i_trf = self.instr_transformer(i_stack)
+
+        v_final = self.vocal_to_instr_attn(v_trf, context=i_trf) + v_trf
+        i_final = self.instr_to_vocal_attn(i_trf, context=v_trf) + i_trf
+        
+        v_final = v_final.view(B, T, self.num_bands, self.embed_dim)
+        i_final = i_final.view(B, T, self.num_bands, self.embed_dim)
+        
+        v_out_bands = []
+        i_out_bands = []
+        for i in range(self.num_bands):
+            start, end = self.band_indices[i], self.band_indices[i+1]
+            v_out_bands.append(self.vocal_band_decoders[i](v_final[:, :, i, :]).view(B, T, 1, 2, -1))
+            i_out_bands.append(self.instr_band_decoders[i](i_final[:, :, i, :]).view(B, T, 1, 2, -1))
+            
+        v_mask = torch.cat(v_out_bands, dim=4).permute(0, 2, 3, 4, 1)
+        i_mask = torch.cat(i_out_bands, dim=4).permute(0, 2, 3, 4, 1)
+        
+        return torch.cat([v_mask, i_mask], dim=1).view(B, self.out_masks * 2, F, T)
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -552,7 +600,7 @@ def main():
     parser.add_argument('--data_dir', type=str, default='train', help='Path to the training dataset.')
     parser.add_argument('--test_dir', type=str, default='test', help='Path to the test dataset for validation.')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training.')
-    parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save a checkpoint every X steps.')
+    parser.add_argument('--checkpoint_steps', type=int, default=8000, help='Save a checkpoint every X steps.')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Specific checkpoint path to resume training or for inference. Overrides automatic selection.')
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
@@ -563,7 +611,7 @@ def main():
     args = parser.parse_args()
 
     noise_level = 0.005
-    segment_length = 1764000
+    segment_length = 176400
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
