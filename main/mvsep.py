@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=12, heads=8, num_bands=22):
+                 embed_dim=512, depth=12, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -25,64 +25,29 @@ class NeuralModel(nn.Module):
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
         
-        hz_points = torch.logspace(math.log10(1), math.log10(freq_bins), steps=num_bands + 1)
-        self.band_indices = torch.unique(hz_points.long(), sorted=True)
-        self.band_indices[0] = 0
-        self.band_indices[-1] = freq_bins
-        self.num_bands = len(self.band_indices) - 1
-        
-        self.band_encoders = nn.ModuleList([
-            nn.Linear((self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2, embed_dim)
-            for i in range(self.num_bands)
-        ])
-
-        self.transformer = Encoder(dim=embed_dim, depth=depth, heads=heads, rotary_pos_emb=True)
+        self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
 
         self.norm = nn.LayerNorm(embed_dim)
         
-        self.vocal_band_decoders = nn.ModuleList([
-            nn.Linear(embed_dim, (self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2)
-            for i in range(self.num_bands)
-        ])
-        
-        self.instr_band_decoders = nn.ModuleList([
-            nn.Linear(embed_dim, (self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2)
-            for i in range(self.num_bands)
-        ])
+        self.model = Encoder(
+            dim=embed_dim,
+            depth=depth,
+            heads=heads,
+            rotary_pos_emb=True
+        )
+        self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
-        x_stft_stacked = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        B, C, F, T = x_stft_stacked.shape
-        
-        feats = []
-        
-        for i in range(self.num_bands):
-            start, end = self.band_indices[i], self.band_indices[i+1]
-            band = x_stft_stacked[:, :, start:end, :].permute(0, 3, 1, 2).contiguous().view(B, T, -1)
-            feats.append(self.band_encoders[i](band))
-            
-        x_stack = torch.stack(feats, dim=2).view(B, T * self.num_bands, self.embed_dim)
-        
-        x_stack = self.norm(x_stack)
-
-        x_trf = self.transformer(x_stack)
-        
-        x_final = x_trf.view(B, T, self.num_bands, self.embed_dim)
-        
-        v_out_bands = []
-        i_out_bands = []
-        for i in range(self.num_bands):
-            start, end = self.band_indices[i], self.band_indices[i+1]
-            width = end - start
-            band_feat = x_final[:, :, i, :]
-            v_out_bands.append(self.vocal_band_decoders[i](band_feat).view(B, T, self.in_channels, 2, width))
-            i_out_bands.append(self.instr_band_decoders[i](band_feat).view(B, T, self.in_channels, 2, width))
-            
-        v_mask = torch.cat(v_out_bands, dim=4).permute(0, 2, 3, 4, 1)
-        i_mask = torch.cat(i_out_bands, dim=4).permute(0, 2, 3, 4, 1)
-        
-        out = torch.cat([v_mask, i_mask], dim=1).reshape(B, self.sources * self.in_channels * 2, F, T)
-        return out
+        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
+        B, C, F, T = x_stft.shape
+        x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
+        x = self.input_proj_stft(x_stft)
+        x = self.norm(x)
+        x = self.model(x)
+        x = self.output_proj(x)
+        current_T = x.shape[1]
+        x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
+        return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -598,7 +563,7 @@ def main():
     args = parser.parse_args()
 
     noise_level = 0.005
-    segment_length = 176400
+    segment_length = 1764000
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
