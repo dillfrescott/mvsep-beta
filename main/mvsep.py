@@ -24,13 +24,16 @@ class NeuralModel(nn.Module):
         self.sources = sources
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
-        self.num_bands = num_bands
         
-        self.band_indices = torch.linspace(0, freq_bins, steps=num_bands + 1).long()
+        hz_points = torch.logspace(math.log10(1), math.log10(freq_bins), steps=num_bands + 1)
+        self.band_indices = torch.unique(hz_points.long(), sorted=True)
+        self.band_indices[0] = 0
+        self.band_indices[-1] = freq_bins
+        self.num_bands = len(self.band_indices) - 1
         
         self.band_encoders = nn.ModuleList([
             nn.Linear((self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2, embed_dim)
-            for i in range(num_bands)
+            for i in range(self.num_bands)
         ])
 
         self.transformer = Encoder(dim=embed_dim, depth=depth, heads=heads, rotary_pos_emb=True)
@@ -39,23 +42,23 @@ class NeuralModel(nn.Module):
         
         self.vocal_band_decoders = nn.ModuleList([
             nn.Linear(embed_dim, (self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2)
-            for i in range(num_bands)
+            for i in range(self.num_bands)
         ])
         
         self.instr_band_decoders = nn.ModuleList([
             nn.Linear(embed_dim, (self.band_indices[i+1] - self.band_indices[i]) * in_channels * 2)
-            for i in range(num_bands)
+            for i in range(self.num_bands)
         ])
 
     def forward(self, x_stft, x_audio):
-        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        B, C, F, T = x_stft.shape
+        x_stft_stacked = torch.cat([x_stft.real, x_stft.imag], dim=1)
+        B, C, F, T = x_stft_stacked.shape
         
         feats = []
         
         for i in range(self.num_bands):
             start, end = self.band_indices[i], self.band_indices[i+1]
-            band = x_stft[:, :, start:end, :].permute(0, 3, 1, 2).contiguous().view(B, T, -1)
+            band = x_stft_stacked[:, :, start:end, :].permute(0, 3, 1, 2).contiguous().view(B, T, -1)
             feats.append(self.band_encoders[i](band))
             
         x_stack = torch.stack(feats, dim=2).view(B, T * self.num_bands, self.embed_dim)
@@ -70,14 +73,16 @@ class NeuralModel(nn.Module):
         i_out_bands = []
         for i in range(self.num_bands):
             start, end = self.band_indices[i], self.band_indices[i+1]
+            width = end - start
             band_feat = x_final[:, :, i, :]
-            v_out_bands.append(self.vocal_band_decoders[i](band_feat).view(B, T, 1, 2, -1))
-            i_out_bands.append(self.instr_band_decoders[i](band_feat).view(B, T, 1, 2, -1))
+            v_out_bands.append(self.vocal_band_decoders[i](band_feat).view(B, T, self.in_channels, 2, width))
+            i_out_bands.append(self.instr_band_decoders[i](band_feat).view(B, T, self.in_channels, 2, width))
             
         v_mask = torch.cat(v_out_bands, dim=4).permute(0, 2, 3, 4, 1)
         i_mask = torch.cat(i_out_bands, dim=4).permute(0, 2, 3, 4, 1)
         
-        return torch.cat([v_mask, i_mask], dim=1).view(B, self.out_masks * 2, F, T)
+        out = torch.cat([v_mask, i_mask], dim=1).reshape(B, self.sources * self.in_channels * 2, F, T)
+        return out
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
