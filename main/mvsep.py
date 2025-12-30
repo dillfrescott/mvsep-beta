@@ -3,7 +3,6 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.cuda.amp as amp
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
@@ -12,130 +11,42 @@ import random
 import math
 import re
 from x_transformers import Encoder
-from torch.utils.checkpoint import checkpoint
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 import warnings
 
 warnings.filterwarnings("ignore")
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.scale = dim ** 0.5
-        self.gamma = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        return F.normalize(x, dim=-1) * self.scale * self.gamma
-
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 dim=256, depth=12, heads=8, use_torch_checkpoint=False):
+                 embed_dim=512, depth=12, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
-        self.use_torch_checkpoint = use_torch_checkpoint
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
-        self.dim = dim
+        self.embed_dim = embed_dim
+        
+        self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
 
-        self.freqs_per_bands = (
-            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-            4, 4, 4, 4, 4, 4, 4, 4,
-            12, 12, 12, 12,
-            24, 24,
-            48,
-            128, 128,
-            1589
-        )
-
-        self.bands = []
-        self.dim_frequencies = []
-        current_freq = 0
-        for num_freqs in self.freqs_per_bands:
-            end_freq = current_freq + num_freqs
-            self.bands.append((current_freq, end_freq))
-            self.dim_frequencies.append(num_freqs)
-            current_freq = end_freq
-
-        self.dim_inputs = [df * in_channels * 2 for df in self.dim_frequencies]
-
-        self.num_bands = len(self.bands)
-
-        self.band_split = nn.ModuleList()
-        for dim_in in self.dim_inputs:
-            self.band_split.append(
-                nn.Sequential(
-                    RMSNorm(dim_in),
-                    nn.Linear(dim_in, self.dim)
-                )
-            )
-
-        self.band_output_projs = nn.ModuleList()
-        for num_freqs in self.dim_frequencies:
-            self.band_output_projs.append(
-                nn.Sequential(
-                    nn.Linear(self.dim, self.out_masks * 2 * num_freqs * 2),
-                    nn.GLU(dim=-1)
-                )
-            )
-
-        self.norm = RMSNorm(self.dim)
-
+        self.norm = nn.LayerNorm(embed_dim)
+        
         self.model = Encoder(
-            dim=self.dim,
+            dim=embed_dim,
             depth=depth,
             heads=heads,
-            polar_pos_emb=True,
-            attn_flash=True
+            polar_pos_emb=True
         )
+        self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        B, C2, F, T = x_stft.shape
-
-        x_stft = x_stft.permute(0, 3, 1, 2)
-        x_stft = x_stft.reshape(B * T, C2, F)
-
-        band_splits = x_stft.split(self.dim_frequencies, dim=-1)
-
-        band_embeddings = []
-        for i, band_input in enumerate(band_splits):
-            band_input = band_input.reshape(B * T, -1)
-
-            if self.use_torch_checkpoint:
-                band_out = checkpoint(self.band_split[i], band_input, use_reentrant=False)
-            else:
-                band_out = self.band_split[i](band_input)
-            band_out = band_out.view(B, T, self.dim)
-            band_embeddings.append(band_out)
-
-        x = torch.stack(band_embeddings, dim=2)
+        B, C, F, T = x_stft.shape
+        x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
+        x = self.input_proj_stft(x_stft)
         x = self.norm(x)
-
-        x = x.view(B, T * self.num_bands, self.dim)
-        if self.use_torch_checkpoint:
-            x = checkpoint(self.model, x, use_reentrant=False)
-        else:
-            x = self.model(x)
-        x = x.view(B, T, self.num_bands, self.dim)
-
-        x_out = torch.zeros(B, self.out_masks * 2, T, self.freq_bins, device=x.device, dtype=x.dtype)
-
-        for i, (start, end) in enumerate(self.bands):
-            band_feat = x[:, :, i, :]
-
-            band_out = self.band_output_projs[i](band_feat)
-            band_out = band_out.reshape(B, T, self.out_masks * 2, end - start)
-            band_out = band_out.permute(0, 2, 1, 3)
-
-            x_out[:, :, :, start:end] = band_out
-
-        x = x_out
-
-        x = x.view(B, 2, self.out_masks, T, F)
-
-        x = x.permute(0, 1, 2, 4, 3)
-
+        x = self.model(x)
+        x = self.output_proj(x)
+        current_T = x.shape[1]
+        x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
@@ -185,8 +96,8 @@ def loss_fn(pred_output,
             multi_res_complex_loss_calculator):
     device = pred_output.device
 
-    B, _, _, F_dim, T = pred_output.shape
-    pred_output_reshaped = pred_output
+    B, _, F_dim, T = pred_output.shape
+    pred_output_reshaped = pred_output.view(B, 2, 4, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
 
@@ -402,7 +313,7 @@ def validate(model, test_dir, device, chunk_size, overlap):
     avg_combined_sdr = (avg_vocal_sdr + avg_instr_sdr) / 2
     return avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr
 
-def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, segment_length, checkpoint_path=None, window=None, reset_optimizer=False, ema_model=None):
+def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, segment_length, checkpoint_path=None, window=None, reset_optimizer=False):
     model.to(device)
     step = 0
     avg_loss = 0.0
@@ -420,49 +331,36 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         fft_sizes=[1024, 2048, 8192], hop_sizes=[256, 512, 2048], win_lengths=[1024, 2048, 8192]
     ).to(device)
 
-    scaler = amp.GradScaler()
-
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
         step = checkpoint_data.get('step', 0)
         avg_loss = checkpoint_data.get('avg_loss', 0.0)
-
+        
         if not reset_optimizer and 'optimizer_state_dict' in checkpoint_data:
             optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
             print(f"Resuming training from step {step}. MODEL AND OPTIMIZER LOADED.")
         else:
             print(f"Resuming training from step {step}. MODEL LOADED, OPTIMIZER RESET.")
 
-        if 'scaler_state_dict' in checkpoint_data:
-            scaler.load_state_dict(checkpoint_data['scaler_state_dict'])
-
     progress_bar = tqdm(initial=step, total=None, dynamic_ncols=True)
-
-    torch.cuda.empty_cache()
-
+    
     while True:
         model.train()
         for batch in dataloader:
             mixture_spec, vocal_audio, instr_audio, mixture_audio, target_vocal_spec, target_instr_spec = batch
-
+            
             mixture_spec, vocal_audio, instr_audio, mixture_audio = mixture_spec.to(device, non_blocking=True), vocal_audio.to(device, non_blocking=True), instr_audio.to(device, non_blocking=True), mixture_audio.to(device, non_blocking=True)
             target_vocal_spec, target_instr_spec = target_vocal_spec.to(device, non_blocking=True), target_instr_spec.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
-            with amp.autocast(enabled=device.type == 'cuda'):
-                pred_masks = model(mixture_spec, mixture_audio)
-                loss = loss_fn(pred_masks, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
-
+            optimizer.zero_grad()
+            pred_masks = model(mixture_spec, mixture_audio)
+            loss = loss_fn(pred_masks, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
+            
             if torch.isnan(loss).any(): continue
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-
-            if ema_model is not None:
-                ema_model.update_parameters(model)
+            optimizer.step()
 
             avg_loss = 0.999 * avg_loss + 0.001 * loss.item() if step > 0 else loss.item()
             step += 1
@@ -472,7 +370,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             if step > 0 and step % checkpoint_steps == 0:
                 checkpoint_payload = {
                     'step': step, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
-                    'avg_loss': avg_loss, 'scaler_state_dict': scaler.state_dict()
+                    'avg_loss': avg_loss
                 }
 
                 reg_checkpoint_path = f"ckpts/checkpoint_step_{step}.pt"
@@ -485,9 +383,8 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 if len(regular_checkpoints) > 3:
                     os.remove(regular_checkpoints[0])
 
-                model_to_valid = ema_model.module if ema_model is not None else model
-                avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr = validate(model_to_valid, args.test_dir, device, segment_length, overlap=44100)
-
+                avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
+                
                 print(f"\nValidation Step {step}: Vocal SDR: {avg_vocal_sdr:.4f}, Instr SDR: {avg_instr_sdr:.4f}, Combined SDR: {avg_combined_sdr:.4f}")
 
                 best_sdr_checkpoints = []
@@ -553,7 +450,7 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
     return best_ckpt
 
 def inference(model, checkpoint_path, input_data, output_instrumental_path, output_vocal_path,
-              chunk_size=485100, overlap=44100, device='cpu', return_tensors=False):
+              chunk_size=485100, overlap=88200, device='cpu', return_tensors=False):
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
@@ -662,25 +559,19 @@ def main():
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
     parser.add_argument('--num_workers', type=int, default=16, help='Number of data loading workers.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
-    parser.add_argument('--use_torch_checkpoint', action='store_true', help='Use torch checkpointing to reduce memory.')
-    parser.add_argument('--ema_momentum', type=float, default=0.999, help='EMA momentum (0.0 to disable).')
 
     args = parser.parse_args()
 
     noise_level = 0.005
-    segment_length = 352800
+    segment_length = 1764000
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(use_torch_checkpoint=args.use_torch_checkpoint)
+    model = NeuralModel() 
     optimizer = Prodigy(model.parameters(), lr=1.0)
-
-    ema_model = None
-    if args.ema_momentum > 0:
-        ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(args.ema_momentum))
 
     if args.train:
         checkpoint_to_load = args.checkpoint_path
@@ -691,7 +582,7 @@ def main():
 
         train_dataset = Dataset(root_dir=args.data_dir, segment_length=segment_length, segment=True, noise_level=noise_level)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
-        train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, segment_length, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer, ema_model=ema_model)
+        train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, segment_length, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
     
     elif args.infer:
         if not args.input_file:
