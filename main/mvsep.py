@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=1024, depth=12, heads=8):
+                 embed_dim=512, depth=12, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -26,6 +26,8 @@ class NeuralModel(nn.Module):
         self.embed_dim = embed_dim
         
         self.input_proj_stft = nn.Linear(freq_bins * in_channels * 2, embed_dim)
+
+        self.norm = nn.LayerNorm(embed_dim)
         
         self.model = Encoder(
             dim=embed_dim,
@@ -33,7 +35,6 @@ class NeuralModel(nn.Module):
             heads=heads,
             polar_pos_emb=True
         )
-
         self.output_proj = nn.Linear(embed_dim, freq_bins * self.out_masks * 2)
 
     def forward(self, x_stft, x_audio):
@@ -41,6 +42,7 @@ class NeuralModel(nn.Module):
         B, C, F, T = x_stft.shape
         x_stft = x_stft.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
         x = self.input_proj_stft(x_stft)
+        x = self.norm(x)
         x = self.model(x)
         x = self.output_proj(x)
         current_T = x.shape[1]
