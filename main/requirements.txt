@@ -1,0 +1,7 @@
+torch
+torchaudio
+torchcodec
+prodigyopt
+soundfile
+tqdm
+x-transformers==2.12.2
