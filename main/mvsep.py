@@ -49,6 +49,12 @@ class NeuralModel(nn.Module):
         x = x.view(B, current_T, self.out_masks * 2, F).permute(0, 2, 3, 1)
         return x
 
+def vocal_instr_correlation_penalty(pred_vocal, pred_instr):
+    v = pred_vocal.flatten(1)
+    i = pred_instr.flatten(1)
+    corr = F.cosine_similarity(v, i, dim=1)
+    return corr.mean()
+
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
         super(MultiResolutionComplexSTFTLoss, self).__init__()
@@ -137,8 +143,9 @@ def loss_fn(pred_output,
 
     vocal_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
+    corr_loss = vocal_instr_correlation_penalty(pred_vocal_audio, pred_instr_audio)
     
-    total_loss = vocal_loss + instr_loss
+    total_loss = vocal_loss + instr_loss + corr_loss
 
     return total_loss
 
