@@ -66,7 +66,7 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             self.register_buffer(f'window_{i}', torch.hann_window(win_len), persistent=False)
 
     def forward(self, y_pred, y_true):
-        complex_loss_total = 0.0
+        total_loss = 0.0
 
         if y_pred.dim() == 2:
             y_pred = y_pred.unsqueeze(1)
@@ -85,12 +85,19 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
                                    win_length=win_length, window=window, return_complex=True, center=True)
 
-            real_loss = F.mse_loss(stft_pred.real, stft_true.real)
-            imag_loss = F.mse_loss(stft_pred.imag, stft_true.imag)
+            mag_pred = stft_pred.abs()
+            mag_true = stft_true.abs()
 
-            complex_loss_total += (real_loss + imag_loss)
+            sc_loss = torch.norm(mag_true - mag_pred, p="fro") / (torch.norm(mag_true, p="fro") + 1e-8)
 
-        return complex_loss_total
+            log_mag_loss = F.l1_loss(torch.log(mag_true + 1e-8), torch.log(mag_pred + 1e-8))
+
+            real_loss = F.l1_loss(stft_pred.real, stft_true.real)
+            imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
+
+            total_loss += (sc_loss + log_mag_loss + real_loss + imag_loss)
+
+        return total_loss
 
 def loss_fn(pred_output,
             mixture_spec,
