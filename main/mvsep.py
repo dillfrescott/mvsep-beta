@@ -15,53 +15,128 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=1024, depth=16, heads=8):
+class CrossScaleAttention(nn.Module):
+    def __init__(self, dim, heads):
         super().__init__()
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+
+    def forward(self, fine, coarse):
+        out, _ = self.attn(fine, coarse, coarse)
+        return fine + out
+
+class NeuralModel(nn.Module):
+    def __init__(
+        self,
+        in_channels=2,
+        sources=2,
+        freq_bins=2049,
+        embed_dim=512,
+        depth=8,
+        heads=8,
+        num_bands=12,
+        time_depth=4,
+        coarse_factor=3
+    ):
+        super().__init__()
+
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
+        self.num_bands = num_bands
 
-        proj_h = (freq_bins - 1) // 2 + 1
+        edges = torch.logspace(0, math.log10(freq_bins), steps=num_bands + 1)
+        edges = torch.unique(edges.round().clamp(0, freq_bins).long())
+        if edges[-1].item() != freq_bins:
+            edges = torch.cat([edges, torch.tensor([freq_bins])])
+        if edges[0].item() != 0:
+            edges[0] = 0
+        self.register_buffer("band_edges", edges)
 
-        self.feature_proj = nn.Sequential(
-            nn.Conv2d(in_channels * 2, 128, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=(2,1), padding=1),
-            nn.GELU(),
-            nn.Conv2d(128, embed_dim, kernel_size=(proj_h, 1)),
-        )
+        self.band_scale = nn.Parameter(torch.ones(num_bands, embed_dim))
+        self.band_gate = nn.Parameter(torch.zeros(num_bands))
 
-        self.norm = nn.LayerNorm(embed_dim)
+        self.band_projs_in = nn.ModuleList()
+        self.band_projs_out = nn.ModuleList()
 
-        self.model = Encoder(
+        for i in range(num_bands):
+            h = self.band_edges[i + 1] - self.band_edges[i]
+            self.band_projs_in.append(
+                nn.Conv2d(in_channels * 2, embed_dim, (h, 3), padding=(0, 1))
+            )
+            self.band_projs_out.append(
+                nn.Sequential(
+                    nn.Conv2d(embed_dim, embed_dim, (1, 3), padding=(0, 1)),
+                    nn.GELU(),
+                    nn.Conv2d(embed_dim, self.out_masks * 2 * h, 1)
+                )
+            )
+
+        self.band_norm = nn.LayerNorm(embed_dim)
+        self.band_encoder = Encoder(
             dim=embed_dim,
             depth=depth,
             heads=heads,
             polar_pos_emb=True
         )
 
-        self.output_cnn = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(embed_dim, self.freq_bins * self.out_masks * 2, kernel_size=1)
+        self.time_norm = nn.LayerNorm(embed_dim)
+        self.time_encoder = Encoder(
+            dim=embed_dim,
+            depth=time_depth,
+            heads=heads,
+            polar_pos_emb=False
         )
 
-    def forward(self, x_stft, x_audio):
+        self.coarse_pool = nn.AvgPool1d(coarse_factor, stride=coarse_factor)
+        self.cross_scale = CrossScaleAttention(embed_dim, heads)
+
+    def forward(self, x_stft, x_audio=None):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        x = self.feature_proj(x_stft)
-        x = x.squeeze(2).permute(0, 2, 1)
-        x = self.norm(x)
-        x = self.model(x)
-        x = x.permute(0, 2, 1).unsqueeze(2)
-        x = self.output_cnn(x)
-        x = x.squeeze(2)
-        B, C, T = x.shape
-        x = x.view(B, self.out_masks * 2, self.freq_bins, T)
-        return x
+        B, C, F, T = x_stft.shape
+
+        band_embs = []
+        for i in range(self.num_bands):
+            s = self.band_edges[i].item()
+            e = self.band_edges[i + 1].item()
+            xb = x_stft[:, :, s:e, :]
+            proj = self.band_projs_in[i](xb).squeeze(2)
+            band_embs.append(proj)
+
+        x = torch.stack(band_embs, dim=1)
+        x = x.permute(0, 3, 1, 2)
+        x = x.reshape(B * T, self.num_bands, self.embed_dim)
+
+        x = x * self.band_scale.unsqueeze(0)
+        x = self.band_norm(x)
+        x = self.band_encoder(x)
+
+        x = x.reshape(B, T, self.num_bands, self.embed_dim)
+        x = x.permute(0, 2, 1, 3)
+
+        x = x.reshape(B * self.num_bands, T, self.embed_dim)
+        x = self.time_norm(x)
+        x = self.time_encoder(x)
+        x = x.reshape(B, self.num_bands, T, self.embed_dim)
+
+        fine = x.permute(0, 2, 1, 3).reshape(B * T, self.num_bands, self.embed_dim)
+        coarse = self.coarse_pool(fine.transpose(1, 2)).transpose(1, 2)
+        fine = self.cross_scale(fine, coarse)
+        x = fine.reshape(B, T, self.num_bands, self.embed_dim).permute(0, 2, 3, 1)
+
+        gates = torch.sigmoid(self.band_gate).view(1, -1, 1, 1)
+        x = x * gates
+
+        outs = []
+        for i in range(self.num_bands):
+            h = self.band_edges[i + 1].item() - self.band_edges[i].item()
+            feat = x[:, i, :, :].unsqueeze(2)
+            out = self.band_projs_out[i](feat).squeeze(2)
+            out = out.view(B, self.out_masks * 2, h, T)
+            outs.append(out)
+
+        return torch.cat(outs, dim=2)
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -152,7 +227,15 @@ def loss_fn(pred_output,
     vocal_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
     
-    total_loss = vocal_loss + instr_loss
+    pv_flat = pred_vocal_audio.reshape(-1, pred_vocal_audio.shape[-1])
+    ti_flat = target_instr_audio.reshape(-1, target_instr_audio.shape[-1])
+    pi_flat = pred_instr_audio.reshape(-1, pred_instr_audio.shape[-1])
+    tv_flat = target_vocal_audio.reshape(-1, target_vocal_audio.shape[-1])
+
+    cos_loss_v_i = torch.abs(F.cosine_similarity(pv_flat, ti_flat, dim=1)).mean()
+    cos_loss_i_v = torch.abs(F.cosine_similarity(pi_flat, tv_flat, dim=1)).mean()
+
+    total_loss = vocal_loss + instr_loss + (cos_loss_v_i + cos_loss_i_v) * 2
 
     return total_loss
 
