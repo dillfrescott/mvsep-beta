@@ -22,50 +22,27 @@ class NeuralModel(nn.Module):
         super().__init__()
         self.freq_bins = freq_bins
         self.n_bands = n_bands
-        self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
         self.in_channels = in_channels
+        self.sources = sources
 
         def get_band_widths(n_bins, n_bands):
             splits = np.logspace(np.log10(1), np.log10(n_bins), n_bands + 1)
             splits = np.unique(np.round(splits).astype(int))
             if splits[0] == 0: splits[0] = 1
             if splits[-1] != n_bins: splits[-1] = n_bins
-            
             widths = np.diff(splits).tolist()
-            
             while len(widths) < n_bands:
                 widths.insert(0, 1)
-            
             widths[-1] += (n_bins - sum(widths))
-                
             return widths
 
         self.band_widths = get_band_widths(freq_bins, n_bands)
-        self.max_band_width = max(self.band_widths)
         
-        indices = []
-        for i, w in enumerate(self.band_widths):
-            indices.extend([i * self.max_band_width + j for j in range(w)])
-        self.register_buffer('freq_index_map', torch.tensor(indices, dtype=torch.long))
-
-        self.out_factor = self.out_masks * 2
-        self.max_out_channels = self.max_band_width * self.out_factor
-
-        self.band_proj1 = nn.Conv2d(
-            in_channels * 2 * self.n_bands, 
-            embed_dim * self.n_bands, 
-            kernel_size=(self.max_band_width, 1), 
-            groups=self.n_bands
-        )
-        self.act = nn.GELU()
-        self.band_proj2 = nn.Conv2d(
-            embed_dim * self.n_bands, 
-            embed_dim * self.n_bands, 
-            kernel_size=(1, 3), 
-            padding=(0, 1), 
-            groups=self.n_bands
-        )
+        self.band_projections = nn.ModuleList([
+            nn.Linear(width * in_channels * 2, embed_dim) 
+            for width in self.band_widths
+        ])
 
         self.norm = nn.LayerNorm(embed_dim)
 
@@ -81,61 +58,54 @@ class NeuralModel(nn.Module):
             heads=heads
         )
 
-        self.output_proj1 = nn.Conv2d(
-            embed_dim * self.n_bands, 
-            embed_dim * self.n_bands, 
-            kernel_size=(1, 3), 
-            padding=(0, 1), 
-            groups=self.n_bands
-        )
-        self.output_proj2 = nn.Conv2d(
-            embed_dim * self.n_bands, 
-            self.max_out_channels * self.n_bands, 
-            kernel_size=(1, 1), 
-            groups=self.n_bands
-        )
+        output_dim_factor = sources * in_channels * 2 
+        
+        self.mask_estimators = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, width * output_dim_factor)
+            )
+            for width in self.band_widths
+        ])
 
     def forward(self, x_stft, x_audio):
-        B, _, _, T = x_stft.shape
+        B, C, F_bins, T = x_stft.shape
         
-        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-
-        bands = torch.split(x_stft, self.band_widths, dim=2)
-        bands_padded = [
-            F.pad(b, (0, 0, 0, self.max_band_width - b.shape[2])) 
-            for b in bands
-        ]
-        x = torch.cat(bands_padded, dim=1)
-
-        x = self.band_proj1(x)
-        x = self.act(x)
-        x = self.band_proj2(x)
-
-        x = x.view(B, self.n_bands, self.embed_dim, 1, T)
-        x = x.squeeze(3).permute(0, 1, 3, 2).contiguous()
+        x = torch.view_as_real(x_stft)
+        x = x.permute(0, 2, 3, 1, 4).flatten(3) 
         
-        x = self.norm(x)
+        x_bands = torch.split(x, self.band_widths, dim=1)
+        
+        outs = []
+        for band_x, proj in zip(x_bands, self.band_projections):
+            band_feat = band_x.permute(0, 2, 1, 3).reshape(B, T, -1)
+            outs.append(proj(band_feat))
+            
+        x = torch.stack(outs, dim=2)
+        
         x = x.view(B * self.n_bands, T, self.embed_dim)
+        x = self.norm(x)
         x = self.time_encoder(x)
+        
         x = x.view(B, self.n_bands, T, self.embed_dim)
-
-        x = x.permute(0, 2, 1, 3).contiguous().view(B * T, self.n_bands, self.embed_dim)
+        x = x.permute(0, 2, 1, 3).reshape(B * T, self.n_bands, self.embed_dim)
         x = self.freq_mixer(x)
-        x = x.view(B, T, self.n_bands, self.embed_dim)
-
-        x = x.permute(0, 2, 3, 1).contiguous().view(B, self.n_bands * self.embed_dim, 1, T)
         
-        x = self.output_proj1(x)
-        x = self.act(x)
-        x = self.output_proj2(x)
+        x = x.view(B, T, self.n_bands, self.embed_dim).permute(0, 2, 1, 3)
 
-        x = x.view(B, self.n_bands, self.max_out_channels, T)
-        x = x.view(B, self.n_bands, self.out_factor, self.max_band_width, T)
-        x = x.permute(0, 2, 1, 3, 4).contiguous()
-        x = x.view(B, self.out_factor, self.n_bands * self.max_band_width, T)
+        mask_outs = []
+        for i, estimator in enumerate(self.mask_estimators):
+            est = estimator(x[:, i])
+            width = self.band_widths[i]
+            est = est.view(B, T, width, self.sources, self.in_channels, 2)
+            mask_outs.append(est)
+
+        x = torch.cat(mask_outs, dim=2)
         
-        x = x[:, :, self.freq_index_map, :]
-
+        x = x.permute(0, 3, 4, 5, 2, 1).contiguous()
+        x = x.view(B, -1, self.freq_bins, T)
+        
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
