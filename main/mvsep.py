@@ -9,141 +9,98 @@ from tqdm import tqdm
 from prodigyopt import Prodigy
 import random
 import math
+import numpy as np
 import re
+from encoder import Encoder
 import warnings
 
 warnings.filterwarnings("ignore")
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-
-    def forward(self, seq_len, device):
-        t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos(), emb.sin()
-
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-def apply_rope(x, cos, sin):
-    return x * cos + rotate_half(x) * sin
-
-class Attention(nn.Module):
-    def __init__(self, dim, heads=8):
-        super().__init__()
-        self.heads = heads
-        self.head_dim = dim // heads
-        
-        self.wq = nn.Linear(dim, dim, bias=False)
-        self.wk = nn.Linear(dim, dim, bias=False)
-        self.wv = nn.Linear(dim, dim, bias=False)
-        
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-
-        self.rope = RotaryEmbedding(self.head_dim)
-
-    def forward(self, x):
-        B, T, C = x.shape
-        H, D = self.heads, self.head_dim
-
-        q = self.wq(x).view(B, T, H, D).transpose(1, 2)
-        k = self.wk(x).view(B, T, H, D).transpose(1, 2)
-        v = self.wv(x).view(B, T, H, D).transpose(1, 2)
-
-        cos, sin = self.rope(T, x.device)
-        
-        cos = cos.view(1, 1, T, D)
-        sin = sin.view(1, 1, T, D)
-        
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
-
-        scores = torch.einsum("bhtd,bhsd->bhts", q, k) / (D ** 0.5)
-        attn = F.softmax(scores, dim=-1)
-
-        out = torch.einsum("bhts,bhsd->bhtd", attn, v)
-        
-        out = out.transpose(1, 2).reshape(B, T, C)
-        return self.out_proj(out)
-
-class EncoderLayer(nn.Module):
-    def __init__(self, dim, heads):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ff = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim)
-        )
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ff(self.norm2(x))
-        return x
-
-class Encoder(nn.Module):
-    def __init__(self, dim, depth, heads):
-        super().__init__()
-        self.layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return self.norm(x)
-
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=256, depth=12, heads=8):
+                 embed_dim=256, depth=12, heads=8, n_bands=12):
         super().__init__()
         self.freq_bins = freq_bins
-        self.in_channels = in_channels
-        self.sources = sources
+        self.n_bands = n_bands
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
 
-        proj_h = (freq_bins - 1) // 2 + 1
+        def get_band_widths(n_bins, n_bands):
+            splits = np.logspace(np.log10(1), np.log10(n_bins), n_bands + 1)
+            splits = np.unique(np.round(splits).astype(int))
+            if splits[0] == 0: splits[0] = 1
+            if splits[-1] != n_bins: splits[-1] = n_bins
+            
+            widths = np.diff(splits).tolist()
+            
+            while len(widths) < n_bands:
+                widths.insert(0, 1)
+            
+            widths[-1] += (n_bins - sum(widths))
+                
+            return widths
 
-        self.feature_proj = nn.Sequential(
-            nn.Conv2d(in_channels * 2, 128, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=(2, 1), padding=1),
-            nn.GELU(),
-            nn.Conv2d(128, embed_dim, kernel_size=(proj_h, 1)),
-        )
+        self.band_widths = get_band_widths(freq_bins, n_bands)
+        
+        self.band_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels * 2, embed_dim, kernel_size=(w, 1)),
+                nn.GELU(),
+                nn.Conv2d(embed_dim, embed_dim, kernel_size=(1, 3), padding=(0, 1))
+            ) for w in self.band_widths
+        ])
 
         self.norm = nn.LayerNorm(embed_dim)
 
-        self.model = Encoder(
+        self.time_encoder = Encoder(
             dim=embed_dim,
             depth=depth,
             heads=heads
         )
 
-        self.output_cnn = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(embed_dim, self.freq_bins * self.out_masks * 2, kernel_size=1)
+        self.freq_mixer = Encoder(
+            dim=embed_dim,
+            depth=2,
+            heads=heads
         )
+
+        self.output_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(embed_dim, embed_dim, kernel_size=(1, 3), padding=(0, 1)),
+                nn.GELU(),
+                nn.Conv2d(embed_dim, self.out_masks * 2 * w, kernel_size=1)
+            ) for w in self.band_widths
+        ])
 
     def forward(self, x_stft, x_audio):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        x = self.feature_proj(x_stft)
-        x = x.squeeze(2).permute(0, 2, 1)
-        x = self.norm(x)
-        x = self.model(x)
-        x = x.permute(0, 2, 1).unsqueeze(2)
-        x = self.output_cnn(x)
-        x = x.squeeze(2)
-        B, C, T = x.shape
-        x = x.view(B, self.out_masks * 2, self.freq_bins, T)
+        bands = torch.split(x_stft, self.band_widths, dim=2)
+
+        band_features = []
+        for i, band in enumerate(bands):
+            x = self.band_projs[i](band)
+            x = x.squeeze(2).permute(0, 2, 1)
+            x = self.norm(x)
+            x = self.time_encoder(x)
+            band_features.append(x)
+
+        x = torch.stack(band_features, dim=2)
+        B, T, _, D = x.shape
+        x = x.view(B * T, self.n_bands, D)
+        
+        x = self.freq_mixer(x)
+        
+        x = x.view(B, T, self.n_bands, D)
+
+        out_list = []
+        for i, width in enumerate(self.band_widths):
+            x_band = x[:, :, i, :].permute(0, 2, 1).unsqueeze(2)
+            x_band = self.output_heads[i](x_band)
+            x_band = x_band.squeeze(2)
+            x_band = x_band.view(B, self.out_masks * 2, width, T)
+            out_list.append(x_band)
+
+        x = torch.cat(out_list, dim=2)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):

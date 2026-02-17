@@ -4,3 +4,5 @@ torchcodec
 prodigyopt
 soundfile
 tqdm
+numpy
+git+https://github.com/dillfrescott/encoder
