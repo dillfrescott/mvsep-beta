@@ -18,12 +18,13 @@ warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=256, depth=12, heads=8, n_bands=12):
+                 embed_dim=256, depth=12, heads=8, n_bands=60):
         super().__init__()
         self.freq_bins = freq_bins
         self.n_bands = n_bands
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
+        self.in_channels = in_channels
 
         def get_band_widths(n_bins, n_bands):
             splits = np.logspace(np.log10(1), np.log10(n_bins), n_bands + 1)
@@ -41,14 +42,30 @@ class NeuralModel(nn.Module):
             return widths
 
         self.band_widths = get_band_widths(freq_bins, n_bands)
+        self.max_band_width = max(self.band_widths)
         
-        self.band_projs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(in_channels * 2, embed_dim, kernel_size=(w, 1)),
-                nn.GELU(),
-                nn.Conv2d(embed_dim, embed_dim, kernel_size=(1, 3), padding=(0, 1))
-            ) for w in self.band_widths
-        ])
+        indices = []
+        for i, w in enumerate(self.band_widths):
+            indices.extend([i * self.max_band_width + j for j in range(w)])
+        self.register_buffer('freq_index_map', torch.tensor(indices, dtype=torch.long))
+
+        self.out_factor = self.out_masks * 2
+        self.max_out_channels = self.max_band_width * self.out_factor
+
+        self.band_proj1 = nn.Conv2d(
+            in_channels * 2 * self.n_bands, 
+            embed_dim * self.n_bands, 
+            kernel_size=(self.max_band_width, 1), 
+            groups=self.n_bands
+        )
+        self.act = nn.GELU()
+        self.band_proj2 = nn.Conv2d(
+            embed_dim * self.n_bands, 
+            embed_dim * self.n_bands, 
+            kernel_size=(1, 3), 
+            padding=(0, 1), 
+            groups=self.n_bands
+        )
 
         self.norm = nn.LayerNorm(embed_dim)
 
@@ -64,43 +81,61 @@ class NeuralModel(nn.Module):
             heads=heads
         )
 
-        self.output_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(embed_dim, embed_dim, kernel_size=(1, 3), padding=(0, 1)),
-                nn.GELU(),
-                nn.Conv2d(embed_dim, self.out_masks * 2 * w, kernel_size=1)
-            ) for w in self.band_widths
-        ])
+        self.output_proj1 = nn.Conv2d(
+            embed_dim * self.n_bands, 
+            embed_dim * self.n_bands, 
+            kernel_size=(1, 3), 
+            padding=(0, 1), 
+            groups=self.n_bands
+        )
+        self.output_proj2 = nn.Conv2d(
+            embed_dim * self.n_bands, 
+            self.max_out_channels * self.n_bands, 
+            kernel_size=(1, 1), 
+            groups=self.n_bands
+        )
 
     def forward(self, x_stft, x_audio):
+        B, _, _, T = x_stft.shape
+        
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
+
         bands = torch.split(x_stft, self.band_widths, dim=2)
+        bands_padded = [
+            F.pad(b, (0, 0, 0, self.max_band_width - b.shape[2])) 
+            for b in bands
+        ]
+        x = torch.cat(bands_padded, dim=1)
 
-        band_features = []
-        for i, band in enumerate(bands):
-            x = self.band_projs[i](band)
-            x = x.squeeze(2).permute(0, 2, 1)
-            x = self.norm(x)
-            x = self.time_encoder(x)
-            band_features.append(x)
+        x = self.band_proj1(x)
+        x = self.act(x)
+        x = self.band_proj2(x)
 
-        x = torch.stack(band_features, dim=2)
-        B, T, _, D = x.shape
-        x = x.view(B * T, self.n_bands, D)
+        x = x.view(B, self.n_bands, self.embed_dim, 1, T)
+        x = x.squeeze(3).permute(0, 1, 3, 2).contiguous()
         
+        x = self.norm(x)
+        x = x.view(B * self.n_bands, T, self.embed_dim)
+        x = self.time_encoder(x)
+        x = x.view(B, self.n_bands, T, self.embed_dim)
+
+        x = x.permute(0, 2, 1, 3).contiguous().view(B * T, self.n_bands, self.embed_dim)
         x = self.freq_mixer(x)
+        x = x.view(B, T, self.n_bands, self.embed_dim)
+
+        x = x.permute(0, 2, 3, 1).contiguous().view(B, self.n_bands * self.embed_dim, 1, T)
         
-        x = x.view(B, T, self.n_bands, D)
+        x = self.output_proj1(x)
+        x = self.act(x)
+        x = self.output_proj2(x)
 
-        out_list = []
-        for i, width in enumerate(self.band_widths):
-            x_band = x[:, :, i, :].permute(0, 2, 1).unsqueeze(2)
-            x_band = self.output_heads[i](x_band)
-            x_band = x_band.squeeze(2)
-            x_band = x_band.view(B, self.out_masks * 2, width, T)
-            out_list.append(x_band)
+        x = x.view(B, self.n_bands, self.max_out_channels, T)
+        x = x.view(B, self.n_bands, self.out_factor, self.max_band_width, T)
+        x = x.permute(0, 2, 1, 3, 4).contiguous()
+        x = x.view(B, self.out_factor, self.n_bands * self.max_band_width, T)
+        
+        x = x[:, :, self.freq_index_map, :]
 
-        x = torch.cat(out_list, dim=2)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
@@ -606,12 +641,12 @@ def main():
     parser.add_argument('--data_dir', type=str, default='train', help='Path to the training dataset.')
     parser.add_argument('--test_dir', type=str, default='test', help='Path to the test dataset for validation.')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training.')
-    parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save a checkpoint every X steps.')
+    parser.add_argument('--checkpoint_steps', type=int, default=40, help='Save a checkpoint every X steps.')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Specific checkpoint path to resume training or for inference. Overrides automatic selection.')
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path for the output instrumental file.')
     parser.add_argument('--output_vocal', type=str, default='output_vocal.wav', help='Path for the output vocal file.')
-    parser.add_argument('--num_workers', type=int, default=16, help='Number of data loading workers.')
+    parser.add_argument('--num_workers', type=int, default=1, help='Number of data loading workers.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     parser.add_argument('--latest', action='store_true', help='Use the latest checkpoint for inference instead of the best SDR one.')
 
