@@ -114,7 +114,7 @@ class NeuralModel(nn.Module):
         self.feature_proj = nn.Sequential(
             nn.Conv2d(in_channels * 2, 128, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=(2,1), padding=1),
+            nn.Conv2d(128, 128, kernel_size=3, stride=(2, 1), padding=1),
             nn.GELU(),
             nn.Conv2d(128, embed_dim, kernel_size=(proj_h, 1)),
         )
@@ -714,3 +714,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
