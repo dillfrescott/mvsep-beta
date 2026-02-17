@@ -101,7 +101,7 @@ class Encoder(nn.Module):
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=16, heads=8):
+                 embed_dim=256, depth=12, heads=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -114,12 +114,10 @@ class NeuralModel(nn.Module):
         self.feature_proj = nn.Sequential(
             nn.Conv2d(in_channels * 2, 128, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=(2, 1), padding=1),
+            nn.Conv2d(128, 128, kernel_size=3, stride=(2,1), padding=1),
             nn.GELU(),
+            nn.Conv2d(128, embed_dim, kernel_size=(proj_h, 1)),
         )
-
-        self.dw_conv = nn.Conv2d(128, 128, kernel_size=(proj_h, 1), groups=128)
-        self.pw_conv = nn.Conv2d(128, embed_dim, kernel_size=1)
 
         self.norm = nn.LayerNorm(embed_dim)
 
@@ -130,32 +128,22 @@ class NeuralModel(nn.Module):
         )
 
         self.output_cnn = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=(1, 3), padding=(0, 1)),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(embed_dim, self.out_masks * 2 * self.freq_bins, kernel_size=1)
+            nn.Conv2d(embed_dim, self.freq_bins * self.out_masks * 2, kernel_size=1)
         )
 
     def forward(self, x_stft, x_audio):
         x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        
         x = self.feature_proj(x_stft)
-        
-        x = self.dw_conv(x)
-        x = self.pw_conv(x)
-        
         x = x.squeeze(2).permute(0, 2, 1)
         x = self.norm(x)
         x = self.model(x)
-        
         x = x.permute(0, 2, 1).unsqueeze(2)
         x = self.output_cnn(x)
-        
         x = x.squeeze(2)
-        
         B, C, T = x.shape
-
         x = x.view(B, self.out_masks * 2, self.freq_bins, T)
-        
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
