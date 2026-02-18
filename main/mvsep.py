@@ -596,7 +596,7 @@ def main():
     args = parser.parse_args()
 
     noise_level = 0.005
-    segment_length = 441000
+    segment_length = 352800
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
