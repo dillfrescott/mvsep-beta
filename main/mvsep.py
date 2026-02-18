@@ -9,7 +9,6 @@ from tqdm import tqdm
 from prodigyopt import Prodigy
 import random
 import math
-import numpy as np
 import re
 from encoder import Encoder
 import warnings
@@ -18,94 +17,68 @@ warnings.filterwarnings("ignore")
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=256, depth=12, heads=8, n_bands=60):
+                 embed_dim=256, depth=12, heads=8, num_bands=32):
         super().__init__()
         self.freq_bins = freq_bins
-        self.n_bands = n_bands
-        self.embed_dim = embed_dim
         self.in_channels = in_channels
         self.sources = sources
+        self.out_masks = sources * in_channels
+        self.embed_dim = embed_dim
+        self.num_bands = num_bands
 
-        def get_band_widths(n_bins, n_bands):
-            splits = np.logspace(np.log10(1), np.log10(n_bins), n_bands + 1)
-            splits = np.unique(np.round(splits).astype(int))
-            if splits[0] == 0: splits[0] = 1
-            if splits[-1] != n_bins: splits[-1] = n_bins
-            widths = np.diff(splits).tolist()
-            while len(widths) < n_bands:
-                widths.insert(0, 1)
-            widths[-1] += (n_bins - sum(widths))
-            return widths
+        edges = torch.linspace(0, 1, num_bands + 1).pow(2) * (freq_bins - 1)
+        self.band_edges = edges.long()
+        self.band_edges[-1] = freq_bins
 
-        self.band_widths = get_band_widths(freq_bins, n_bands)
-        
-        self.band_projections = nn.ModuleList([
-            nn.Linear(width * in_channels * 2, embed_dim) 
-            for width in self.band_widths
-        ])
+        self.feature_proj = nn.ModuleList()
+        self.output_proj = nn.ModuleList()
 
+        for i in range(num_bands):
+            bw = self.band_edges[i+1] - self.band_edges[i]
+            self.feature_proj.append(nn.Sequential(
+                nn.Linear(bw * in_channels * 2, embed_dim),
+                nn.GELU()
+            ))
+            self.output_proj.append(
+                nn.Linear(embed_dim, bw * self.out_masks * 2)
+            )
+
+        self.time_model = Encoder(dim=embed_dim, depth=depth, heads=heads)
+        self.band_model = Encoder(dim=embed_dim, depth=depth, heads=heads)
         self.norm = nn.LayerNorm(embed_dim)
 
-        self.time_encoder = Encoder(
-            dim=embed_dim,
-            depth=depth,
-            heads=heads
-        )
-
-        self.freq_mixer = Encoder(
-            dim=embed_dim,
-            depth=2,
-            heads=heads
-        )
-
-        output_dim_factor = sources * in_channels * 2 
-        
-        self.mask_estimators = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(embed_dim, embed_dim),
-                nn.GELU(),
-                nn.Linear(embed_dim, width * output_dim_factor)
-            )
-            for width in self.band_widths
-        ])
-
     def forward(self, x_stft, x_audio):
-        B, C, F_bins, T = x_stft.shape
+        B, _, F, T = x_stft.shape
+        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
+        x_stft = x_stft.permute(0, 3, 2, 1)
         
-        x = torch.view_as_real(x_stft)
-        x = x.permute(0, 2, 3, 1, 4).flatten(3) 
+        bands = []
+        for i in range(self.num_bands):
+            start = self.band_edges[i]
+            end = self.band_edges[i+1]
+            band = x_stft[:, :, start:end, :].reshape(B, T, -1)
+            bands.append(self.feature_proj[i](band))
         
-        x_bands = torch.split(x, self.band_widths, dim=1)
+        x = torch.stack(bands, dim=2)
+        
+        B, T, N, D = x.shape
+        x = x.permute(0, 2, 1, 3).reshape(B * N, T, D)
+        x = self.time_model(x)
+        x = x.view(B, N, T, D).permute(0, 2, 1, 3)
+        
+        x = x.reshape(B * T, N, D)
+        x = self.band_model(x)
+        x = x.view(B, T, N, D)
+        
+        x = self.norm(x)
         
         outs = []
-        for band_x, proj in zip(x_bands, self.band_projections):
-            band_feat = band_x.permute(0, 2, 1, 3).reshape(B, T, -1)
-            outs.append(proj(band_feat))
+        for i in range(self.num_bands):
+            bw = self.band_edges[i+1] - self.band_edges[i]
+            band_out = self.output_proj[i](x[:, :, i, :]).view(B, T, bw, self.out_masks * 2)
+            outs.append(band_out)
             
-        x = torch.stack(outs, dim=2)
-        
-        x = x.view(B * self.n_bands, T, self.embed_dim)
-        x = self.norm(x)
-        x = self.time_encoder(x)
-        
-        x = x.view(B, self.n_bands, T, self.embed_dim)
-        x = x.permute(0, 2, 1, 3).reshape(B * T, self.n_bands, self.embed_dim)
-        x = self.freq_mixer(x)
-        
-        x = x.view(B, T, self.n_bands, self.embed_dim).permute(0, 2, 1, 3)
-
-        mask_outs = []
-        for i, estimator in enumerate(self.mask_estimators):
-            est = estimator(x[:, i])
-            width = self.band_widths[i]
-            est = est.view(B, T, width, self.sources, self.in_channels, 2)
-            mask_outs.append(est)
-
-        x = torch.cat(mask_outs, dim=2)
-        
-        x = x.permute(0, 3, 4, 5, 2, 1).contiguous()
-        x = x.view(B, -1, self.freq_bins, T)
-        
+        x = torch.cat(outs, dim=2).permute(0, 3, 2, 1)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
