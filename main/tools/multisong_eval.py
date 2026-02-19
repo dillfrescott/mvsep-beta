@@ -7,13 +7,13 @@ import torchaudio
 from tqdm import tqdm
 import math
 import warnings
-from mvsep import NeuralModel, _load_model_state_dict
+from mvsep import NeuralModel
 
 warnings.filterwarnings("ignore")
 
 def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=352800, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    _load_model_state_dict(model, checkpoint_data['model_state_dict'], context="infer")
+    model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval().to(device)
 
     os.makedirs(output_dir, exist_ok=True)

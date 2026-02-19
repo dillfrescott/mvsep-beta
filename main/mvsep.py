@@ -10,42 +10,14 @@ from prodigyopt import Prodigy
 import random
 import math
 import re
-from mamba3 import Mamba3
+from encoder import Encoder
 import warnings
 
 warnings.filterwarnings("ignore")
 
-def _adapt_checkpoint_state_dict_keys(model, checkpoint_state_dict):
-    model_keys = list(model.state_dict().keys())
-    ckpt_keys = list(checkpoint_state_dict.keys())
-
-    model_has_prefix = any(k.startswith('_orig_mod.') for k in model_keys)
-    ckpt_has_prefix = any(k.startswith('_orig_mod.') for k in ckpt_keys)
-
-    if ckpt_has_prefix and not model_has_prefix:
-        return {
-            (k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k): v
-            for k, v in checkpoint_state_dict.items()
-        }
-    if model_has_prefix and not ckpt_has_prefix:
-        return {f'_orig_mod.{k}': v for k, v in checkpoint_state_dict.items()}
-    return checkpoint_state_dict
-
-def _load_model_state_dict(model, checkpoint_state_dict, context):
-    adapted_state_dict = _adapt_checkpoint_state_dict_keys(model, checkpoint_state_dict)
-    missing_keys, unexpected_keys = model.load_state_dict(adapted_state_dict, strict=False)
-
-    if missing_keys or unexpected_keys:
-        print(
-            f"[{context}] Warning: loaded with key mismatch. "
-            f"Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}"
-        )
-    else:
-        print(f"[{context}] Model weights loaded cleanly.")
-
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=256, depth=6, num_bands=8):
+                 embed_dim=256, depth=8, heads=8, num_bands=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -55,21 +27,14 @@ class NeuralModel(nn.Module):
         self.num_bands = num_bands
 
         edges = torch.linspace(0, 1, num_bands + 1).pow(2) * (freq_bins - 1)
-        band_edges = edges.long()
-        band_edges[-1] = freq_bins
-        self.band_slices = []
-        self.band_widths = []
-        for i in range(num_bands):
-            start = int(band_edges[i].item())
-            end = int(band_edges[i + 1].item())
-            self.band_slices.append((start, end))
-            self.band_widths.append(end - start)
+        self.band_edges = edges.long()
+        self.band_edges[-1] = freq_bins
 
         self.feature_proj = nn.ModuleList()
         self.output_proj = nn.ModuleList()
 
         for i in range(num_bands):
-            bw = self.band_widths[i]
+            bw = self.band_edges[i+1] - self.band_edges[i]
             self.feature_proj.append(nn.Sequential(
                 nn.Linear(bw * in_channels * 2, embed_dim),
                 nn.GELU()
@@ -78,8 +43,8 @@ class NeuralModel(nn.Module):
                 nn.Linear(embed_dim, bw * self.out_masks * 2)
             )
 
-        self.time_model = Mamba3(d_model=embed_dim, layers=depth, causal=False)
-        self.band_model = Mamba3(d_model=embed_dim, layers=depth, causal=False)
+        self.time_model = Encoder(dim=embed_dim, depth=depth, heads=heads)
+        self.band_model = Encoder(dim=embed_dim, depth=depth, heads=heads)
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x_stft, x_audio):
@@ -89,7 +54,8 @@ class NeuralModel(nn.Module):
         
         bands = []
         for i in range(self.num_bands):
-            start, end = self.band_slices[i]
+            start = self.band_edges[i]
+            end = self.band_edges[i+1]
             band = x_stft[:, :, start:end, :].reshape(B, T, -1)
             bands.append(self.feature_proj[i](band))
         
@@ -108,7 +74,7 @@ class NeuralModel(nn.Module):
         
         outs = []
         for i in range(self.num_bands):
-            bw = self.band_widths[i]
+            bw = self.band_edges[i+1] - self.band_edges[i]
             band_out = self.output_proj[i](x[:, :, i, :]).view(B, T, bw, self.out_masks * 2)
             outs.append(band_out)
             
@@ -399,7 +365,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        _load_model_state_dict(model, checkpoint_data['model_state_dict'], context="train")
+        model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
         step = checkpoint_data.get('step', 0)
         avg_loss = checkpoint_data.get('avg_loss', 0.0)
         
@@ -519,7 +485,7 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
               chunk_size=485100, overlap=88200, device='cpu', return_tensors=False):
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        _load_model_state_dict(model, checkpoint_data['model_state_dict'], context="infer")
+        model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     
     model.eval().to(device)
 
@@ -626,7 +592,6 @@ def main():
     parser.add_argument('--num_workers', type=int, default=16, help='Number of data loading workers.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     parser.add_argument('--latest', action='store_true', help='Use the latest checkpoint for inference instead of the best SDR one.')
-    parser.add_argument('--compile', action='store_true', help='Enable torch.compile for training mode.')
 
     args = parser.parse_args()
 
@@ -638,10 +603,8 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel()
-    if args.train and args.compile:
-        model = torch.compile(model)
-    optimizer = Prodigy(model.parameters(), lr=0.22)
+    model = NeuralModel() 
+    optimizer = Prodigy(model.parameters(), lr=1.0)
 
     if args.train:
         checkpoint_to_load = args.checkpoint_path
