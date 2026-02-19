@@ -101,7 +101,7 @@ class Encoder(nn.Module):
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=256, depth=8, heads=8, num_bands=8):
+                 embed_dim=256, depth=12, heads=8, num_bands=8):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -680,7 +680,7 @@ def main():
     args = parser.parse_args()
 
     noise_level = 0.005
-    segment_length = 352800
+    segment_length = 882000
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
