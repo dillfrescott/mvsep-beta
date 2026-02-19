@@ -10,10 +10,94 @@ from prodigyopt import Prodigy
 import random
 import math
 import re
-from encoder import Encoder
 import warnings
 
 warnings.filterwarnings("ignore")
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, seq_len, device):
+        t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos(), emb.sin()
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rope(x, cos, sin):
+    return x * cos + rotate_half(x) * sin
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads=8):
+        super().__init__()
+        self.heads = heads
+        self.head_dim = dim // heads
+        
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wk = nn.Linear(dim, dim, bias=False)
+        self.wv = nn.Linear(dim, dim, bias=False)
+        
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+        self.rope = RotaryEmbedding(self.head_dim)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        H, D = self.heads, self.head_dim
+
+        q = self.wq(x).view(B, T, H, D).transpose(1, 2)
+        k = self.wk(x).view(B, T, H, D).transpose(1, 2)
+        v = self.wv(x).view(B, T, H, D).transpose(1, 2)
+
+        cos, sin = self.rope(T, x.device)
+        
+        cos = cos.view(1, 1, T, D)
+        sin = sin.view(1, 1, T, D)
+        
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        scores = torch.einsum("bhtd,bhsd->bhts", q, k) / (D ** 0.5)
+        attn = F.softmax(scores, dim=-1)
+
+        out = torch.einsum("bhts,bhsd->bhtd", attn, v)
+        
+        out = out.transpose(1, 2).reshape(B, T, C)
+        return self.out_proj(out)
+
+class EncoderLayer(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
+        return x
+
+class Encoder(nn.Module):
+    def __init__(self, dim, depth, heads):
+        super().__init__()
+        self.layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
