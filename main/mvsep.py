@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import soundfile as sf
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from prodigyopt import Prodigy
@@ -15,23 +16,22 @@ import warnings
 warnings.filterwarnings("ignore")
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, max_seq_len=8192):
         super().__init__()
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-
-    def forward(self, seq_len, device):
-        t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        t = torch.arange(max_seq_len).type_as(inv_freq)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos(), emb.sin()
+        self.register_buffer("cos", emb.cos().view(1, 1, max_seq_len, dim))
+        self.register_buffer("sin", emb.sin().view(1, 1, max_seq_len, dim))
 
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
+    def forward(self, seq_len):
+        return self.cos[:, :, :seq_len, :], self.sin[:, :, :seq_len, :]
 
 def apply_rope(x, cos, sin):
-    return x * cos + rotate_half(x) * sin
+    x1, x2 = x.chunk(2, dim=-1)
+    rotated = torch.cat((-x2, x1), dim=-1)
+    return x * cos + rotated * sin
 
 class Attention(nn.Module):
     def __init__(self, dim, heads=8):
@@ -39,35 +39,20 @@ class Attention(nn.Module):
         self.heads = heads
         self.head_dim = dim // heads
         
-        self.wq = nn.Linear(dim, dim, bias=False)
-        self.wk = nn.Linear(dim, dim, bias=False)
-        self.wv = nn.Linear(dim, dim, bias=False)
-        
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
-
         self.rope = RotaryEmbedding(self.head_dim)
 
     def forward(self, x):
         B, T, C = x.shape
-        H, D = self.heads, self.head_dim
+        qkv = self.qkv(x).reshape(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = self.wq(x).view(B, T, H, D).transpose(1, 2)
-        k = self.wk(x).view(B, T, H, D).transpose(1, 2)
-        v = self.wv(x).view(B, T, H, D).transpose(1, 2)
-
-        cos, sin = self.rope(T, x.device)
-        
-        cos = cos.view(1, 1, T, D)
-        sin = sin.view(1, 1, T, D)
-        
+        cos, sin = self.rope(T)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        scores = torch.einsum("bhtd,bhsd->bhts", q, k) / (D ** 0.5)
-        attn = F.softmax(scores, dim=-1)
-
-        out = torch.einsum("bhts,bhsd->bhtd", attn, v)
-        
+        out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, T, C)
         return self.out_proj(out)
 
@@ -100,69 +85,85 @@ class Encoder(nn.Module):
         return self.norm(x)
 
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=256, depth=12, heads=8, num_bands=8):
-        super().__init__()
-        self.freq_bins = freq_bins
-        self.in_channels = in_channels
-        self.sources = sources
-        self.out_masks = sources * in_channels
-        self.embed_dim = embed_dim
-        self.num_bands = num_bands
+    def __init__(self, in_channels=2, sources=2, freq_bins=1025,
+                     embed_dim=256, depth=12, heads=8, num_bands=60):
+            super().__init__()
+            self.freq_bins = freq_bins
+            self.in_channels = in_channels
+            self.sources = sources
+            self.out_masks = sources * in_channels
+            self.embed_dim = embed_dim
+            self.num_bands = num_bands
 
-        edges = torch.linspace(0, 1, num_bands + 1).pow(2) * (freq_bins - 1)
-        self.band_edges = edges.long()
-        self.band_edges[-1] = freq_bins
+            m_min = 0
+            m_max = 2595 * math.log10(1 + (freq_bins - 1) / 700.0)
+            m_pts = torch.linspace(m_min, m_max, num_bands + 1)
+            f_pts = 700 * (10 ** (m_pts / 2595) - 1)
+            
+            band_edges = torch.round(f_pts).long()
+            band_edges[0] = 0
+            band_edges[-1] = freq_bins
+            
+            for i in range(1, num_bands):
+                if band_edges[i] <= band_edges[i-1]:
+                    band_edges[i] = band_edges[i-1] + 1
+            band_edges[-1] = freq_bins
+            
+            self.register_buffer('band_edges', band_edges)
+            
+            bws = band_edges[1:] - band_edges[:-1]
+            self.register_buffer('bws', bws)
+            self.max_bw = bws.max().item()
 
-        self.feature_proj = nn.ModuleList()
-        self.output_proj = nn.ModuleList()
+            feat_in_dim = self.max_bw * in_channels * 2
+            feat_out_dim = self.max_bw * self.out_masks * 2
+            
+            self.feat_proj_weight = nn.Parameter(torch.randn(num_bands, feat_in_dim, embed_dim) / math.sqrt(feat_in_dim))
+            self.feat_proj_bias = nn.Parameter(torch.zeros(num_bands, embed_dim))
+            
+            self.out_proj_weight = nn.Parameter(torch.randn(num_bands, embed_dim, feat_out_dim) / math.sqrt(embed_dim))
+            self.out_proj_bias = nn.Parameter(torch.zeros(num_bands, feat_out_dim))
 
-        for i in range(num_bands):
-            bw = self.band_edges[i+1] - self.band_edges[i]
-            self.feature_proj.append(nn.Sequential(
-                nn.Linear(bw * in_channels * 2, embed_dim),
-                nn.GELU()
-            ))
-            self.output_proj.append(
-                nn.Linear(embed_dim, bw * self.out_masks * 2)
-            )
+            self.time_model = Encoder(dim=embed_dim, depth=depth, heads=heads)
+            self.band_model = Encoder(dim=embed_dim, depth=depth, heads=heads)
+            self.norm = nn.LayerNorm(embed_dim)
 
-        self.time_model = Encoder(dim=embed_dim, depth=depth, heads=heads)
-        self.band_model = Encoder(dim=embed_dim, depth=depth, heads=heads)
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x_stft, x_audio):
-        B, _, F, T = x_stft.shape
-        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        x_stft = x_stft.permute(0, 3, 2, 1)
+    def forward(self, x_stft, x_audio=None):
+        B, _, _, T = x_stft.shape
+        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1).permute(0, 3, 2, 1)
         
-        bands = []
+        padded_bands = []
         for i in range(self.num_bands):
-            start = self.band_edges[i]
-            end = self.band_edges[i+1]
+            start, end = self.band_edges[i], self.band_edges[i+1]
             band = x_stft[:, :, start:end, :].reshape(B, T, -1)
-            bands.append(self.feature_proj[i](band))
+            pad_size = (self.max_bw * self.in_channels * 2) - band.shape[-1]
+            if pad_size > 0:
+                band = F.pad(band, (0, pad_size))
+            padded_bands.append(band)
+            
+        x = torch.stack(padded_bands, dim=2)
         
-        x = torch.stack(bands, dim=2)
+        x = torch.einsum('b t n f, n f d -> b t n d', x, self.feat_proj_weight) + self.feat_proj_bias
+        x = F.gelu(x)
         
         B, T, N, D = x.shape
-        x = x.permute(0, 2, 1, 3).reshape(B * N, T, D)
+        x = x.transpose(1, 2).reshape(B * N, T, D)
         x = self.time_model(x)
-        x = x.view(B, N, T, D).permute(0, 2, 1, 3)
-        
-        x = x.reshape(B * T, N, D)
+        x = x.view(B, N, T, D).transpose(1, 2).reshape(B * T, N, D)
         x = self.band_model(x)
         x = x.view(B, T, N, D)
-        
         x = self.norm(x)
         
-        outs = []
+        out = torch.einsum('b t n d, n d f -> b t n f', x, self.out_proj_weight) + self.out_proj_bias
+        
+        out_bands = []
         for i in range(self.num_bands):
-            bw = self.band_edges[i+1] - self.band_edges[i]
-            band_out = self.output_proj[i](x[:, :, i, :]).view(B, T, bw, self.out_masks * 2)
-            outs.append(band_out)
+            bw = self.bws[i].item()
+            valid_dim = bw * self.out_masks * 2
+            band_out = out[:, :, i, :valid_dim].view(B, T, bw, self.out_masks * 2)
+            out_bands.append(band_out)
             
-        x = torch.cat(outs, dim=2).permute(0, 3, 2, 1)
+        x = torch.cat(out_bands, dim=2).permute(0, 3, 2, 1)
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
@@ -188,7 +189,6 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
 
         for i, (n_fft, hop_length, win_length) in enumerate(zip(self.fft_sizes, self.hop_sizes, self.win_lengths)):
             window = getattr(self, f'window_{i}')
-            window = window.to(y_pred_flat.device)
 
             stft_pred = torch.stft(y_pred_flat, n_fft=n_fft, hop_length=hop_length,
                                    win_length=win_length, window=window, return_complex=True, center=True)
@@ -217,8 +217,8 @@ def loss_fn(pred_output,
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
 
-    pred_masks_real = pred_real[:, :4]
-    pred_masks_imag = pred_imag[:, :4]
+    pred_masks_real = torch.tanh(pred_real[:, :4])
+    pred_masks_imag = torch.tanh(pred_imag[:, :4])
 
     vL_cmask = pred_masks_real[:, 0] + 1j * pred_masks_imag[:, 0]
     vR_cmask = pred_masks_real[:, 1] + 1j * pred_masks_imag[:, 1]
@@ -259,33 +259,35 @@ def loss_fn(pred_output,
     return total_loss
 
 class Dataset(Dataset):
-    def __init__(self, root_dir, sample_rate=44100, segment_length=88200, segment=True, noise_level=0.0):
+    def __init__(self, root_dir, sample_rate=44100, segment_length=264600, segment=True, noise_level=0.0):
         self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
         self.segment = segment
         self.noise_level = noise_level
 
-        self.n_fft = 4096
-        self.hop_length = 1024
+        self.n_fft = 2048
+        self.hop_length = 512
         self.window = torch.hann_window(self.n_fft)
 
-        self.vocal_paths = []
-        self.other_paths = []
+        self.vocal_tracks = []
+        self.other_tracks = []
 
-        track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
+        track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, track))]
 
-        print("Scanning track folders...")
-        for td in tqdm(track_dirs, desc="Scanning tracks"):
+        print("Scanning and caching track metadata...")
+        for td in tqdm(track_dirs, desc="Caching tracks"):
             vocal_path = self._find_audio_file(td, 'vocals')
             other_path = self._find_audio_file(td, 'other')
 
             if vocal_path:
-                self.vocal_paths.append(vocal_path)
+                info = sf.info(vocal_path)
+                self.vocal_tracks.append({'path': vocal_path, 'frames': info.frames, 'sr': info.samplerate})
             if other_path:
-                self.other_paths.append(other_path)
+                info = sf.info(other_path)
+                self.other_tracks.append({'path': other_path, 'frames': info.frames, 'sr': info.samplerate})
 
-        if not self.vocal_paths or not self.other_paths:
+        if not self.vocal_tracks or not self.other_tracks:
             raise ValueError("Dataset must contain both vocal and 'other' stems.")
 
         self.size = 50000
@@ -307,15 +309,31 @@ class Dataset(Dataset):
             audio = audio[:2, :]
         return audio
 
-    def _load_audio(self, filepath):
-        audio, sr = torchaudio.load(filepath)
-        return self._preprocess_audio(audio, sr)
-
-    def _load_vocal(self, path):
-        return self._load_audio(path)
-
-    def _load_instrumental(self, path):
-        return self._load_audio(path)
+    def _load_chunk(self, track_info):
+        path = track_info['path']
+        total_frames = track_info['frames']
+        sr = track_info['sr']
+        
+        target_length = self.segment_length if self.segment else total_frames
+        
+        if total_frames <= target_length:
+            audio_np, sr = sf.read(path, dtype='float32')
+            audio = torch.from_numpy(audio_np)
+            audio = audio.unsqueeze(0) if audio.dim() == 1 else audio.t()
+            
+            audio = self._preprocess_audio(audio, sr)
+            pad_size = target_length - audio.shape[1]
+            if pad_size > 0:
+                audio = F.pad(audio, (0, pad_size))
+        else:
+            start_frame = random.randint(0, total_frames - target_length)
+            audio_np, sr = sf.read(path, start=start_frame, frames=target_length, dtype='float32')
+            audio = torch.from_numpy(audio_np)
+            audio = audio.unsqueeze(0) if audio.dim() == 1 else audio.t()
+            
+            audio = self._preprocess_audio(audio, sr)
+            
+        return audio
 
     def __len__(self):
         return self.size
@@ -323,31 +341,16 @@ class Dataset(Dataset):
     def __getitem__(self, idx):
         while True:
             try:
-                vocal_path = random.choice(self.vocal_paths)
-                other_path = random.choice(self.other_paths)
+                vocal_info = random.choice(self.vocal_tracks)
+                other_info = random.choice(self.other_tracks)
 
-                vocal_audio = self._load_vocal(vocal_path)
-                instr_audio = self._load_instrumental(other_path)
-
-                min_length = min(vocal_audio.shape[1], instr_audio.shape[1])
-                if self.segment and min_length < self.segment_length:
-                    continue
-
-                if self.segment:
-                    start = random.randint(0, min_length - self.segment_length)
-                    end = start + self.segment_length
-                    vocal_seg = vocal_audio[:, start:end]
-                    instr_seg = instr_audio[:, start:end]
-                else:
-                    vocal_seg = vocal_audio
-                    instr_seg = instr_audio
+                vocal_seg = self._load_chunk(vocal_info)
+                instr_seg = self._load_chunk(other_info)
 
                 if self.noise_level > 0:
                     noise_factor = self.noise_level * (1 + (torch.rand(1).item() * 2 - 1) * 0.5)
-                    vocal_noise = torch.randn_like(vocal_seg) * noise_factor
-                    instr_noise = torch.randn_like(instr_seg) * noise_factor
-                    vocal_seg = vocal_seg + vocal_noise
-                    instr_seg = instr_seg + instr_noise
+                    vocal_seg = vocal_seg + torch.randn_like(vocal_seg) * noise_factor
+                    instr_seg = instr_seg + torch.randn_like(instr_seg) * noise_factor
 
                 mixture_seg = vocal_seg + instr_seg
 
@@ -361,8 +364,7 @@ class Dataset(Dataset):
                                                window=self.window, return_complex=True, center=True)
 
                 return mixture_spec, vocal_seg, instr_seg, mixture_seg, target_vocal_spec, target_instr_spec
-            except Exception as e:
-                print(f"Error loading item, trying next. Error: {e}")
+            except Exception:
                 continue
 
 def calculate_sdr(pred, target, epsilon=1e-8):
@@ -441,7 +443,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             best_sdr = max(sdr_values)
 
     stft_params_for_istft = {
-        'n_fft': 4096, 'hop_length': 1024, 'window': window.to(device)
+        'n_fft': 2048, 'hop_length': 512, 'window': window.to(device)
     }
     multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
         fft_sizes=[1024, 2048, 8192], hop_sizes=[256, 512, 2048], win_lengths=[1024, 2048, 8192]
@@ -588,7 +590,7 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
     instrumentals = torch.zeros_like(input_audio)
     sum_fade_windows = torch.zeros(total_length, device=device)
 
-    n_fft, hop_length = 4096, 1024
+    n_fft, hop_length = 2048, 512
     window = torch.hann_window(n_fft).to(device)
     step_size = chunk_size - overlap
 
@@ -617,8 +619,8 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
             pred_output_reshaped = pred_output.view(2, 4, F_spec, T_spec)
             pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
-            pred_masks_real = pred_real[:4]
-            pred_masks_imag = pred_imag[:4]
+            pred_masks_real = torch.tanh(pred_real[:4])
+            pred_masks_imag = torch.tanh(pred_imag[:4])
 
             vL_cmask = pred_masks_real[0] + 1j * pred_masks_imag[0]
             vR_cmask = pred_masks_real[1] + 1j * pred_masks_imag[1]
@@ -680,14 +682,16 @@ def main():
     args = parser.parse_args()
 
     noise_level = 0.005
-    segment_length = 882000
+    segment_length = 220500
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    window = torch.hann_window(4096).to(device)
-    model = NeuralModel() 
+    window = torch.hann_window(2048).to(device)
+    
+    model = NeuralModel()
+    
     optimizer = Prodigy(model.parameters(), lr=1.0)
 
     if args.train:

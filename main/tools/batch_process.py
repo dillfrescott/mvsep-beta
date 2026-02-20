@@ -47,7 +47,7 @@ def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=882000, 
         instrumentals = torch.zeros_like(input_audio)
         sum_fade_windows = torch.zeros(total_length, device=device)
 
-        n_fft, hop_length = 4096, 1024
+        n_fft, hop_length = 2048, 512
         window = torch.hann_window(n_fft).to(device)
         step_size = chunk_size - overlap
 
@@ -75,8 +75,8 @@ def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=882000, 
                 pred_output_reshaped = pred_output.view(2, 4, F_spec, T_spec)
                 pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
-                pred_masks_real = pred_real[:4]
-                pred_masks_imag = pred_imag[:4]
+                pred_masks_real = torch.tanh(pred_real[:4])
+                pred_masks_imag = torch.tanh(pred_imag[:4])
 
                 vL_cmask = pred_masks_real[0] + 1j * pred_masks_imag[0]
                 vR_cmask = pred_masks_real[1] + 1j * pred_masks_imag[1]
@@ -124,7 +124,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = NeuralModel()
+    model = NeuralModel(freq_bins=1025)
 
     if args.infer:
         inference(model, args.checkpoint_path, args.input_dir, args.output_dir, device=device)
