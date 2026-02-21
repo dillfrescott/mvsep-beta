@@ -4,4 +4,3 @@ torchcodec
 prodigyopt
 soundfile
 tqdm
-numpy
