@@ -102,13 +102,15 @@ class Encoder(nn.Module):
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=14, heads=8):
+                 embed_dim=512, depth=12, hop_length=1024, window_size=4096):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
         self.embed_dim = embed_dim
+        self.hop_length = hop_length
+        self.window_size = window_size
 
         proj_h = (freq_bins - 1) // 2 + 1
 
@@ -120,12 +122,28 @@ class NeuralModel(nn.Module):
             nn.Conv2d(128, embed_dim, kernel_size=(proj_h, 1)),
         )
 
+        self.audio_proj = nn.Sequential(
+            nn.Conv1d(
+                in_channels, 
+                128, 
+                kernel_size=self.window_size,
+                stride=self.hop_length,
+                padding=self.window_size // 2
+            ),
+            nn.GELU(),
+            nn.Conv1d(128, embed_dim, kernel_size=3, padding=1)
+        )
+
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.GELU()
+        )
+
         self.norm = nn.LayerNorm(embed_dim)
 
         self.model = Encoder(
             dim=embed_dim,
-            depth=depth,
-            heads=heads
+            depth=depth
         )
 
         self.output_cnn = nn.Sequential(
@@ -135,14 +153,28 @@ class NeuralModel(nn.Module):
         )
 
     def forward(self, x_stft, x_audio):
-        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        x = self.feature_proj(x_stft)
-        x = x.squeeze(2).permute(0, 2, 1)
+        x_stft_cat = torch.cat([x_stft.real, x_stft.imag], dim=1)
+        x_s = self.feature_proj(x_stft_cat)
+        x_s = x_s.squeeze(2).permute(0, 2, 1)
+        
+        T_frames = x_s.shape[1]
+
+        x_a = self.audio_proj(x_audio)
+        
+        if x_a.shape[-1] != T_frames:
+            x_a = F.interpolate(x_a, size=T_frames, mode='linear', align_corners=False)
+            
+        x_a = x_a.permute(0, 2, 1)
+
+        x = torch.cat([x_s, x_a], dim=-1)
+        x = self.fusion_proj(x)
+
         x = self.norm(x)
         x = self.model(x)
         x = x.permute(0, 2, 1).unsqueeze(2)
         x = self.output_cnn(x)
         x = x.squeeze(2)
+        
         B, C, T = x.shape
         x = x.view(B, self.out_masks * 2, self.freq_bins, T)
         return x
