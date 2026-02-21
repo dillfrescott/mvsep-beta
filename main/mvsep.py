@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import soundfile as sf
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from prodigyopt import Prodigy
@@ -247,8 +248,8 @@ class Dataset(Dataset):
         self.segment = segment
         self.noise_level = noise_level
 
-        self.n_fft = 2048
-        self.hop_length = 512
+        self.n_fft = 4096
+        self.hop_length = 1024
         self.window = torch.hann_window(self.n_fft)
 
         self.vocal_tracks = []
