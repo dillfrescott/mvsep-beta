@@ -102,7 +102,7 @@ class Encoder(nn.Module):
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=512, depth=12, heads=8, hop_length=1024, window_size=4096):
+                 embed_dim=1024, depth=12, heads=8, hop_length=1024, window_size=4096):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
