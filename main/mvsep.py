@@ -45,31 +45,30 @@ class Attention(nn.Module):
         self.wv = nn.Linear(dim, dim, bias=False)
         
         self.out_proj = nn.Linear(dim, dim, bias=False)
-
         self.rope = RotaryEmbedding(self.head_dim)
 
     def forward(self, x):
-        B, T, C = x.shape
+        B, S, C = x.shape
         H, D = self.heads, self.head_dim
 
-        q = self.wq(x).view(B, T, H, D).transpose(1, 2)
-        k = self.wk(x).view(B, T, H, D).transpose(1, 2)
-        v = self.wv(x).view(B, T, H, D).transpose(1, 2)
+        q = self.wq(x).view(B, S, H, D).transpose(1, 2)
+        k = self.wk(x).view(B, S, H, D).transpose(1, 2)
+        v = self.wv(x).view(B, S, H, D).transpose(1, 2)
 
-        cos, sin = self.rope(T, x.device)
+        cos, sin = self.rope(S, x.device)
         
-        cos = cos.view(1, 1, T, D)
-        sin = sin.view(1, 1, T, D)
+        cos = cos.view(1, 1, S, D)
+        sin = sin.view(1, 1, S, D)
         
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        scores = torch.einsum("bhtd,bhsd->bhts", q, k) / (D ** 0.5)
+        scores = torch.einsum("bhsd,bhtd->bhst", q, k) / (D ** 0.5)
         attn = F.softmax(scores, dim=-1)
 
-        out = torch.einsum("bhts,bhsd->bhtd", attn, v)
+        out = torch.einsum("bhst,bhtd->bhsd", attn, v)
+        out = out.transpose(1, 2).reshape(B, S, C)
         
-        out = out.transpose(1, 2).reshape(B, T, C)
         return self.out_proj(out)
 
 class EncoderLayer(nn.Module):
@@ -89,20 +88,42 @@ class EncoderLayer(nn.Module):
         x = x + self.ff(self.norm2(x))
         return x
 
-class Encoder(nn.Module):
+class DualPathEncoder(nn.Module):
     def __init__(self, dim, depth, heads):
         super().__init__()
-        self.layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
+        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
+        self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
+        B, F_b, T, E = x.shape
+        for t_layer, f_layer in zip(self.time_layers, self.freq_layers):
+            x = x.reshape(B * F_b, T, E)
+            x = t_layer(x)
+            x = x.view(B, F_b, T, E)
+            
+            x = x.transpose(1, 2).reshape(B * T, F_b, E)
+            x = f_layer(x)
+            x = x.view(B, T, F_b, E).transpose(1, 2)
         return self.norm(x)
+
+class PixelShuffleFreq(nn.Module):
+    def __init__(self, upscale_factor):
+        super().__init__()
+        self.upscale_factor = upscale_factor
+
+    def forward(self, x):
+        B, CR, F_sub, T = x.shape
+        r = self.upscale_factor
+        C = CR // r
+        x = x.view(B, C, r, F_sub, T)
+        x = x.permute(0, 1, 3, 2, 4).contiguous()
+        x = x.view(B, C, F_sub * r, T)
+        return x
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=1024, depth=12, heads=8, hop_length=1024, window_size=4096):
+                 embed_dim=256, depth=12, heads=8, hop_length=1024, window_size=4096):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -111,15 +132,13 @@ class NeuralModel(nn.Module):
         self.embed_dim = embed_dim
         self.hop_length = hop_length
         self.window_size = window_size
-
-        proj_h = (freq_bins - 1) // 2 + 1
+        self.n_bands = 64
+        self.upscale_factor = 32
 
         self.feature_proj = nn.Sequential(
             nn.Conv2d(in_channels * 2, 128, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=(2,1), padding=1),
-            nn.GELU(),
-            nn.Conv2d(128, embed_dim, kernel_size=(proj_h, 1)),
+            nn.Conv2d(128, embed_dim, kernel_size=(32, 1), stride=(32, 1))
         )
 
         self.audio_proj = nn.Sequential(
@@ -141,43 +160,38 @@ class NeuralModel(nn.Module):
 
         self.norm = nn.LayerNorm(embed_dim)
 
-        self.model = Encoder(
+        self.model = DualPathEncoder(
             dim=embed_dim,
             depth=depth,
             heads=heads
         )
 
         self.output_cnn = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(embed_dim, self.freq_bins * self.out_masks * 2, kernel_size=1)
+            nn.Conv2d(embed_dim, self.out_masks * 2 * self.upscale_factor, kernel_size=1),
+            PixelShuffleFreq(self.upscale_factor)
         )
 
     def forward(self, x_stft, x_audio):
+        B = x_stft.shape[0]
+        
         x_stft_cat = torch.cat([x_stft.real, x_stft.imag], dim=1)
         x_s = self.feature_proj(x_stft_cat)
-        x_s = x_s.squeeze(2).permute(0, 2, 1)
         
-        T_frames = x_s.shape[1]
-
         x_a = self.audio_proj(x_audio)
+        x_a = x_a.unsqueeze(2).expand(-1, -1, self.n_bands, -1)
         
-        if x_a.shape[-1] != T_frames:
-            x_a = F.interpolate(x_a, size=T_frames, mode='linear', align_corners=False)
-            
-        x_a = x_a.permute(0, 2, 1)
-
-        x = torch.cat([x_s, x_a], dim=-1)
+        x = torch.cat([x_s, x_a], dim=1)
+        x = x.permute(0, 2, 3, 1)
         x = self.fusion_proj(x)
-
         x = self.norm(x)
-        x = self.model(x)
-        x = x.permute(0, 2, 1).unsqueeze(2)
-        x = self.output_cnn(x)
-        x = x.squeeze(2)
         
-        B, C, T = x.shape
-        x = x.view(B, self.out_masks * 2, self.freq_bins, T)
+        x = self.model(x)
+        
+        x = x.permute(0, 3, 1, 2)
+        x = self.output_cnn(x)
+        
+        x = F.pad(x, (0, 0, 0, 1))
+        
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
@@ -697,7 +711,7 @@ def main():
     args = parser.parse_args()
 
     noise_level = 0.005
-    segment_length = 441000
+    segment_length = 264600
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)

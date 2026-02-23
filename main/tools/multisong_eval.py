@@ -11,7 +11,7 @@ from mvsep import NeuralModel
 
 warnings.filterwarnings("ignore")
 
-def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=441000, overlap=88200, device='cpu'):
+def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=264600, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval().to(device)
