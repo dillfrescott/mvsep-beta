@@ -320,45 +320,6 @@ class Dataset(Dataset):
 
         self.size = 50000
 
-    def _apply_overdrive(self, audio, drive=2.0):
-        audio = audio * drive
-        audio = torch.tanh(audio)
-        return audio
-
-    def _apply_highpass(self, audio, cutoff=100):
-        nyquist = self.sample_rate / 2
-        normalized_cutoff = cutoff / nyquist
-        b, a = torch.tensor([1 - normalized_cutoff]), torch.tensor([1, -normalized_cutoff])
-        filtered = audio.clone()
-        for ch in range(audio.shape[0]):
-            filtered[ch] = torch.lfilter(b, a, audio[ch])
-        return filtered
-
-    def _apply_bandpass(self, audio, low_cutoff=300, high_cutoff=3000):
-        nyquist = self.sample_rate / 2
-        low_norm = low_cutoff / nyquist
-        high_norm = high_cutoff / nyquist
-        b_low, a_low = torch.tensor([1 - low_norm]), torch.tensor([1, -low_norm])
-        b_high, a_high = torch.tensor([1 - high_norm]), torch.tensor([1, -high_norm])
-        filtered = audio.clone()
-        for ch in range(audio.shape[0]):
-            temp = torch.lfilter(b_low, a_low, audio[ch])
-            filtered[ch] = torch.lfilter(b_high, a_high, temp, clamp=False)
-        return filtered
-
-    def _apply_vocal_augmentation(self, vocal_audio):
-        if random.random() < 0.3:
-            vocal_audio = self._apply_overdrive(vocal_audio, drive=random.uniform(1.5, 4.0))
-
-        aug_choice = random.random()
-        if aug_choice < 0.20:
-            vocal_audio = self._apply_highpass(vocal_audio, cutoff=random.uniform(80, 200))
-        elif aug_choice < 0.35:
-            vocal_audio = self._apply_bandpass(vocal_audio,
-                                               low_cutoff=random.uniform(200, 500),
-                                               high_cutoff=random.uniform(2000, 4000))
-        return vocal_audio
-
     def _find_audio_file(self, directory, base_name):
         for ext in ['.wav', '.flac']:
             path = os.path.join(directory, base_name + ext)
@@ -414,16 +375,14 @@ class Dataset(Dataset):
                 vocal_seg = self._load_chunk(vocal_info)
                 instr_seg = self._load_chunk(other_info)
 
-                vocal_seg = self._apply_vocal_augmentation(vocal_seg)
-
                 mixture_seg = vocal_seg + instr_seg
 
                 mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                           window=self.window, return_complex=True, center=True)
-
+                
                 target_vocal_spec = torch.stft(vocal_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                                window=self.window, return_complex=True, center=True)
-
+                
                 target_instr_spec = torch.stft(instr_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                                window=self.window, return_complex=True, center=True)
 
