@@ -34,14 +34,18 @@ def rotate_half(x):
 def apply_rope(x, cos, sin):
     return x * cos + rotate_half(x) * sin
 
-class Attention(nn.Module):
+class DifferentialAttention(nn.Module):
     def __init__(self, dim, heads=8):
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
         
-        self.wq = nn.Linear(dim, dim, bias=False)
-        self.wk = nn.Linear(dim, dim, bias=False)
+        self.wq_pos = nn.Linear(dim, dim, bias=False)
+        self.wk_pos = nn.Linear(dim, dim, bias=False)
+        
+        self.wq_neg = nn.Linear(dim, dim, bias=False)
+        self.wk_neg = nn.Linear(dim, dim, bias=False)
+        
         self.wv = nn.Linear(dim, dim, bias=False)
         
         self.out_proj = nn.Linear(dim, dim, bias=False)
@@ -51,8 +55,12 @@ class Attention(nn.Module):
         B, S, C = x.shape
         H, D = self.heads, self.head_dim
 
-        q = self.wq(x).view(B, S, H, D).transpose(1, 2)
-        k = self.wk(x).view(B, S, H, D).transpose(1, 2)
+        q_pos = self.wq_pos(x).view(B, S, H, D).transpose(1, 2)
+        k_pos = self.wk_pos(x).view(B, S, H, D).transpose(1, 2)
+        
+        q_neg = self.wq_neg(x).view(B, S, H, D).transpose(1, 2)
+        k_neg = self.wk_neg(x).view(B, S, H, D).transpose(1, 2)
+        
         v = self.wv(x).view(B, S, H, D).transpose(1, 2)
 
         cos, sin = self.rope(S, x.device)
@@ -60,13 +68,21 @@ class Attention(nn.Module):
         cos = cos.view(1, 1, S, D)
         sin = sin.view(1, 1, S, D)
         
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        q_pos = apply_rope(q_pos, cos, sin)
+        k_pos = apply_rope(k_pos, cos, sin)
+        
+        q_neg = apply_rope(q_neg, cos, sin)
+        k_neg = apply_rope(k_neg, cos, sin)
 
-        scores = torch.einsum("bhsd,bhtd->bhst", q, k) / (D ** 0.5)
-        attn = F.softmax(scores, dim=-1)
+        scores_pos = torch.einsum("bhsd,bhtd->bhst", q_pos, k_pos) / (D ** 0.5)
+        scores_neg = torch.einsum("bhsd,bhtd->bhst", q_neg, k_neg) / (D ** 0.5)
 
-        out = torch.einsum("bhst,bhtd->bhsd", attn, v)
+        attn_pos = F.softmax(scores_pos, dim=-1)
+        attn_neg = F.softmax(scores_neg, dim=-1)
+
+        attn_zero_sum = attn_pos - attn_neg
+
+        out = torch.einsum("bhst,bhtd->bhsd", attn_zero_sum, v)
         out = out.transpose(1, 2).reshape(B, S, C)
         
         return self.out_proj(out)
@@ -75,7 +91,7 @@ class EncoderLayer(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, heads)
+        self.attn = DifferentialAttention(dim, heads)
         self.norm2 = nn.LayerNorm(dim)
         self.ff = nn.Sequential(
             nn.Linear(dim, dim * 4),
@@ -704,7 +720,7 @@ def main():
 
     args = parser.parse_args()
 
-    segment_length = 264600
+    segment_length = 220500
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
