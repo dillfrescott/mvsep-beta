@@ -15,6 +15,25 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.g = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.g
+
+class SwiGLU(nn.Module):
+    def __init__(self, dim, intermediate_size):
+        super().__init__()
+        self.w1 = nn.Linear(dim, intermediate_size, bias=False)
+        self.w2 = nn.Linear(dim, intermediate_size, bias=False)
+        self.w3 = nn.Linear(intermediate_size, dim, bias=False)
+
+    def forward(self, x):
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -90,14 +109,10 @@ class DifferentialAttention(nn.Module):
 class EncoderLayer(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = RMSNorm(dim)
         self.attn = DifferentialAttention(dim, heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ff = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim)
-        )
+        self.norm2 = RMSNorm(dim)
+        self.ff = SwiGLU(dim, int(dim * 4 * 2 / 3))
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
@@ -109,7 +124,7 @@ class DualPathEncoder(nn.Module):
         super().__init__()
         self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
         self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
-        self.norm = nn.LayerNorm(dim)
+        self.norm = RMSNorm(dim)
 
     def forward(self, x):
         B, F_b, T, E = x.shape
@@ -139,7 +154,7 @@ class PixelShuffleFreq(nn.Module):
 
 class NeuralModel(nn.Module):
     def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=256, depth=12, heads=8, hop_length=1024, window_size=4096):
+                 embed_dim=256, depth=10, heads=8, hop_length=1024, window_size=4096):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -174,7 +189,7 @@ class NeuralModel(nn.Module):
             nn.GELU()
         )
 
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = RMSNorm(embed_dim)
 
         self.model = DualPathEncoder(
             dim=embed_dim,
