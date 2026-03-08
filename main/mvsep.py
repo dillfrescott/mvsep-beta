@@ -101,29 +101,27 @@ class DualPathEncoder(nn.Module):
             x = x.reshape(B * F_b, T, E)
             x = t_layer(x)
             x = x.view(B, F_b, T, E)
-            
+
             x = x.transpose(1, 2).reshape(B * T, F_b, E)
             x = f_layer(x)
             x = x.view(B, T, F_b, E).transpose(1, 2)
+
         return self.norm(x)
 
-class PixelShuffleFreq(nn.Module):
-    def __init__(self, upscale_factor):
-        super().__init__()
-        self.upscale_factor = upscale_factor
-
-    def forward(self, x):
-        B, CR, F_sub, T = x.shape
-        r = self.upscale_factor
-        C = CR // r
-        x = x.view(B, C, r, F_sub, T)
-        x = x.permute(0, 1, 3, 2, 4).contiguous()
-        x = x.view(B, C, F_sub * r, T)
-        return x
-
 class NeuralModel(nn.Module):
-    def __init__(self, in_channels=2, sources=2, freq_bins=2049,
-                 embed_dim=256, depth=12, heads=8, hop_length=1024, window_size=4096):
+    def __init__(
+        self,
+        in_channels=2,
+        sources=2,
+        freq_bins=2049,
+        embed_dim=192,
+        depth=12,
+        heads=8,
+        hop_length=1024,
+        window_size=4096,
+        freq_patch=65,
+        freq_stride=16
+    ):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -132,19 +130,27 @@ class NeuralModel(nn.Module):
         self.embed_dim = embed_dim
         self.hop_length = hop_length
         self.window_size = window_size
-        self.n_bands = 64
-        self.upscale_factor = 32
+        self.freq_patch = freq_patch
+        self.freq_stride = freq_stride
+
+        self.n_bands = ((freq_bins + 2 * (freq_patch // 2) - freq_patch) // freq_stride) + 1
 
         self.feature_proj = nn.Sequential(
             nn.Conv2d(in_channels * 2, 128, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(128, embed_dim, kernel_size=(32, 1), stride=(32, 1))
+            nn.Conv2d(
+                128,
+                embed_dim,
+                kernel_size=(freq_patch, 1),
+                stride=(freq_stride, 1),
+                padding=(freq_patch // 2, 0)
+            )
         )
 
         self.audio_proj = nn.Sequential(
             nn.Conv1d(
-                in_channels, 
-                128, 
+                in_channels,
+                128,
                 kernel_size=self.window_size,
                 stride=self.hop_length,
                 padding=self.window_size // 2
@@ -167,31 +173,37 @@ class NeuralModel(nn.Module):
         )
 
         self.output_cnn = nn.Sequential(
-            nn.Conv2d(embed_dim, self.out_masks * 2 * self.upscale_factor, kernel_size=1),
-            PixelShuffleFreq(self.upscale_factor)
+            nn.ConvTranspose2d(
+                embed_dim,
+                embed_dim,
+                kernel_size=(freq_patch, 1),
+                stride=(freq_stride, 1),
+                padding=(freq_patch // 2, 0)
+            ),
+            nn.GELU(),
+            nn.Conv2d(embed_dim, self.out_masks * 2, kernel_size=1)
         )
 
     def forward(self, x_stft, x_audio):
-        B = x_stft.shape[0]
-        
         x_stft_cat = torch.cat([x_stft.real, x_stft.imag], dim=1)
         x_s = self.feature_proj(x_stft_cat)
-        
+
         x_a = self.audio_proj(x_audio)
+        if x_a.shape[-1] != x_s.shape[-1]:
+            x_a = F.interpolate(x_a, size=x_s.shape[-1], mode="linear", align_corners=False)
         x_a = x_a.unsqueeze(2).expand(-1, -1, self.n_bands, -1)
-        
+
         x = torch.cat([x_s, x_a], dim=1)
         x = x.permute(0, 2, 3, 1)
         x = self.fusion_proj(x)
         x = self.norm(x)
-        
+
         x = self.model(x)
-        
+
         x = x.permute(0, 3, 1, 2)
         x = self.output_cnn(x)
-        
-        x = F.pad(x, (0, 0, 0, 1))
-        
+        x = x[:, :, :self.freq_bins, :]
+
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
@@ -704,7 +716,7 @@ def main():
 
     args = parser.parse_args()
 
-    segment_length = 264600
+    segment_length = 176400
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
