@@ -1,6 +1,5 @@
 import os
 import argparse
-import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -108,106 +107,23 @@ class DualPathEncoder(nn.Module):
             x = x.view(B, T, F_b, E).transpose(1, 2)
         return self.norm(x)
 
-def make_band_splits(freq_bins, n_bands):
-    edges = torch.linspace(0.0, 1.0, n_bands + 1)
-    edges = edges ** 2.2
-    edges = (edges * freq_bins).round().long()
-
-    edges[0] = 0
-    edges[-1] = freq_bins
-
-    for i in range(1, len(edges)):
-        if edges[i] <= edges[i - 1]:
-            edges[i] = edges[i - 1] + 1
-
-    edges[-1] = freq_bins
-
-    offsets = []
-    sizes = []
-    start = 0
-    for i in range(n_bands):
-        end = int(edges[i + 1].item())
-        if end > freq_bins:
-            end = freq_bins
-        if end <= start:
-            end = min(start + 1, freq_bins)
-        offsets.append((start, end))
-        sizes.append(end - start)
-        start = end
-
-    if offsets[-1][1] != freq_bins:
-        offsets[-1] = (offsets[-1][0], freq_bins)
-        sizes[-1] = freq_bins - offsets[-1][0]
-
-    return sizes, offsets
-
-class BandSplitProjection(nn.Module):
-    def __init__(self, freq_bins, in_channels, embed_dim, n_bands=64):
+class PixelShuffleFreq(nn.Module):
+    def __init__(self, upscale_factor):
         super().__init__()
-        self.freq_bins = freq_bins
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        self.n_bands = n_bands
-
-        self.band_sizes, self.band_offsets = make_band_splits(freq_bins, n_bands)
-
-        self.band_projs = nn.ModuleList([
-            nn.Linear(in_channels * 2 * band_size, embed_dim)
-            for band_size in self.band_sizes
-        ])
-
-    def forward(self, x_stft):
-        bands = []
-        for (start, end), proj in zip(self.band_offsets, self.band_projs):
-            x_band = x_stft[:, :, start:end, :]
-            x_band = torch.cat([x_band.real, x_band.imag], dim=1)
-            x_band = x_band.permute(0, 3, 1, 2).contiguous()
-            x_band = x_band.view(x_band.shape[0], x_band.shape[1], -1)
-            x_band = proj(x_band)
-            bands.append(x_band)
-
-        x = torch.stack(bands, dim=1)
-        return x
-
-class BandMergeProjection(nn.Module):
-    def __init__(self, freq_bins, out_masks, embed_dim, n_bands=64):
-        super().__init__()
-        self.freq_bins = freq_bins
-        self.out_masks = out_masks
-        self.embed_dim = embed_dim
-        self.n_bands = n_bands
-
-        self.band_sizes, self.band_offsets = make_band_splits(freq_bins, n_bands)
-
-        self.band_outs = nn.ModuleList([
-            nn.Linear(embed_dim, out_masks * 2 * band_size)
-            for band_size in self.band_sizes
-        ])
+        self.upscale_factor = upscale_factor
 
     def forward(self, x):
-        band_outputs = []
-        for i, (band_size, head) in enumerate(zip(self.band_sizes, self.band_outs)):
-            x_band = x[:, i]
-            x_band = head(x_band)
-            x_band = x_band.view(x_band.shape[0], x_band.shape[1], self.out_masks * 2, band_size)
-            x_band = x_band.permute(0, 2, 3, 1).contiguous()
-            band_outputs.append(x_band)
-
-        x = torch.cat(band_outputs, dim=2)
+        B, CR, F_sub, T = x.shape
+        r = self.upscale_factor
+        C = CR // r
+        x = x.view(B, C, r, F_sub, T)
+        x = x.permute(0, 1, 3, 2, 4).contiguous()
+        x = x.view(B, C, F_sub * r, T)
         return x
 
 class NeuralModel(nn.Module):
-    def __init__(
-        self,
-        in_channels=2,
-        sources=2,
-        freq_bins=2049,
-        embed_dim=256,
-        depth=12,
-        heads=8,
-        hop_length=1024,
-        window_size=4096
-    ):
+    def __init__(self, in_channels=2, sources=2, freq_bins=2049,
+                 embed_dim=256, depth=12, heads=8, hop_length=1024, window_size=4096):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -217,18 +133,18 @@ class NeuralModel(nn.Module):
         self.hop_length = hop_length
         self.window_size = window_size
         self.n_bands = 64
+        self.upscale_factor = 32
 
-        self.band_split = BandSplitProjection(
-            freq_bins=freq_bins,
-            in_channels=in_channels,
-            embed_dim=embed_dim,
-            n_bands=self.n_bands
+        self.feature_proj = nn.Sequential(
+            nn.Conv2d(in_channels * 2, 128, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(128, embed_dim, kernel_size=(32, 1), stride=(32, 1))
         )
 
         self.audio_proj = nn.Sequential(
             nn.Conv1d(
-                in_channels,
-                128,
+                in_channels, 
+                128, 
                 kernel_size=self.window_size,
                 stride=self.hop_length,
                 padding=self.window_size // 2
@@ -244,34 +160,38 @@ class NeuralModel(nn.Module):
 
         self.norm = nn.LayerNorm(embed_dim)
 
-        self.model = DualPathEncoder(dim=embed_dim, depth=depth, heads=heads)
+        self.model = DualPathEncoder(
+            dim=embed_dim,
+            depth=depth,
+            heads=heads
+        )
 
-        self.band_merge = BandMergeProjection(
-            freq_bins=freq_bins,
-            out_masks=self.out_masks,
-            embed_dim=embed_dim,
-            n_bands=self.n_bands
+        self.output_cnn = nn.Sequential(
+            nn.Conv2d(embed_dim, self.out_masks * 2 * self.upscale_factor, kernel_size=1),
+            PixelShuffleFreq(self.upscale_factor)
         )
 
     def forward(self, x_stft, x_audio):
-        x_s = self.band_split(x_stft)
-
+        B = x_stft.shape[0]
+        
+        x_stft_cat = torch.cat([x_stft.real, x_stft.imag], dim=1)
+        x_s = self.feature_proj(x_stft_cat)
+        
         x_a = self.audio_proj(x_audio)
-
-        if x_a.shape[-1] != x_s.shape[2]:
-            x_a = F.interpolate(x_a, size=x_s.shape[2], mode="linear", align_corners=False)
-
         x_a = x_a.unsqueeze(2).expand(-1, -1, self.n_bands, -1)
-        x_a = x_a.permute(0, 2, 3, 1).contiguous()
-
-        x = torch.cat([x_s, x_a], dim=-1)
+        
+        x = torch.cat([x_s, x_a], dim=1)
+        x = x.permute(0, 2, 3, 1)
         x = self.fusion_proj(x)
         x = self.norm(x)
-
+        
         x = self.model(x)
-
-        x = self.band_merge(x)
-
+        
+        x = x.permute(0, 3, 1, 2)
+        x = self.output_cnn(x)
+        
+        x = F.pad(x, (0, 0, 0, 1))
+        
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
