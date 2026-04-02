@@ -16,24 +16,41 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
+class PoPE(nn.Module):
+    def __init__(self, dim, heads):
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-
+        self.heads = heads
+        self.dim = dim
+        
+        inv_freqs = 10000 ** -(torch.arange(0, dim, 1).float() / dim)
+        self.register_buffer('inv_freqs', inv_freqs)
+        
+        self.bias = nn.Parameter(torch.zeros(heads, dim))
+    
     def forward(self, seq_len, device):
-        t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos(), emb.sin()
+        pos = torch.arange(seq_len, device=device, dtype=self.inv_freqs.dtype)
+        freqs = torch.einsum("i,j->ij", pos, self.inv_freqs)
+        
+        bias = self.bias.clamp(-2 * math.pi, 0)
+        
+        freqs_with_bias = freqs.unsqueeze(0) + bias.unsqueeze(1)
+        
+        return freqs, freqs_with_bias
 
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-def apply_rope(x, cos, sin):
-    return x * cos + rotate_half(x) * sin
+def apply_pope(q, k, freqs, freqs_with_bias):
+    q_mag = F.softplus(q.float())
+    k_mag = F.softplus(k.float())
+    
+    q_phase = freqs.unsqueeze(0).unsqueeze(0)
+    k_phase = freqs_with_bias.unsqueeze(0)
+    
+    q_complex = torch.polar(q_mag, q_phase)
+    k_complex = torch.polar(k_mag, k_phase)
+    
+    q_embed = torch.view_as_real(q_complex).flatten(-2)
+    k_embed = torch.view_as_real(k_complex).flatten(-2)
+    
+    return q_embed.type_as(q), k_embed.type_as(k)
 
 class Attention(nn.Module):
     def __init__(self, dim, heads=8):
@@ -46,7 +63,7 @@ class Attention(nn.Module):
         self.wv = nn.Linear(dim, dim, bias=False)
         
         self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.rope = RotaryEmbedding(self.head_dim)
+        self.pope = PoPE(self.head_dim, heads)
 
     def forward(self, x):
         B, S, C = x.shape
@@ -56,13 +73,9 @@ class Attention(nn.Module):
         k = self.wk(x).view(B, S, H, D).transpose(1, 2)
         v = self.wv(x).view(B, S, H, D).transpose(1, 2)
 
-        cos, sin = self.rope(S, x.device)
+        freqs, bias = self.pope(S, x.device)
         
-        cos = cos.view(1, 1, S, D)
-        sin = sin.view(1, 1, S, D)
-        
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        q, k = apply_pope(q, k, freqs, bias)
 
         scores = torch.einsum("bhsd,bhtd->bhst", q, k) / (D ** 0.5)
         attn = F.softmax(scores, dim=-1)
@@ -72,17 +85,27 @@ class Attention(nn.Module):
         
         return self.out_proj(out)
 
+class GatedFF(nn.Module):
+    def __init__(self, dim, hidden_dim=None):
+        super().__init__()
+        
+        if hidden_dim is None:
+            hidden_dim = int(8 * dim / 3)
+            
+        self.gate_proj = nn.Linear(dim, hidden_dim)
+        self.up_proj = nn.Linear(dim, hidden_dim)
+        self.down_proj = nn.Linear(hidden_dim, dim)
+
+    def forward(self, x):
+        return self.down_proj(F.gelu(self.gate_proj(x)) * self.up_proj(x))
+
 class EncoderLayer(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, heads)
         self.norm2 = nn.LayerNorm(dim)
-        self.ff = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim)
-        )
+        self.ff = GatedFF(dim)
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
