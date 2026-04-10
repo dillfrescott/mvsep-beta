@@ -557,8 +557,42 @@ def validate(model, test_dir, device, chunk_size, overlap):
     avg_combined_sdr = (avg_vocal_sdr + avg_instr_sdr) / 2
     return avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr
 
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {name: param.data.clone() for name, param in model.named_parameters() if param.requires_grad}
+        self.backup = {}
+
+    def update(self):
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    self.shadow[name].copy_(self.decay * self.shadow[name] + (1.0 - self.decay) * param.data)
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self):
+        return self.shadow
+
+    def load_state_dict(self, state_dict):
+        for name, value in state_dict.items():
+            if name in self.shadow:
+                self.shadow[name].copy_(value)
+
 def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, segment_length, checkpoint_path=None, window=None, reset_optimizer=False):
     model.to(device)
+    ema = EMA(model, decay=0.999)
     step = 0
     avg_loss = 0.0
     
@@ -578,6 +612,13 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
+        
+        if 'ema_state_dict' in checkpoint_data:
+            ema.load_state_dict(checkpoint_data['ema_state_dict'])
+            print("EMA state loaded from checkpoint.")
+        else:
+            print("No EMA state found in checkpoint. Initializing from current model weights.")
+            
         step = checkpoint_data.get('step', 0)
         avg_loss = checkpoint_data.get('avg_loss', 0.0)
         
@@ -605,6 +646,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            ema.update()
 
             avg_loss = 0.999 * avg_loss + 0.001 * loss.item() if step > 0 else loss.item()
             step += 1
@@ -613,7 +655,10 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
             if step > 0 and step % checkpoint_steps == 0:
                 checkpoint_payload = {
-                    'step': step, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
+                    'step': step, 
+                    'model_state_dict': model.state_dict(), 
+                    'ema_state_dict': ema.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss
                 }
 
@@ -627,9 +672,11 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 if len(regular_checkpoints) > 3:
                     os.remove(regular_checkpoints[0])
 
+                ema.apply_shadow()
                 avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
+                ema.restore()
                 
-                print(f"\nValidation Step {step}: Vocal SDR: {avg_vocal_sdr:.4f}, Instr SDR: {avg_instr_sdr:.4f}, Combined SDR: {avg_combined_sdr:.4f}")
+                print(f"\nValidation Step {step} (EMA): Vocal SDR: {avg_vocal_sdr:.4f}, Instr SDR: {avg_instr_sdr:.4f}, Combined SDR: {avg_combined_sdr:.4f}")
 
                 best_sdr_checkpoints = []
                 if os.path.exists('best_ckpts'):
