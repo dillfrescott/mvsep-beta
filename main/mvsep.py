@@ -42,8 +42,8 @@ def apply_pope(q, k, freqs, freqs_with_bias):
     q_mag = F.softplus(q.float())
     k_mag = F.softplus(k.float())
     
-    q_phase = freqs.unsqueeze(0).unsqueeze(0)
-    k_phase = freqs_with_bias.unsqueeze(0)
+    q_phase = freqs.unsqueeze(0).unsqueeze(0).float()
+    k_phase = freqs_with_bias.unsqueeze(0).float()
     
     q_complex = torch.polar(q_mag, q_phase)
     k_complex = torch.polar(k_mag, k_phase)
@@ -180,26 +180,27 @@ class BandSplitProjection(nn.Module):
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         self.n_bands = n_bands
-
-        self.band_sizes, self.band_offsets = make_band_splits(freq_bins, n_bands)
-
-        self.band_projs = nn.ModuleList([
-            nn.Linear(in_channels * 2 * band_size, embed_dim)
-            for band_size in self.band_sizes
-        ])
+        self.band_sizes, _ = make_band_splits(freq_bins, n_bands)
+        self.max_band_size = max(self.band_sizes)
+        self.weight = nn.Parameter(torch.empty(n_bands, embed_dim, in_channels * 2 * self.max_band_size))
+        self.bias = nn.Parameter(torch.empty(n_bands, embed_dim))
+        for i, band_size in enumerate(self.band_sizes):
+            in_f = in_channels * 2 * band_size
+            w = torch.empty(embed_dim, in_f)
+            nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            self.weight.data[i, :, :in_f] = w
+            self.weight.data[i, :, in_f:] = 0
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(w)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias.data[i], -bound, bound)
 
     def forward(self, x_stft):
-        bands = []
-        for (start, end), proj in zip(self.band_offsets, self.band_projs):
-            x_band = x_stft[:, :, start:end, :]
-            x_band = torch.cat([x_band.real, x_band.imag], dim=1)
-            x_band = x_band.permute(0, 3, 1, 2).contiguous()
-            x_band = x_band.view(x_band.shape[0], x_band.shape[1], -1)
-            x_band = proj(x_band)
-            bands.append(x_band)
-
-        x = torch.stack(bands, dim=1)
-        return x
+        x = torch.cat([x_stft.real, x_stft.imag], dim=1).permute(0, 3, 1, 2)
+        bands = torch.split(x, self.band_sizes, dim=-1)
+        x = torch.stack([F.pad(b, (0, self.max_band_size - b.shape[-1])) for b in bands], dim=2)
+        x = x.reshape(x.shape[0], x.shape[1], self.n_bands, -1)
+        x = torch.einsum('btni, noi -> btno', x, self.weight) + self.bias
+        return x.transpose(1, 2)
 
 class BandMergeProjection(nn.Module):
     def __init__(self, freq_bins, out_masks, embed_dim, n_bands=64):
@@ -208,25 +209,25 @@ class BandMergeProjection(nn.Module):
         self.out_masks = out_masks
         self.embed_dim = embed_dim
         self.n_bands = n_bands
-
-        self.band_sizes, self.band_offsets = make_band_splits(freq_bins, n_bands)
-
-        self.band_outs = nn.ModuleList([
-            nn.Linear(embed_dim, out_masks * 2 * band_size)
-            for band_size in self.band_sizes
-        ])
+        self.band_sizes, _ = make_band_splits(freq_bins, n_bands)
+        self.max_band_size = max(self.band_sizes)
+        self.weight = nn.Parameter(torch.empty(n_bands, out_masks * 2 * self.max_band_size, embed_dim))
+        self.bias = nn.Parameter(torch.empty(n_bands, out_masks * 2 * self.max_band_size))
+        for i, band_size in enumerate(self.band_sizes):
+            out_f = out_masks * 2 * band_size
+            w = torch.empty(out_f, embed_dim)
+            nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            self.weight.data[i, :out_f, :] = w
+            self.weight.data[i, out_f:, :] = 0
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(w)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias.data[i, :out_f], -bound, bound)
+            self.bias.data[i, out_f:] = 0
 
     def forward(self, x):
-        band_outputs = []
-        for i, (band_size, head) in enumerate(zip(self.band_sizes, self.band_outs)):
-            x_band = x[:, i]
-            x_band = head(x_band)
-            x_band = x_band.view(x_band.shape[0], x_band.shape[1], self.out_masks * 2, band_size)
-            x_band = x_band.permute(0, 2, 3, 1).contiguous()
-            band_outputs.append(x_band)
-
-        x = torch.cat(band_outputs, dim=2)
-        return x
+        x = torch.einsum('btne, noe -> btno', x.transpose(1, 2), self.weight) + self.bias
+        x = x.view(x.shape[0], x.shape[1], self.n_bands, self.out_masks * 2, self.max_band_size).permute(0, 3, 2, 4, 1)
+        return torch.cat([x[:, :, i, :s, :] for i, s in enumerate(self.band_sizes)], dim=2)
 
 class NeuralModel(nn.Module):
     def __init__(
@@ -352,6 +353,7 @@ def loss_fn(pred_output,
             stft_params_for_istft,
             multi_res_complex_loss_calculator):
     device = pred_output.device
+    pred_output = pred_output.float()
 
     B, _, F_dim, T = pred_output.shape
     pred_output_reshaped = pred_output.view(B, 2, 4, F_dim, T)
@@ -604,6 +606,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     ema = EMA(model, decay=0.999)
     step = 0
     avg_loss = 0.0
+    scaler = torch.cuda.amp.GradScaler()
     
     best_sdr = -float('inf')
     if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
@@ -648,13 +651,16 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             target_vocal_spec, target_instr_spec = target_vocal_spec.to(device, non_blocking=True), target_instr_spec.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            pred_masks = model(mixture_spec, mixture_audio)
-            loss = loss_fn(pred_masks, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
+            with torch.cuda.amp.autocast():
+                pred_masks = model(mixture_spec, mixture_audio)
+                loss = loss_fn(pred_masks, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
             
             if torch.isnan(loss).any(): continue
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             ema.update()
 
             avg_loss = 0.999 * avg_loss + 0.001 * loss.item() if step > 0 else loss.item()
@@ -817,8 +823,8 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
 
             spec = torch.stft(padded_chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
 
-            with torch.no_grad():
-                pred_output = model(spec.unsqueeze(0), padded_chunk.unsqueeze(0)).squeeze(0)
+            with torch.no_grad(), torch.cuda.amp.autocast():
+                pred_output = model(spec.unsqueeze(0), padded_chunk.unsqueeze(0)).squeeze(0).float()
 
             _, F_spec, T_spec = spec.shape
             pred_output_reshaped = pred_output.view(2, 4, F_spec, T_spec)
