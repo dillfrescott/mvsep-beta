@@ -7,7 +7,6 @@ import torch.nn.functional as F
 import torchaudio
 import soundfile as sf
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 from prodigyopt import Prodigy
 import random
@@ -53,8 +52,8 @@ def apply_pope(q, k, freqs, freqs_with_bias):
     
     return q_embed.type_as(q), k_embed.type_as(k)
 
-class MemAttention(nn.Module):
-    def __init__(self, dim, heads=8, mem_slots=64):
+class Attention(nn.Module):
+    def __init__(self, dim, heads=8):
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
@@ -66,9 +65,6 @@ class MemAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.pope = PoPE(self.head_dim, heads)
 
-        self.mem_k = nn.Parameter(torch.randn(heads, mem_slots, self.head_dim * 2) * 0.02)
-        self.mem_v = nn.Parameter(torch.randn(heads, mem_slots, self.head_dim) * 0.02)
-
     def forward(self, x):
         B, S, C = x.shape
         H, D = self.heads, self.head_dim
@@ -78,18 +74,13 @@ class MemAttention(nn.Module):
         v = self.wv(x).view(B, S, H, D).transpose(1, 2)
 
         freqs, bias = self.pope(S, x.device)
+        
         q, k = apply_pope(q, k, freqs, bias)
 
-        mem_k = self.mem_k.unsqueeze(0).expand(B, -1, -1, -1)
-        mem_v = self.mem_v.unsqueeze(0).expand(B, -1, -1, -1)
-
-        k = torch.cat([k, mem_k], dim=2)
-        v = torch.cat([v, mem_v], dim=2)
-
-        scores = torch.einsum("bhsd,bhmd->bhsm", q, k) / (q.shape[-1] ** 0.5)
+        scores = torch.einsum("bhsd,bhtd->bhst", q, k) / (D ** 0.5)
         attn = F.softmax(scores, dim=-1)
 
-        out = torch.einsum("bhsm,bhmd->bhsd", attn, v)
+        out = torch.einsum("bhst,bhtd->bhsd", attn, v)
         out = out.transpose(1, 2).reshape(B, S, C)
         
         return self.out_proj(out)
@@ -112,7 +103,7 @@ class EncoderLayer(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = MemAttention(dim, heads)
+        self.attn = Attention(dim, heads)
         self.norm2 = nn.LayerNorm(dim)
         self.ff = GatedFF(dim)
 
@@ -132,11 +123,11 @@ class DualPathEncoder(nn.Module):
         B, F_b, T, E = x.shape
         for t_layer, f_layer in zip(self.time_layers, self.freq_layers):
             x = x.reshape(B * F_b, T, E)
-            x = checkpoint(t_layer, x, use_reentrant=False)
+            x = t_layer(x)
             x = x.view(B, F_b, T, E)
-
+            
             x = x.transpose(1, 2).reshape(B * T, F_b, E)
-            x = checkpoint(f_layer, x, use_reentrant=False)
+            x = f_layer(x)
             x = x.view(B, T, F_b, E).transpose(1, 2)
         return self.norm(x)
 
