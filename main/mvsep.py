@@ -8,7 +8,7 @@ import torchaudio
 import soundfile as sf
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from prodigyopt import Prodigy
+from adam_atan2_pytorch import AdamAtan2
 import random
 import math
 import re
@@ -233,7 +233,7 @@ class NeuralModel(nn.Module):
         sources=2,
         freq_bins=2049,
         embed_dim=256,
-        depth=24,
+        depth=12,
         heads=8,
         hop_length=1024,
         window_size=4096,
@@ -903,7 +903,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
     model = NeuralModel(use_checkpoint=args.ckpt) 
-    optimizer = Prodigy(model.parameters(), lr=1.0)
+    optimizer = AdamAtan2(model.parameters(), lr=1e-4)
 
     if args.train:
         checkpoint_to_load = args.checkpoint_path
