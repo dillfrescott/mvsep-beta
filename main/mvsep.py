@@ -138,6 +138,37 @@ class DualPathEncoder(nn.Module):
             x = x.view(B, T, F_b, E).transpose(1, 2)
         return self.norm(x)
 
+class MaskEstimator(nn.Module):
+    def __init__(self, dim, depth, heads, n_bands):
+        super().__init__()
+        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
+        self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim)
+        self.gate_conv = nn.Conv1d(dim, dim, kernel_size=3, padding=1)
+        self.feat_conv = nn.Conv1d(dim, dim, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        B, n_bands, T, E = x.shape
+
+        for t_layer, f_layer in zip(self.time_layers, self.freq_layers):
+            x = x.reshape(B * n_bands, T, E)
+            x = t_layer(x)
+            x = x.view(B, n_bands, T, E)
+
+            x = x.transpose(1, 2).reshape(B * T, n_bands, E)
+            x = f_layer(x)
+            x = x.view(B, T, n_bands, E).transpose(1, 2)
+
+        x = self.norm(x)
+
+        B, n_bands, T, E = x.shape
+        x = x.reshape(B * n_bands, T, E).transpose(1, 2)
+        gate = torch.sigmoid(self.gate_conv(x))
+        feat = self.feat_conv(x)
+        x = (gate * feat).transpose(1, 2).view(B, n_bands, T, E)
+
+        return x
+
 def make_band_splits(freq_bins, n_bands):
     edges = torch.linspace(0.0, 1.0, n_bands + 1)
     edges = edges ** 2.2
@@ -233,7 +264,7 @@ class NeuralModel(nn.Module):
         sources=2,
         freq_bins=2049,
         embed_dim=256,
-        depth=12,
+        depth=14,
         heads=8,
         hop_length=1024,
         window_size=4096,
@@ -277,6 +308,8 @@ class NeuralModel(nn.Module):
 
         self.model = DualPathEncoder(dim=embed_dim, depth=depth, heads=heads, use_checkpoint=use_checkpoint)
 
+        self.mask_estimator = MaskEstimator(dim=embed_dim, depth=2, heads=heads, n_bands=self.n_bands)
+
         self.band_merge = BandMergeProjection(
             freq_bins=freq_bins,
             out_masks=self.out_masks,
@@ -300,6 +333,8 @@ class NeuralModel(nn.Module):
         x = self.norm(x)
 
         x = self.model(x)
+
+        x = self.mask_estimator(x)
 
         x = self.band_merge(x)
 
