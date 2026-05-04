@@ -77,7 +77,7 @@ class Attention(nn.Module):
         
         q, k = apply_pope(q, k, freqs, bias)
 
-        scores = torch.einsum("bhsd,bhtd->bhst", q, k) / (D ** 0.5)
+        scores = torch.einsum("bhsd,bhtd->bhst", q, k) / (q.shape[-1] ** 0.5)
         attn = F.softmax(scores, dim=-1)
 
         out = torch.einsum("bhst,bhtd->bhsd", attn, v)
@@ -169,7 +169,7 @@ class MaskEstimator(nn.Module):
 
         return x
 
-def make_band_splits(freq_bins, n_bands):
+def make_band_splits(freq_bins, n_bands, overlap_ratio=0.25):
     edges = torch.linspace(0.0, 1.0, n_bands + 1)
     edges = edges ** 2.2
     edges = (edges * freq_bins).round().long()
@@ -183,8 +183,8 @@ def make_band_splits(freq_bins, n_bands):
 
     edges[-1] = freq_bins
 
-    offsets = []
-    sizes = []
+    nominal_offsets = []
+    nominal_sizes = []
     start = 0
     for i in range(n_bands):
         end = int(edges[i + 1].item())
@@ -192,15 +192,26 @@ def make_band_splits(freq_bins, n_bands):
             end = freq_bins
         if end <= start:
             end = min(start + 1, freq_bins)
-        offsets.append((start, end))
-        sizes.append(end - start)
+        nominal_offsets.append((start, end))
+        nominal_sizes.append(end - start)
         start = end
 
-    if offsets[-1][1] != freq_bins:
-        offsets[-1] = (offsets[-1][0], freq_bins)
-        sizes[-1] = freq_bins - offsets[-1][0]
+    if nominal_offsets[-1][1] != freq_bins:
+        nominal_offsets[-1] = (nominal_offsets[-1][0], freq_bins)
+        nominal_sizes[-1] = freq_bins - nominal_offsets[-1][0]
 
-    return sizes, offsets
+    ext_offsets = []
+    ext_sizes = []
+    for i in range(n_bands):
+        nom_start, nom_end = nominal_offsets[i]
+        nom_size = nom_end - nom_start
+        overlap = max(1, int(nom_size * overlap_ratio))
+        ext_start = max(0, nom_start - overlap)
+        ext_end = min(freq_bins, nom_end + overlap)
+        ext_offsets.append((ext_start, ext_end))
+        ext_sizes.append(ext_end - ext_start)
+
+    return ext_sizes, ext_offsets, nominal_offsets, nominal_sizes
 
 class BandSplitProjection(nn.Module):
     def __init__(self, freq_bins, in_channels, embed_dim, n_bands=64):
@@ -210,12 +221,13 @@ class BandSplitProjection(nn.Module):
         self.embed_dim = embed_dim
         self.n_bands = n_bands
 
-        self.band_sizes, self.band_offsets = make_band_splits(freq_bins, n_bands)
+        self.band_sizes, self.band_offsets, _, _ = make_band_splits(freq_bins, n_bands)
 
         self.band_projs = nn.ModuleList([
             nn.Linear(in_channels * 2 * band_size, embed_dim)
             for band_size in self.band_sizes
         ])
+        self.band_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x_stft):
         bands = []
@@ -228,6 +240,7 @@ class BandSplitProjection(nn.Module):
             bands.append(x_band)
 
         x = torch.stack(bands, dim=1)
+        x = self.band_norm(x)
         return x
 
 class BandMergeProjection(nn.Module):
@@ -238,24 +251,53 @@ class BandMergeProjection(nn.Module):
         self.embed_dim = embed_dim
         self.n_bands = n_bands
 
-        self.band_sizes, self.band_offsets = make_band_splits(freq_bins, n_bands)
+        self.ext_sizes, self.ext_offsets, self.nominal_offsets, self.nominal_sizes = make_band_splits(freq_bins, n_bands)
 
         self.band_outs = nn.ModuleList([
-            nn.Linear(embed_dim, out_masks * 2 * band_size)
-            for band_size in self.band_sizes
+            nn.Linear(embed_dim, out_masks * 2 * ext_size)
+            for ext_size in self.ext_sizes
         ])
 
+        self.register_buffer('merge_windows', self._build_merge_windows())
+
+    def _build_merge_windows(self):
+        windows = []
+        max_ext = max(e - s for s, e in self.ext_offsets)
+        for i in range(self.n_bands):
+            ext_start, ext_end = self.ext_offsets[i]
+            ext_size = ext_end - ext_start
+            nom_start, nom_end = self.nominal_offsets[i]
+            nom_start_in_ext = nom_start - ext_start
+            nom_end_in_ext = nom_end - ext_start
+
+            window = torch.zeros(max_ext)
+            left_taper = nom_start_in_ext
+            if left_taper > 0:
+                window[:left_taper] = torch.linspace(0, 1, left_taper + 1)[:-1]
+            window[nom_start_in_ext:nom_end_in_ext] = 1.0
+            right_taper = ext_size - nom_end_in_ext
+            if right_taper > 0:
+                window[nom_end_in_ext:nom_end_in_ext + right_taper] = torch.linspace(1, 0, right_taper + 1)[:-1]
+            windows.append(window)
+        return torch.stack(windows)
+
     def forward(self, x):
-        band_outputs = []
-        for i, (band_size, head) in enumerate(zip(self.band_sizes, self.band_outs)):
+        B, _, T, _ = x.shape
+        output = torch.zeros(B, self.out_masks * 2, self.freq_bins, T, device=x.device, dtype=x.dtype)
+
+        for i, (ext_size, head) in enumerate(zip(self.ext_sizes, self.band_outs)):
             x_band = x[:, i]
             x_band = head(x_band)
-            x_band = x_band.view(x_band.shape[0], x_band.shape[1], self.out_masks * 2, band_size)
+            x_band = x_band.view(x_band.shape[0], x_band.shape[1], self.out_masks * 2, ext_size)
             x_band = x_band.permute(0, 2, 3, 1).contiguous()
-            band_outputs.append(x_band)
 
-        x = torch.cat(band_outputs, dim=2)
-        return x
+            w = self.merge_windows[i, :ext_size].view(1, 1, -1, 1)
+            x_band = x_band * w
+
+            ext_start, ext_end = self.ext_offsets[i]
+            output[:, :, ext_start:ext_end, :] += x_band
+
+        return output
 
 class NeuralModel(nn.Module):
     def __init__(
@@ -299,22 +341,29 @@ class NeuralModel(nn.Module):
             nn.Conv1d(128, embed_dim, kernel_size=3, padding=1)
         )
 
-        self.fusion_proj = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.GELU()
+        self.audio_to_film = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, self.n_bands * 2 * embed_dim)
         )
 
         self.norm = nn.LayerNorm(embed_dim)
 
         self.model = DualPathEncoder(dim=embed_dim, depth=depth, heads=heads, use_checkpoint=use_checkpoint)
 
-        self.mask_estimator = MaskEstimator(dim=embed_dim, depth=2, heads=heads, n_bands=self.n_bands)
+        self.mask_estimator = MaskEstimator(dim=embed_dim, depth=4, heads=heads, n_bands=self.n_bands)
 
         self.band_merge = BandMergeProjection(
             freq_bins=freq_bins,
             out_masks=self.out_masks,
             embed_dim=embed_dim,
             n_bands=self.n_bands
+        )
+
+        self.merge_refine = nn.Sequential(
+            nn.Conv2d(self.out_masks * 2, self.out_masks * 2, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(self.out_masks * 2, self.out_masks * 2, kernel_size=3, padding=1)
         )
 
     def forward(self, x_stft, x_audio):
@@ -325,11 +374,13 @@ class NeuralModel(nn.Module):
         if x_a.shape[-1] != x_s.shape[2]:
             x_a = F.interpolate(x_a, size=x_s.shape[2], mode="linear", align_corners=False)
 
-        x_a = x_a.unsqueeze(2).expand(-1, -1, self.n_bands, -1)
-        x_a = x_a.permute(0, 2, 3, 1).contiguous()
+        x_a_t = x_a.permute(0, 2, 1)
+        film = self.audio_to_film(x_a_t)
+        film = film.view(x_a_t.shape[0], x_a_t.shape[1], self.n_bands, 2, self.embed_dim)
+        scale = (1 + 0.1 * torch.tanh(film[:, :, :, 0])).permute(0, 2, 1, 3)
+        shift = film[:, :, :, 1].permute(0, 2, 1, 3)
 
-        x = torch.cat([x_s, x_a], dim=-1)
-        x = self.fusion_proj(x)
+        x = scale * x_s + shift
         x = self.norm(x)
 
         x = self.model(x)
@@ -337,6 +388,7 @@ class NeuralModel(nn.Module):
         x = self.mask_estimator(x)
 
         x = self.band_merge(x)
+        x = x + self.merge_refine(x)
 
         return x
 
