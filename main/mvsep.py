@@ -86,48 +86,30 @@ class Attention(nn.Module):
         return self.out_proj(out)
 
 class GatedFF(nn.Module):
-    def __init__(self, dim, heads, hidden_dim=None):
+    def __init__(self, dim, hidden_dim=None):
         super().__init__()
         
         if hidden_dim is None:
             hidden_dim = int(8 * dim / 3)
-            hidden_dim = (hidden_dim + heads - 1) // heads * heads
             
         self.gate_proj = nn.Linear(dim, hidden_dim)
         self.up_proj = nn.Linear(dim, hidden_dim)
         self.down_proj = nn.Linear(hidden_dim, dim)
-        self.heads = heads
-        self.head_dim = hidden_dim // heads
-        self.wq = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.wk = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.wv = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.attn_out = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.pope = PoPE(self.head_dim, heads)
 
     def forward(self, x):
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        B, S, H_d = up.shape
-        H, D = self.heads, self.head_dim
-        q = self.wq(up).view(B, S, H, D).transpose(1, 2)
-        k = self.wk(up).view(B, S, H, D).transpose(1, 2)
-        v = self.wv(up).view(B, S, H, D).transpose(1, 2)
-        freqs, bias = self.pope(S, x.device)
-        q, k = apply_pope(q, k, freqs, bias)
-        scores = torch.einsum("bhsd,bhtd->bhst", q, k) / (D ** 0.5)
-        attn = F.softmax(scores, dim=-1)
-        out = torch.einsum("bhst,bhtd->bhsd", attn, v)
-        up = self.attn_out(out.transpose(1, 2).reshape(B, S, H_d))
-        return self.down_proj(F.gelu(gate) * up)
+        return self.down_proj(F.gelu(self.gate_proj(x)) * self.up_proj(x))
 
 class EncoderLayer(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.ff = GatedFF(dim, heads)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = GatedFF(dim)
 
     def forward(self, x):
-        x = x + self.ff(self.norm(x))
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
         return x
 
 class DualPathEncoder(nn.Module):
@@ -158,6 +140,7 @@ class DualPathEncoder(nn.Module):
 
 def make_band_splits(freq_bins, n_bands, overlap_ratio=0.25):
     edges = torch.linspace(0.0, 1.0, n_bands + 1)
+    edges = edges ** 2.2
     edges = (edges * freq_bins).round().long()
 
     edges[0] = 0
@@ -200,7 +183,7 @@ def make_band_splits(freq_bins, n_bands, overlap_ratio=0.25):
     return ext_sizes, ext_offsets, nominal_offsets, nominal_sizes
 
 class BandSplitProjection(nn.Module):
-    def __init__(self, freq_bins, in_channels, embed_dim, n_bands=32):
+    def __init__(self, freq_bins, in_channels, embed_dim, n_bands=64):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -230,7 +213,7 @@ class BandSplitProjection(nn.Module):
         return x
 
 class BandMergeProjection(nn.Module):
-    def __init__(self, freq_bins, out_masks, embed_dim, n_bands=32):
+    def __init__(self, freq_bins, out_masks, embed_dim, n_bands=64):
         super().__init__()
         self.freq_bins = freq_bins
         self.out_masks = out_masks
@@ -337,9 +320,6 @@ class NeuralModel(nn.Module):
 
         self.model = DualPathEncoder(dim=embed_dim, depth=depth, heads=heads, use_checkpoint=use_checkpoint)
 
-        self.mask_gate = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1)
-        self.mask_feat = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1)
-
         self.band_merge = BandMergeProjection(
             freq_bins=freq_bins,
             out_masks=self.out_masks,
@@ -371,12 +351,6 @@ class NeuralModel(nn.Module):
         x = self.norm(x)
 
         x = self.model(x)
-
-        B, n_bands, T, E = x.shape
-        x_flat = x.reshape(B * n_bands, T, E).transpose(1, 2)
-        gate = torch.sigmoid(self.mask_gate(x_flat))
-        feat = self.mask_feat(x_flat)
-        x = x + (gate * feat).transpose(1, 2).view(B, n_bands, T, E)
 
         x = self.band_merge(x)
         x = x + self.merge_refine(x)
@@ -418,7 +392,7 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
 
             complex_loss_total += (real_loss + imag_loss)
 
-        return complex_loss_total / len(self.fft_sizes)
+        return complex_loss_total
 
 def loss_fn(pred_output,
             mixture_spec,
@@ -471,15 +445,8 @@ def loss_fn(pred_output,
 
     vocal_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
-
-    vocal_wave_l1 = F.l1_loss(pred_vocal_audio, target_vocal_audio)
-    instr_wave_l1 = F.l1_loss(pred_instr_audio, target_instr_audio)
-
-    comp_audio = pred_vocal_audio + pred_instr_audio
-    target_mixture_audio = target_vocal_audio + target_instr_audio
-    comp_loss = F.l1_loss(comp_audio, target_mixture_audio)
-
-    total_loss = vocal_loss + instr_loss + vocal_wave_l1 + instr_wave_l1 + comp_loss
+    
+    total_loss = vocal_loss + instr_loss
 
     return total_loss
 
@@ -747,8 +714,6 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             progress_bar.set_description(f"Step {step} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f} - Best SDR: {best_sdr:.4f}")
 
             if step > 0 and step % checkpoint_steps == 0:
-                ema.apply_shadow()
-
                 checkpoint_payload = {
                     'step': step, 
                     'model_state_dict': model.state_dict(), 
@@ -767,6 +732,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 if len(regular_checkpoints) > 3:
                     os.remove(regular_checkpoints[0])
 
+                ema.apply_shadow()
                 avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
                 ema.restore()
                 
@@ -835,7 +801,7 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
     return best_ckpt
 
 def inference(model, checkpoint_path, input_data, output_instrumental_path, output_vocal_path,
-              chunk_size=264600, overlap=88200, device='cpu', return_tensors=False):
+              chunk_size=485100, overlap=88200, device='cpu', return_tensors=False):
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
