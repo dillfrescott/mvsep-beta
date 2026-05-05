@@ -200,7 +200,7 @@ def make_band_splits(freq_bins, n_bands, overlap_ratio=0.25):
     return ext_sizes, ext_offsets, nominal_offsets, nominal_sizes
 
 class BandSplitProjection(nn.Module):
-    def __init__(self, freq_bins, in_channels, embed_dim, n_bands=64):
+    def __init__(self, freq_bins, in_channels, embed_dim, n_bands=32):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -230,7 +230,7 @@ class BandSplitProjection(nn.Module):
         return x
 
 class BandMergeProjection(nn.Module):
-    def __init__(self, freq_bins, out_masks, embed_dim, n_bands=64):
+    def __init__(self, freq_bins, out_masks, embed_dim, n_bands=32):
         super().__init__()
         self.freq_bins = freq_bins
         self.out_masks = out_masks
