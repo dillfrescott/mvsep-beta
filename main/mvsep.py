@@ -364,6 +364,7 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
         self.fft_sizes = fft_sizes
         self.hop_sizes = hop_sizes
         self.win_lengths = win_lengths
+        self.log_weights = nn.Parameter(torch.zeros(len(fft_sizes)))
         for i, win_len in enumerate(win_lengths):
             self.register_buffer(f'window_{i}', torch.hann_window(win_len), persistent=False)
 
@@ -378,6 +379,8 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
         y_pred_flat = y_pred.reshape(B * C, L)
         y_true_flat = y_true.reshape(B * C, L)
 
+        weights = F.softmax(self.log_weights, dim=0) * len(self.fft_sizes)
+
         for i, (n_fft, hop_length, win_length) in enumerate(zip(self.fft_sizes, self.hop_sizes, self.win_lengths)):
             window = getattr(self, f'window_{i}')
             window = window.to(y_pred_flat.device)
@@ -390,7 +393,7 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             real_loss = F.l1_loss(stft_pred.real, stft_true.real)
             imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
 
-            complex_loss_total += (real_loss + imag_loss)
+            complex_loss_total += weights[i] * (real_loss + imag_loss)
 
         return complex_loss_total
 
@@ -653,7 +656,7 @@ class EMA:
             if name in self.shadow:
                 self.shadow[name].copy_(value)
 
-def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, segment_length, checkpoint_path=None, window=None, reset_optimizer=False):
+def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, segment_length, multi_res_complex_loss_calculator, checkpoint_path=None, window=None, reset_optimizer=False):
     model.to(device)
     ema = EMA(model, decay=0.999)
     step = 0
@@ -668,9 +671,6 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     stft_params_for_istft = {
         'n_fft': 4096, 'hop_length': 1024, 'window': window.to(device)
     }
-    multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
-        fft_sizes=[1024, 2048, 8192], hop_sizes=[256, 512, 2048], win_lengths=[1024, 2048, 8192]
-    ).to(device)
 
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -690,6 +690,9 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             print(f"Resuming training from step {step}. MODEL AND OPTIMIZER LOADED.")
         else:
             print(f"Resuming training from step {step}. MODEL LOADED, OPTIMIZER RESET.")
+
+        if 'loss_state_dict' in checkpoint_data:
+            multi_res_complex_loss_calculator.load_state_dict(checkpoint_data['loss_state_dict'])
 
     progress_bar = tqdm(initial=step, total=None, dynamic_ncols=True)
     
@@ -722,7 +725,8 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                     'model_state_dict': model.state_dict(), 
                     'ema_state_dict': ema.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    'avg_loss': avg_loss
+                    'avg_loss': avg_loss,
+                    'loss_state_dict': multi_res_complex_loss_calculator.state_dict()
                 }
 
                 reg_checkpoint_path = f"ckpts/checkpoint_step_{step}.pt"
@@ -957,8 +961,11 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(use_checkpoint=args.ckpt) 
-    optimizer = AdamAtan2(model.parameters(), lr=1e-4)
+    model = NeuralModel(use_checkpoint=args.ckpt)
+    multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
+        fft_sizes=[1024, 2048, 8192], hop_sizes=[256, 512, 2048], win_lengths=[1024, 2048, 8192]
+    ).to(device)
+    optimizer = AdamAtan2(list(model.parameters()) + list(multi_res_complex_loss_calculator.parameters()), lr=1e-4)
 
     if args.train:
         checkpoint_to_load = args.checkpoint_path
@@ -969,7 +976,7 @@ def main():
 
         train_dataset = Dataset(root_dir=args.data_dir, segment_length=segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
-        train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, segment_length, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
+        train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, segment_length, multi_res_complex_loss_calculator, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
     
     elif args.infer:
         if not args.input_file:
