@@ -443,10 +443,13 @@ def loss_fn(pred_output,
         window=window, center=True, length=recon_len
     ).reshape(B, C, -1)
 
-    vocal_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
-    instr_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
+    vocal_stft_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
+    instr_stft_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
     
-    total_loss = vocal_loss + instr_loss
+    vocal_wave_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
+    instr_wave_loss = F.l1_loss(pred_instr_audio, target_instr_audio)
+    
+    total_loss = vocal_stft_loss + instr_stft_loss + vocal_wave_loss + instr_wave_loss
 
     return total_loss
 
