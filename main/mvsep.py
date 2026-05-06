@@ -183,7 +183,7 @@ def make_band_splits(freq_bins, n_bands, overlap_ratio=0.25):
     return ext_sizes, ext_offsets, nominal_offsets, nominal_sizes
 
 class BandSplitProjection(nn.Module):
-    def __init__(self, freq_bins, in_channels, embed_dim, n_bands=32):
+    def __init__(self, freq_bins, in_channels, embed_dim, n_bands=64):
         super().__init__()
         self.freq_bins = freq_bins
         self.in_channels = in_channels
@@ -213,7 +213,7 @@ class BandSplitProjection(nn.Module):
         return x
 
 class BandMergeProjection(nn.Module):
-    def __init__(self, freq_bins, out_masks, embed_dim, n_bands=32):
+    def __init__(self, freq_bins, out_masks, embed_dim, n_bands=64):
         super().__init__()
         self.freq_bins = freq_bins
         self.out_masks = out_masks
@@ -274,8 +274,8 @@ class NeuralModel(nn.Module):
         in_channels=2,
         sources=2,
         freq_bins=2049,
-        embed_dim=384,
-        depth=12,
+        embed_dim=256,
+        depth=14,
         heads=8,
         hop_length=1024,
         window_size=4096,
@@ -289,7 +289,7 @@ class NeuralModel(nn.Module):
         self.embed_dim = embed_dim
         self.hop_length = hop_length
         self.window_size = window_size
-        self.n_bands = 32
+        self.n_bands = 64
 
         self.band_split = BandSplitProjection(
             freq_bins=freq_bins,
