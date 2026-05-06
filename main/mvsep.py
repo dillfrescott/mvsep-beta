@@ -365,6 +365,8 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
         self.hop_sizes = hop_sizes
         self.win_lengths = win_lengths
         self.log_weights = nn.Parameter(torch.zeros(len(fft_sizes)))
+        self.stft_log_weight = nn.Parameter(torch.zeros(1))
+        self.wave_log_weight = nn.Parameter(torch.zeros(1))
         for i, win_len in enumerate(win_lengths):
             self.register_buffer(f'window_{i}', torch.hann_window(win_len), persistent=False)
 
@@ -396,6 +398,11 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             complex_loss_total += weights[i] * (real_loss + imag_loss)
 
         return complex_loss_total
+
+    def get_loss_weights(self):
+        stft_w = F.softplus(self.stft_log_weight)
+        wave_w = F.softplus(self.wave_log_weight)
+        return stft_w, wave_w
 
 def loss_fn(pred_output,
             mixture_spec,
@@ -452,7 +459,8 @@ def loss_fn(pred_output,
     vocal_wave_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
     instr_wave_loss = F.l1_loss(pred_instr_audio, target_instr_audio)
     
-    total_loss = vocal_stft_loss + instr_stft_loss + vocal_wave_loss + instr_wave_loss
+    stft_w, wave_w = multi_res_complex_loss_calculator.get_loss_weights()
+    total_loss = stft_w * (vocal_stft_loss + instr_stft_loss) + wave_w * (vocal_wave_loss + instr_wave_loss)
 
     return total_loss
 
