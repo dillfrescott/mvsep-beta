@@ -11,7 +11,7 @@ from mvsep import NeuralModel
 
 warnings.filterwarnings("ignore")
 
-def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=264600, overlap=88200, device='cpu'):
+def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=485100, overlap=88200, device='cpu'):
     checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
     model.eval().to(device)
@@ -20,6 +20,9 @@ def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=264600, 
 
     input_files = [f for f in os.listdir(input_dir) if f.endswith('_mixture.wav')]
     input_files.sort()
+
+    n_fft, hop_length = 4096, 1024
+    window = torch.hann_window(n_fft).to(device)
 
     for filename in input_files:
         input_wav_path = os.path.join(input_dir, filename)
@@ -36,112 +39,74 @@ def inference(model, checkpoint_path, input_dir, output_dir, chunk_size=264600, 
             continue
         input_audio = input_audio.to(device)
 
-        total_length = input_audio.shape[1]
-        vocals = torch.zeros_like(input_audio)
-        instrumentals = torch.zeros_like(input_audio)
-        sum_weights = torch.zeros(total_length, device=device)
+        orig_len = input_audio.shape[1]
+        pad_len = (orig_len // hop_length + 1) * hop_length
+        input_audio = F.pad(input_audio, (0, pad_len - orig_len))
 
-        n_fft, hop_length = 4096, 1024
-        window = torch.hann_window(n_fft).to(device)
-        step_size = chunk_size - overlap
+        with torch.no_grad():
+            spec = torch.stft(input_audio, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
+            x_s = model.band_split(spec.unsqueeze(0))
+            x_a = model.audio_proj(input_audio.unsqueeze(0))
+            
+            if x_a.shape[-1] != x_s.shape[2]:
+                x_a = F.interpolate(x_a, size=x_s.shape[2], mode="linear", align_corners=False)
 
-        chunk_starts = list(range(0, total_length, step_size))
-        num_chunks = len(chunk_starts)
+            x_a_t = x_a.permute(0, 2, 1)
+            film = model.audio_to_film(x_a_t)
+            film = film.view(x_a_t.shape[0], x_a_t.shape[1], model.n_bands, 2, model.embed_dim)
+            scale = (1 + 0.1 * torch.tanh(film[:, :, :, 0])).permute(0, 2, 1, 3)
+            shift = film[:, :, :, 1].permute(0, 2, 1, 3)
 
-        ola_window = torch.hann_window(chunk_size, device=device, dtype=input_audio.dtype)
+            x = scale * x_s + shift
+            x = model.norm(x)
 
-        with tqdm(total=num_chunks, desc=f"Processing {filename}", leave=False) as pbar:
-            for chunk_idx, i in enumerate(chunk_starts):
+            B, BANDS, T_total, E = x.shape
+            chunk_frames = (chunk_size // hop_length)
+            overlap_frames = (overlap // hop_length)
+            step_frames = chunk_frames - overlap_frames
+            
+            x_out = torch.zeros_like(x)
+            w_sum = torch.zeros(1, 1, T_total, 1, device=device)
+            ola_w = torch.hann_window(chunk_frames, device=device).view(1, 1, -1, 1)
+
+            for i in tqdm(range(0, T_total, step_frames), desc=f"Processing {filename}", leave=False):
                 start = i
-                end = min(i + chunk_size, total_length)
-                chunk = input_audio[:, start:end]
-                L = chunk.shape[1]
-
-                if L < n_fft:
-                    needed = n_fft - L
-                    left_ctx = min(needed, start)
-                    right_ctx = min(needed - left_ctx, total_length - end)
-                    extended_start = start - left_ctx
-                    extended_end = end + right_ctx
-                    chunk = input_audio[:, extended_start:extended_end]
-                    start = extended_start
-                    end = extended_end
-                    L = chunk.shape[1]
-                    if L < n_fft:
-                        chunk = F.pad(chunk, (0, n_fft - L), mode='reflect' if L > 1 else 'constant')
-                        L = chunk.shape[1]
-
-                target_length = chunk_size
-                padded_chunk = chunk
-                pad_amount = 0
-                if L < target_length:
-                    pad_amount = target_length - L
-                    max_reflect = L - 1
-                    if pad_amount <= max_reflect:
-                        padded_chunk = F.pad(chunk, (0, pad_amount), mode='reflect')
-                    else:
-                        padded_chunk = F.pad(chunk, (0, max_reflect), mode='reflect')
-                        remaining = pad_amount - max_reflect
-                        padded_chunk = F.pad(padded_chunk, (0, remaining), mode='constant')
-
-                spec = torch.stft(padded_chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
-
-                with torch.no_grad():
-                    pred_output = model(spec.unsqueeze(0), padded_chunk.unsqueeze(0)).squeeze(0)
-
-                _, F_spec, T_spec = spec.shape
-                pred_output_reshaped = pred_output.view(2, 4, F_spec, T_spec)
-                pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
-
-                pred_masks_real = pred_real[:4]
-                pred_masks_imag = pred_imag[:4]
-
-                vL_cmask = pred_masks_real[0] + 1j * pred_masks_imag[0]
-                vR_cmask = pred_masks_real[1] + 1j * pred_masks_imag[1]
-                iL_cmask = pred_masks_real[2] + 1j * pred_masks_imag[2]
-                iR_cmask = pred_masks_real[3] + 1j * pred_masks_imag[3]
-
-                instrumental_spec = torch.stack([iL_cmask * spec[0], iR_cmask * spec[1]], dim=0)
-                vocal_spec = torch.stack([vL_cmask * spec[0], vR_cmask * spec[1]], dim=0)
-
-                vocal_chunk_full = torch.istft(vocal_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
-                inst_chunk_full = torch.istft(instrumental_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
-
-                vocal_chunk = vocal_chunk_full[:, :L]
-                inst_chunk = inst_chunk_full[:, :L]
-
-                if L == chunk_size:
-                    w = ola_window
+                end = min(i + chunk_frames, T_total)
+                L = end - start
+                
+                if L < chunk_frames:
+                    curr_w = torch.hann_window(L, device=device).view(1, 1, -1, 1)
                 else:
-                    w = torch.hann_window(L, device=device, dtype=input_audio.dtype)
+                    curr_w = ola_w
+                    
+                x_chunk = x[:, :, start:end, :]
+                if L < chunk_frames:
+                    x_chunk = F.pad(x_chunk, (0, 0, 0, chunk_frames - L))
+                    
+                x_res = model.model(x_chunk)
+                x_out[:, :, start:end, :] += x_res[:, :, :L, :] * curr_w
+                w_sum[:, :, start:end, :] += curr_w
 
-                if num_chunks == 1:
-                    w = torch.ones(L, device=device, dtype=input_audio.dtype)
-                else:
-                    if chunk_idx == 0:
-                        w = w.clone()
-                        half = L // 2
-                        w[:half] = 1.0
-                    elif end >= total_length:
-                        w = w.clone()
-                        half = L // 2
-                        w[half:] = 1.0
+            x = x_out / w_sum.clamp(min=1e-8)
+            x = model.band_merge(x)
+            x = x + model.merge_refine(x)
+            
+            B_f, _, F_spec, T_spec = x.shape
+            x_reshaped = x.view(B_f, 2, 4, F_spec, T_spec)
+            
+            vL_c = x_reshaped[0, 0, 0] + 1j * x_reshaped[0, 1, 0]
+            vR_c = x_reshaped[0, 0, 1] + 1j * x_reshaped[0, 1, 1]
+            iL_c = x_reshaped[0, 0, 2] + 1j * x_reshaped[0, 1, 2]
+            iR_c = x_reshaped[0, 0, 3] + 1j * x_reshaped[0, 1, 3]
 
-                actual_end = min(start + L, total_length)
-                usable = actual_end - start
+            v_spec = torch.stack([vL_c * spec[0], vR_c * spec[1]], dim=0)
+            i_spec = torch.stack([iL_c * spec[0], iR_c * spec[1]], dim=0)
 
-                vocals[:, start:actual_end] += vocal_chunk[:, :usable] * w[:usable]
-                instrumentals[:, start:actual_end] += inst_chunk[:, :usable] * w[:usable]
-                sum_weights[start:actual_end] += w[:usable]
-                pbar.update(1)
-
-        sum_weights = sum_weights.clamp(min=1e-8)
-
-        vocals = vocals / sum_weights
-        instrumentals = instrumentals / sum_weights
+            vocals = torch.istft(v_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=orig_len, center=True)
+            instrs = torch.istft(i_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=orig_len, center=True)
 
         torchaudio.save(output_vocal_path, vocals.cpu().clamp(-1.0, 1.0), sr, format='flac')
-        torchaudio.save(output_instrumental_path, instrumentals.cpu().clamp(-1.0, 1.0), sr, format='flac')
+        torchaudio.save(output_instrumental_path, instrs.cpu().clamp(-1.0, 1.0), sr, format='flac')
 
 def main():
     parser = argparse.ArgumentParser()
