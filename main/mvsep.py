@@ -848,7 +848,7 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
         w_sum = torch.zeros(1, 1, T_total, 1, device=device)
         ola_w = torch.hann_window(chunk_frames, device=device).view(1, 1, -1, 1)
 
-        for i in range(0, T_total, step_frames):
+        for i in tqdm(range(0, T_total, step_frames), desc="Processing audio", leave=False):
             start = i
             end = min(i + chunk_frames, T_total)
             L = end - start
