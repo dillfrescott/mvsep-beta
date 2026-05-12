@@ -21,35 +21,35 @@ class PoPE(nn.Module):
         super().__init__()
         self.heads = heads
         self.dim = dim
-        
+
         inv_freqs = 10000 ** -(torch.arange(0, dim, 1).float() / dim)
         self.register_buffer('inv_freqs', inv_freqs)
-        
+
         self.bias = nn.Parameter(torch.zeros(heads, dim))
-    
+
     def forward(self, seq_len, device):
         pos = torch.arange(seq_len, device=device, dtype=self.inv_freqs.dtype)
         freqs = torch.einsum("i,j->ij", pos, self.inv_freqs)
-        
+
         bias = self.bias.clamp(-2 * math.pi, 0)
-        
+
         freqs_with_bias = freqs.unsqueeze(0) + bias.unsqueeze(1)
-        
+
         return freqs, freqs_with_bias
 
 def apply_pope(q, k, freqs, freqs_with_bias):
     q_mag = F.softplus(q.float())
     k_mag = F.softplus(k.float())
-    
+
     q_phase = freqs.unsqueeze(0).unsqueeze(0)
     k_phase = freqs_with_bias.unsqueeze(0)
-    
+
     q_complex = torch.polar(q_mag, q_phase)
     k_complex = torch.polar(k_mag, k_phase)
-    
+
     q_embed = torch.view_as_real(q_complex).flatten(-2)
     k_embed = torch.view_as_real(k_complex).flatten(-2)
-    
+
     return q_embed.type_as(q), k_embed.type_as(k)
 
 class Attention(nn.Module):
@@ -57,39 +57,44 @@ class Attention(nn.Module):
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
-        
+
         self.wq = nn.Linear(dim, dim, bias=False)
         self.wk = nn.Linear(dim, dim, bias=False)
         self.wv = nn.Linear(dim, dim, bias=False)
-        
+
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.pope = PoPE(self.head_dim, heads)
 
-    def forward(self, x):
+    def forward(self, x, context=None):
         B, S, C = x.shape
         H, D = self.heads, self.head_dim
 
         q = self.wq(x).view(B, S, H, D).transpose(1, 2)
-        k = self.wk(x).view(B, S, H, D).transpose(1, 2)
-        v = self.wv(x).view(B, S, H, D).transpose(1, 2)
+
+        k_in = context if context is not None else x
+        S_kv = k_in.shape[1]
+
+        k = self.wk(k_in).view(B, S_kv, H, D).transpose(1, 2)
+        v = self.wv(k_in).view(B, S_kv, H, D).transpose(1, 2)
 
         freqs, bias = self.pope(S, x.device)
-        
+
         q, k = apply_pope(q, k, freqs, bias)
 
-        out = F.scaled_dot_product_attention(q, k, v, scale=D**-0.5)
+
+        out = F.scaled_dot_product_attention(q, k, v, scale=(2*D)**-0.5)
 
         out = out.transpose(1, 2).reshape(B, S, C)
-        
+
         return self.out_proj(out)
 
 class GatedFF(nn.Module):
     def __init__(self, dim, hidden_dim=None):
         super().__init__()
-        
+
         if hidden_dim is None:
             hidden_dim = int(8 * dim / 3)
-            
+
         self.gate_proj = nn.Linear(dim, hidden_dim)
         self.up_proj = nn.Linear(dim, hidden_dim)
         self.down_proj = nn.Linear(hidden_dim, dim)
@@ -98,36 +103,61 @@ class GatedFF(nn.Module):
         return self.down_proj(F.gelu(self.gate_proj(x)) * self.up_proj(x))
 
 class EncoderLayer(nn.Module):
-    def __init__(self, dim, heads):
+    def __init__(self, dim, heads, cross_attn=False):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, heads)
         self.norm2 = nn.LayerNorm(dim)
         self.ff = GatedFF(dim)
+        self.cross_attn = Attention(dim, heads) if cross_attn else None
+        self.norm_cross = nn.LayerNorm(dim) if cross_attn else None
+        self.norm_ctx = nn.LayerNorm(dim) if cross_attn else None
 
-    def forward(self, x):
+    def forward(self, x, context=None):
         x = x + self.attn(self.norm1(x))
+        if self.cross_attn is not None and context is not None:
+
+            x = x + self.cross_attn(self.norm_cross(x), context=self.norm_ctx(context))
         x = x + self.ff(self.norm2(x))
         return x
+
+class ResBlock1D(nn.Module):
+    def __init__(self, dim, dilation=1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(dim, dim, 3, padding=dilation, dilation=dilation),
+            nn.GroupNorm(8, dim),
+            nn.GELU(),
+            nn.Conv1d(dim, dim, 3, padding=dilation, dilation=dilation),
+            nn.GroupNorm(8, dim)
+        )
+    def forward(self, x):
+        return x + self.conv(x)
 
 class DualPathEncoder(nn.Module):
     def __init__(self, dim, depth, heads, use_checkpoint=False):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
+        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads, cross_attn=True) for _ in range(depth)])
         self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x):
+    def forward(self, x, context=None):
         B, F_b, T, E = x.shape
         for t_layer, f_layer in zip(self.time_layers, self.freq_layers):
             x = x.reshape(B * F_b, T, E)
-            if self.use_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(t_layer, x, use_reentrant=False)
+
+            if context is not None:
+                t_ctx = context.unsqueeze(1).expand(-1, F_b, -1, -1).reshape(B * F_b, T, E)
             else:
-                x = t_layer(x)
+                t_ctx = None
+
+            if self.use_checkpoint and self.training:
+                x = torch.utils.checkpoint.checkpoint(t_layer, x, t_ctx, use_reentrant=False)
+            else:
+                x = t_layer(x, context=t_ctx)
             x = x.view(B, F_b, T, E)
-            
+
             x = x.transpose(1, 2).reshape(B * T, F_b, E)
             if self.use_checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(f_layer, x, use_reentrant=False)
@@ -261,6 +291,35 @@ class BandMergeProjection(nn.Module):
 
         return output
 
+class AudioContextEncoder(nn.Module):
+    def __init__(self, in_channels, embed_dim, window_size, hop_length):
+        super().__init__()
+        self.initial_conv = nn.Sequential(
+            nn.Conv1d(
+                in_channels,
+                128,
+                kernel_size=window_size,
+                stride=hop_length,
+                padding=window_size // 2
+            ),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
+            ResBlock1D(128, dilation=1),
+            ResBlock1D(128, dilation=2),
+            nn.Conv1d(128, embed_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, embed_dim)
+        )
+
+        self.transformer = EncoderLayer(embed_dim, heads=8)
+
+    def forward(self, x):
+        x = self.initial_conv(x)
+
+        x = x.permute(0, 2, 1) 
+        x = self.transformer(x)
+        x = x.permute(0, 2, 1) 
+        return x
+
 class NeuralModel(nn.Module):
     def __init__(
         self,
@@ -291,22 +350,12 @@ class NeuralModel(nn.Module):
             n_bands=self.n_bands
         )
 
-        self.audio_proj = nn.Sequential(
-            nn.Conv1d(
-                in_channels,
-                128,
-                kernel_size=self.window_size,
-                stride=self.hop_length,
-                padding=self.window_size // 2
-            ),
-            nn.GELU(),
-            nn.Conv1d(128, embed_dim, kernel_size=3, padding=1)
-        )
 
-        self.audio_to_film = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2),
-            nn.GELU(),
-            nn.Linear(embed_dim * 2, self.n_bands * 2 * embed_dim)
+        self.audio_context_encoder = AudioContextEncoder(
+            in_channels=in_channels,
+            embed_dim=embed_dim,
+            window_size=self.window_size,
+            hop_length=self.hop_length
         )
 
         self.norm = nn.LayerNorm(embed_dim)
@@ -329,21 +378,16 @@ class NeuralModel(nn.Module):
     def forward(self, x_stft, x_audio):
         x_s = self.band_split(x_stft)
 
-        x_a = self.audio_proj(x_audio)
+
+        x_a = self.audio_context_encoder(x_audio)
 
         if x_a.shape[-1] != x_s.shape[2]:
             x_a = F.interpolate(x_a, size=x_s.shape[2], mode="linear", align_corners=False)
 
         x_a_t = x_a.permute(0, 2, 1)
-        film = self.audio_to_film(x_a_t)
-        film = film.view(x_a_t.shape[0], x_a_t.shape[1], self.n_bands, 2, self.embed_dim)
-        scale = (1 + 0.1 * torch.tanh(film[:, :, :, 0])).permute(0, 2, 1, 3)
-        shift = film[:, :, :, 1].permute(0, 2, 1, 3)
 
-        x = scale * x_s + shift
-        x = self.norm(x)
-
-        x = self.model(x)
+        x = self.norm(x_s)
+        x = self.model(x, context=x_a_t)
 
         x = self.band_merge(x)
         x = x + self.merge_refine(x)
@@ -439,10 +483,10 @@ def loss_fn(pred_output,
 
     vocal_stft_loss = multi_res_complex_loss_calculator(pred_vocal_audio, target_vocal_audio)
     instr_stft_loss = multi_res_complex_loss_calculator(pred_instr_audio, target_instr_audio)
-    
+
     vocal_wave_loss = F.l1_loss(pred_vocal_audio, target_vocal_audio)
     instr_wave_loss = F.l1_loss(pred_instr_audio, target_instr_audio)
-    
+
     total_loss = vocal_stft_loss + instr_stft_loss + vocal_wave_loss + instr_wave_loss
 
     return total_loss
@@ -501,14 +545,14 @@ class Dataset(Dataset):
         path = track_info['path']
         total_frames = track_info['frames']
         sr = track_info['sr']
-        
+
         target_length = self.segment_length if self.segment else total_frames
-        
+
         if total_frames <= target_length:
             audio_np, sr = sf.read(path, dtype='float32')
             audio = torch.from_numpy(audio_np)
             audio = audio.unsqueeze(0) if audio.dim() == 1 else audio.t()
-            
+
             audio = self._preprocess_audio(audio, sr)
             pad_size = target_length - audio.shape[1]
             if pad_size > 0:
@@ -518,9 +562,9 @@ class Dataset(Dataset):
             audio_np, sr = sf.read(path, start=start_frame, frames=target_length, dtype='float32')
             audio = torch.from_numpy(audio_np)
             audio = audio.unsqueeze(0) if audio.dim() == 1 else audio.t()
-            
+
             audio = self._preprocess_audio(audio, sr)
-            
+
         return audio
 
     def __len__(self):
@@ -539,10 +583,10 @@ class Dataset(Dataset):
 
                 mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                           window=self.window, return_complex=True, center=True)
-                
+
                 target_vocal_spec = torch.stft(vocal_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                                window=self.window, return_complex=True, center=True)
-                
+
                 target_instr_spec = torch.stft(instr_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                                window=self.window, return_complex=True, center=True)
 
@@ -562,9 +606,9 @@ def validate(model, test_dir, device, chunk_size, overlap):
     if not os.path.exists(test_dir) or not os.listdir(test_dir):
         print(f"Test directory not found or is empty: {test_dir}")
         return 0.0, 0.0, 0.0
-        
+
     track_dirs = [os.path.join(test_dir, d) for d in os.listdir(test_dir) if os.path.isdir(os.path.join(test_dir, d))]
-    
+
     if not track_dirs:
         print(f"No subdirectories found in test directory: {test_dir}")
         return 0.0, 0.0, 0.0
@@ -576,12 +620,12 @@ def validate(model, test_dir, device, chunk_size, overlap):
             try:
                 vocal_path = next(os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.startswith('vocals') and f.endswith(('.wav', '.flac')))
                 other_path = next(os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.startswith('other') and f.endswith(('.wav', '.flac')))
-                
+
                 gt_vocals, sr_v = torchaudio.load(vocal_path)
                 gt_instr, sr_i = torchaudio.load(other_path)
 
                 if sr_v != 44100 or sr_i != 44100: continue
-                
+
                 min_len = min(gt_vocals.shape[1], gt_instr.shape[1])
                 gt_vocals, gt_instr = gt_vocals[:, :min_len], gt_instr[:, :min_len]
 
@@ -596,11 +640,11 @@ def validate(model, test_dir, device, chunk_size, overlap):
 
                 vocal_sdr = calculate_sdr(pred_vocals, gt_vocals)
                 instr_sdr = calculate_sdr(pred_instr, gt_instr)
-                
+
                 total_vocal_sdr += vocal_sdr
                 total_instr_sdr += instr_sdr
                 count += 1
-                
+
                 pbar.set_postfix({'vocal_sdr': f"{vocal_sdr:.2f}", 'instr_sdr': f"{instr_sdr:.2f}"})
             except (StopIteration, Exception) as e:
                 continue
@@ -652,7 +696,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     ema = EMA(model, decay=0.999)
     step = 0
     avg_loss = 0.0
-    
+
     best_sdr = -float('inf')
     if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
         sdr_values = [float(re.search(r"sdr_([\d\.]+)\.pt", f).group(1)) for f in os.listdir('best_ckpts') if re.search(r"sdr_([\d\.]+)\.pt", f)]
@@ -669,16 +713,16 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
-        
+
         if 'ema_state_dict' in checkpoint_data:
             ema.load_state_dict(checkpoint_data['ema_state_dict'])
             print("EMA state loaded from checkpoint.")
         else:
             print("No EMA state found in checkpoint. Initializing from current model weights.")
-            
+
         step = checkpoint_data.get('step', 0)
         avg_loss = checkpoint_data.get('avg_loss', 0.0)
-        
+
         if not reset_optimizer and 'optimizer_state_dict' in checkpoint_data:
             optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
             print(f"Resuming training from step {step}. MODEL AND OPTIMIZER LOADED.")
@@ -686,19 +730,19 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             print(f"Resuming training from step {step}. MODEL LOADED, OPTIMIZER RESET.")
 
     progress_bar = tqdm(initial=step, total=None, dynamic_ncols=True)
-    
+
     while True:
         model.train()
         for batch in dataloader:
             mixture_spec, vocal_audio, instr_audio, mixture_audio, target_vocal_spec, target_instr_spec = batch
-            
+
             mixture_spec, vocal_audio, instr_audio, mixture_audio = mixture_spec.to(device, non_blocking=True), vocal_audio.to(device, non_blocking=True), instr_audio.to(device, non_blocking=True), mixture_audio.to(device, non_blocking=True)
             target_vocal_spec, target_instr_spec = target_vocal_spec.to(device, non_blocking=True), target_instr_spec.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             pred_masks = model(mixture_spec, mixture_audio)
             loss = loss_fn(pred_masks, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
-            
+
             if torch.isnan(loss).any(): continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -732,7 +776,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 ema.apply_shadow()
                 avg_vocal_sdr, avg_instr_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
                 ema.restore()
-                
+
                 print(f"\nValidation Step {step} (EMA): Vocal SDR: {avg_vocal_sdr:.4f}, Instr SDR: {avg_instr_sdr:.4f}, Combined SDR: {avg_combined_sdr:.4f}")
 
                 best_sdr_checkpoints = []
@@ -742,13 +786,13 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                         if match:
                             sdr = float(match.group(1))
                             best_sdr_checkpoints.append((sdr, os.path.join('best_ckpts', f)))
-                
+
                 best_sdr_checkpoints.sort(key=lambda x: x[0])
 
                 current_best_sdr = best_sdr_checkpoints[-1][0] if best_sdr_checkpoints else -float('inf')
                 if avg_combined_sdr > current_best_sdr:
                     best_sdr = avg_combined_sdr
-                    
+
                     for _, path in best_sdr_checkpoints:
                         try:
                             os.remove(path)
@@ -760,7 +804,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                     print(f"New best SDR! Saved checkpoint: {best_ckpt_filename}\n")
                 else:
                     print(f"SDR did not improve. Best SDR remains {best_sdr:.4f}\n")
-                
+
                 model.train()
 
 def find_latest_checkpoint(folder='ckpts'):
@@ -802,7 +846,7 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
-    
+
     model.eval().to(device)
 
     if isinstance(input_data, str):
@@ -964,7 +1008,7 @@ def main():
         train_dataset = Dataset(root_dir=args.data_dir, segment_length=segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
         train(model, train_dataloader, optimizer, loss_fn, device, args.checkpoint_steps, args, segment_length, checkpoint_path=checkpoint_to_load, window=window, reset_optimizer=args.reset_optimizer)
-    
+
     elif args.infer:
         if not args.input_file:
             print("Error: --input_file is required for inference.")
@@ -991,7 +1035,7 @@ def main():
 
         inference(model, checkpoint_to_load, args.input_file, args.output_instrumental, args.output_vocal,
                   chunk_size=segment_length, device=device)
-    
+
     else:
         print("Please specify either --train or --infer.")
 
