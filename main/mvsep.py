@@ -9,6 +9,7 @@ import soundfile as sf
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from adam_atan2_pytorch import AdamAtan2
+from torch.cuda.amp import autocast, GradScaler
 import random
 import math
 import re
@@ -41,8 +42,8 @@ def apply_pope(q, k, freqs, freqs_with_bias):
     q_mag = F.softplus(q.float())
     k_mag = F.softplus(k.float())
 
-    q_phase = freqs.unsqueeze(0).unsqueeze(0)
-    k_phase = freqs_with_bias.unsqueeze(0)
+    q_phase = freqs.unsqueeze(0).unsqueeze(0).float()
+    k_phase = freqs_with_bias.unsqueeze(0).float()
 
     q_complex = torch.polar(q_mag, q_phase)
     k_complex = torch.polar(k_mag, k_phase)
@@ -65,22 +66,17 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.pope = PoPE(self.head_dim, heads)
 
-    def forward(self, x, context=None):
+    def forward(self, x):
         B, S, C = x.shape
         H, D = self.heads, self.head_dim
 
         q = self.wq(x).view(B, S, H, D).transpose(1, 2)
-
-        k_in = context if context is not None else x
-        S_kv = k_in.shape[1]
-
-        k = self.wk(k_in).view(B, S_kv, H, D).transpose(1, 2)
-        v = self.wv(k_in).view(B, S_kv, H, D).transpose(1, 2)
+        k = self.wk(x).view(B, S, H, D).transpose(1, 2)
+        v = self.wv(x).view(B, S, H, D).transpose(1, 2)
 
         freqs, bias = self.pope(S, x.device)
 
         q, k = apply_pope(q, k, freqs, bias)
-
 
         out = F.scaled_dot_product_attention(q, k, v, scale=(2*D)**-0.5)
 
@@ -103,59 +99,35 @@ class GatedFF(nn.Module):
         return self.down_proj(F.gelu(self.gate_proj(x)) * self.up_proj(x))
 
 class EncoderLayer(nn.Module):
-    def __init__(self, dim, heads, cross_attn=False):
+    def __init__(self, dim, heads):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, heads)
         self.norm2 = nn.LayerNorm(dim)
         self.ff = GatedFF(dim)
-        self.cross_attn = Attention(dim, heads) if cross_attn else None
-        self.norm_cross = nn.LayerNorm(dim) if cross_attn else None
-        self.norm_ctx = nn.LayerNorm(dim) if cross_attn else None
 
-    def forward(self, x, context=None):
+    def forward(self, x):
         x = x + self.attn(self.norm1(x))
-        if self.cross_attn is not None and context is not None:
-
-            x = x + self.cross_attn(self.norm_cross(x), context=self.norm_ctx(context))
         x = x + self.ff(self.norm2(x))
         return x
-
-class ResBlock1D(nn.Module):
-    def __init__(self, dim, dilation=1):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(dim, dim, 3, padding=dilation, dilation=dilation),
-            nn.GroupNorm(8, dim),
-            nn.GELU(),
-            nn.Conv1d(dim, dim, 3, padding=dilation, dilation=dilation),
-            nn.GroupNorm(8, dim)
-        )
-    def forward(self, x):
-        return x + self.conv(x)
 
 class DualPathEncoder(nn.Module):
     def __init__(self, dim, depth, heads, use_checkpoint=False):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads, cross_attn=True) for _ in range(depth)])
+        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
         self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x, context=None):
+    def forward(self, x):
         B, F_b, T, E = x.shape
         for t_layer, f_layer in zip(self.time_layers, self.freq_layers):
             x = x.reshape(B * F_b, T, E)
 
-            if context is not None:
-                t_ctx = context.unsqueeze(1).expand(-1, F_b, -1, -1).reshape(B * F_b, T, E)
-            else:
-                t_ctx = None
-
             if self.use_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(t_layer, x, t_ctx, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(t_layer, x, use_reentrant=False)
             else:
-                x = t_layer(x, context=t_ctx)
+                x = t_layer(x)
             x = x.view(B, F_b, T, E)
 
             x = x.transpose(1, 2).reshape(B * T, F_b, E)
@@ -166,160 +138,6 @@ class DualPathEncoder(nn.Module):
             x = x.view(B, T, F_b, E).transpose(1, 2)
         return self.norm(x)
 
-def make_band_splits(freq_bins, n_bands, overlap_ratio=0.25):
-    edges = torch.linspace(0.0, 1.0, n_bands + 1)
-    edges = edges ** 2.2
-    edges = (edges * freq_bins).round().long()
-
-    edges[0] = 0
-    edges[-1] = freq_bins
-
-    for i in range(1, len(edges)):
-        if edges[i] <= edges[i - 1]:
-            edges[i] = edges[i - 1] + 1
-
-    edges[-1] = freq_bins
-
-    nominal_offsets = []
-    nominal_sizes = []
-    start = 0
-    for i in range(n_bands):
-        end = int(edges[i + 1].item())
-        if end > freq_bins:
-            end = freq_bins
-        if end <= start:
-            end = min(start + 1, freq_bins)
-        nominal_offsets.append((start, end))
-        nominal_sizes.append(end - start)
-        start = end
-
-    if nominal_offsets[-1][1] != freq_bins:
-        nominal_offsets[-1] = (nominal_offsets[-1][0], freq_bins)
-        nominal_sizes[-1] = freq_bins - nominal_offsets[-1][0]
-
-    ext_offsets = []
-    ext_sizes = []
-    for i in range(n_bands):
-        nom_start, nom_end = nominal_offsets[i]
-        nom_size = nom_end - nom_start
-        overlap = max(1, int(nom_size * overlap_ratio))
-        ext_start = max(0, nom_start - overlap)
-        ext_end = min(freq_bins, nom_end + overlap)
-        ext_offsets.append((ext_start, ext_end))
-        ext_sizes.append(ext_end - ext_start)
-
-    return ext_sizes, ext_offsets, nominal_offsets, nominal_sizes
-
-class BandSplitProjection(nn.Module):
-    def __init__(self, freq_bins, in_channels, embed_dim, n_bands=64):
-        super().__init__()
-        self.freq_bins = freq_bins
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        self.n_bands = n_bands
-
-        self.band_sizes, self.band_offsets, _, _ = make_band_splits(freq_bins, n_bands)
-
-        self.band_projs = nn.ModuleList([
-            nn.Linear(in_channels * 2 * band_size, embed_dim)
-            for band_size in self.band_sizes
-        ])
-        self.band_norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x_stft):
-        B, _, _, T = x_stft.shape
-        x_stft = torch.cat([x_stft.real, x_stft.imag], dim=1)
-        bands = []
-        for (start, end), proj in zip(self.band_offsets, self.band_projs):
-            x_band = x_stft[:, :, start:end, :].permute(0, 3, 1, 2).reshape(B, T, -1)
-            x_band = proj(x_band)
-            bands.append(x_band)
-
-        x = torch.stack(bands, dim=1)
-        x = self.band_norm(x)
-        return x
-
-class BandMergeProjection(nn.Module):
-    def __init__(self, freq_bins, out_masks, embed_dim, n_bands=64):
-        super().__init__()
-        self.freq_bins = freq_bins
-        self.out_masks = out_masks
-        self.embed_dim = embed_dim
-        self.n_bands = n_bands
-
-        self.ext_sizes, self.ext_offsets, self.nominal_offsets, self.nominal_sizes = make_band_splits(freq_bins, n_bands)
-
-        self.band_outs = nn.ModuleList([
-            nn.Linear(embed_dim, out_masks * 2 * ext_size)
-            for ext_size in self.ext_sizes
-        ])
-
-        self.register_buffer('merge_windows', self._build_merge_windows())
-
-    def _build_merge_windows(self):
-        windows = []
-        max_ext = max(e - s for s, e in self.ext_offsets)
-        for i in range(self.n_bands):
-            ext_start, ext_end = self.ext_offsets[i]
-            ext_size = ext_end - ext_start
-            nom_start, nom_end = self.nominal_offsets[i]
-            nom_start_in_ext = nom_start - ext_start
-            nom_end_in_ext = nom_end - ext_start
-
-            window = torch.zeros(max_ext)
-            left_taper = nom_start_in_ext
-            if left_taper > 0:
-                window[:left_taper] = torch.linspace(0, 1, left_taper + 1)[:-1]
-            window[nom_start_in_ext:nom_end_in_ext] = 1.0
-            right_taper = ext_size - nom_end_in_ext
-            if right_taper > 0:
-                window[nom_end_in_ext:nom_end_in_ext + right_taper] = torch.linspace(1, 0, right_taper + 1)[:-1]
-            windows.append(window)
-        return torch.stack(windows)
-
-    def forward(self, x):
-        B, _, T, _ = x.shape
-        output = torch.zeros(B, self.out_masks * 2, self.freq_bins, T, device=x.device, dtype=x.dtype)
-
-        for i, (ext_size, head) in enumerate(zip(self.ext_sizes, self.band_outs)):
-            x_band = x[:, i]
-            x_band = head(x_band)
-            x_band = x_band.view(B, T, self.out_masks * 2, ext_size).permute(0, 2, 3, 1)
-
-            w = self.merge_windows[i, :ext_size].view(1, 1, -1, 1)
-            output[:, :, self.ext_offsets[i][0]:self.ext_offsets[i][1], :] += x_band * w
-
-        return output
-
-class AudioContextEncoder(nn.Module):
-    def __init__(self, in_channels, embed_dim, window_size, hop_length):
-        super().__init__()
-        self.initial_conv = nn.Sequential(
-            nn.Conv1d(
-                in_channels,
-                128,
-                kernel_size=window_size,
-                stride=hop_length,
-                padding=window_size // 2
-            ),
-            nn.GroupNorm(8, 128),
-            nn.GELU(),
-            ResBlock1D(128, dilation=1),
-            ResBlock1D(128, dilation=2),
-            nn.Conv1d(128, embed_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(8, embed_dim)
-        )
-
-        self.transformer = EncoderLayer(embed_dim, heads=8)
-
-    def forward(self, x):
-        x = self.initial_conv(x)
-
-        x = x.permute(0, 2, 1) 
-        x = self.transformer(x)
-        x = x.permute(0, 2, 1) 
-        return x
-
 class NeuralModel(nn.Module):
     def __init__(
         self,
@@ -327,72 +145,58 @@ class NeuralModel(nn.Module):
         sources=2,
         freq_bins=2049,
         embed_dim=256,
-        depth=14,
+        depth=12,
         heads=8,
         hop_length=1024,
         window_size=4096,
-        use_checkpoint=False
+        use_checkpoint=False,
+        downsample=12
     ):
         super().__init__()
-        self.freq_bins = freq_bins
+
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
-        self.embed_dim = embed_dim
-        self.hop_length = hop_length
-        self.window_size = window_size
-        self.n_bands = 64
+        self.freq_bins = freq_bins
+        self.downsample = downsample
 
-        self.band_split = BandSplitProjection(
-            freq_bins=freq_bins,
-            in_channels=in_channels,
-            embed_dim=embed_dim,
-            n_bands=self.n_bands
+        self.input = nn.Conv2d(
+            in_channels=in_channels * 2,
+            out_channels=embed_dim,
+            kernel_size=(downsample, 1),
+            stride=(downsample, 1)
         )
-
-
-        self.audio_context_encoder = AudioContextEncoder(
-            in_channels=in_channels,
-            embed_dim=embed_dim,
-            window_size=self.window_size,
-            hop_length=self.hop_length
-        )
-
         self.norm = nn.LayerNorm(embed_dim)
 
-        self.model = DualPathEncoder(dim=embed_dim, depth=depth, heads=heads, use_checkpoint=use_checkpoint)
-
-        self.band_merge = BandMergeProjection(
-            freq_bins=freq_bins,
-            out_masks=self.out_masks,
-            embed_dim=embed_dim,
-            n_bands=self.n_bands
+        self.model = DualPathEncoder(
+            dim=embed_dim,
+            depth=depth,
+            heads=heads,
+            use_checkpoint=use_checkpoint
         )
 
-        self.merge_refine = nn.Sequential(
-            nn.Conv2d(self.out_masks * 2, self.out_masks * 2, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(self.out_masks * 2, self.out_masks * 2, kernel_size=3, padding=1)
+        self.output = nn.ConvTranspose2d(
+            in_channels=embed_dim,
+            out_channels=self.out_masks * 2,
+            kernel_size=(downsample, 1),
+            stride=(downsample, 1),
+            output_padding=(freq_bins % downsample, 0)
         )
 
-    def forward(self, x_stft, x_audio):
-        x_s = self.band_split(x_stft)
+    def forward(self, x_stft):
+        x = torch.cat([x_stft.real, x_stft.imag], dim=1)
 
+        x = self.input(x)
+        
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
 
-        x_a = self.audio_context_encoder(x_audio)
+        x = self.model(x)
 
-        if x_a.shape[-1] != x_s.shape[2]:
-            x_a = F.interpolate(x_a, size=x_s.shape[2], mode="linear", align_corners=False)
+        x = x.permute(0, 3, 1, 2)
+        x = self.output(x)
 
-        x_a_t = x_a.permute(0, 2, 1)
-
-        x = self.norm(x_s)
-        x = self.model(x, context=x_a_t)
-
-        x = self.band_merge(x)
-        x = x + self.merge_refine(x)
-
-        return x
+        return torch.tanh(x)
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -443,7 +247,7 @@ def loss_fn(pred_output,
     device = pred_output.device
 
     B, _, F_dim, T = pred_output.shape
-    pred_output_reshaped = pred_output.view(B, 2, 4, F_dim, T)
+    pred_output_reshaped = pred_output.contiguous().view(B, 2, 4, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
 
@@ -696,6 +500,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     ema = EMA(model, decay=0.999)
     step = 0
     avg_loss = 0.0
+    scaler = GradScaler()
 
     best_sdr = -float('inf')
     if os.path.exists('best_ckpts') and os.listdir('best_ckpts'):
@@ -734,19 +539,22 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     while True:
         model.train()
         for batch in dataloader:
-            mixture_spec, vocal_audio, instr_audio, mixture_audio, target_vocal_spec, target_instr_spec = batch
+            mixture_spec, vocal_audio, instr_audio, _, target_vocal_spec, target_instr_spec = batch
 
-            mixture_spec, vocal_audio, instr_audio, mixture_audio = mixture_spec.to(device, non_blocking=True), vocal_audio.to(device, non_blocking=True), instr_audio.to(device, non_blocking=True), mixture_audio.to(device, non_blocking=True)
+            mixture_spec, vocal_audio, instr_audio = mixture_spec.to(device, non_blocking=True), vocal_audio.to(device, non_blocking=True), instr_audio.to(device, non_blocking=True)
             target_vocal_spec, target_instr_spec = target_vocal_spec.to(device, non_blocking=True), target_instr_spec.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            pred_masks = model(mixture_spec, mixture_audio)
-            loss = loss_fn(pred_masks, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
+            with autocast():
+                pred_masks = model(mixture_spec)
+                loss = loss_fn(pred_masks, mixture_spec, vocal_audio, instr_audio, target_vocal_spec, target_instr_spec, stft_params_for_istft, multi_res_complex_loss_calculator)
 
             if torch.isnan(loss).any(): continue
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             ema.update()
 
             avg_loss = 0.999 * avg_loss + 0.001 * loss.item() if step > 0 else loss.item()
@@ -910,10 +718,11 @@ def inference(model, checkpoint_path, input_data, output_instrumental_path, outp
             spec = torch.stft(padded_chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
 
             with torch.no_grad():
-                pred_output = model(spec.unsqueeze(0), padded_chunk.unsqueeze(0)).squeeze(0)
+                with autocast():
+                    pred_output = model(spec.unsqueeze(0)).squeeze(0)
 
             _, F_spec, T_spec = spec.shape
-            pred_output_reshaped = pred_output.view(2, 4, F_spec, T_spec)
+            pred_output_reshaped = pred_output.contiguous().view(2, 4, F_spec, T_spec)
             pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
             pred_masks_real = pred_real[:4]
