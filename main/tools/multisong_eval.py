@@ -117,9 +117,26 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=264600, 
                 pbar.update(1)
 
         sum_weights = sum_weights.clamp(min=1e-8)
+
+        vocals_idx = -1
+        for j, stem_name in enumerate(stems):
+            if stem_name.lower() == 'vocals':
+                vocals_idx = j
+                break
+
+        if vocals_idx != -1:
+            vocals = (pred_stems[vocals_idx] / sum_weights).clamp(-1.0, 1.0)
+        else:
+            vocals = torch.zeros_like(input_audio)
+
+        instrum = torch.zeros_like(input_audio)
         for j in range(num_stems):
-            res = (pred_stems[j] / sum_weights).clamp(-1.0, 1.0)
-            torchaudio.save(os.path.join(output_dir, f'{song_id}_{stems[j]}.flac'), res.cpu(), sr, format='flac')
+            if j != vocals_idx:
+                instrum += pred_stems[j]
+        instrum = (instrum / sum_weights).clamp(-1.0, 1.0)
+
+        torchaudio.save(os.path.join(output_dir, f'{song_id}_vocals.flac'), vocals.cpu(), sr)
+        torchaudio.save(os.path.join(output_dir, f'{song_id}_instrum.flac'), instrum.cpu(), sr)
 
 def main():
     parser = argparse.ArgumentParser()
