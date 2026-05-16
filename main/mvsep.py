@@ -382,13 +382,17 @@ def calculate_sdr(pred, target, epsilon=1e-8):
 def validate(model, test_dir, device, chunk_size, overlap):
     model.eval()
     if not os.path.exists(test_dir) or not os.listdir(test_dir):
+        print(f"Test directory not found or is empty: {test_dir}")
         return 0.0
 
     track_dirs = [os.path.join(test_dir, d) for d in os.listdir(test_dir) if os.path.isdir(os.path.join(test_dir, d))]
-    if not track_dirs: return 0.0
+    if not track_dirs:
+        print(f"No valid track directories found in: {test_dir}")
+        return 0.0
 
     total_sdr, count = 0.0, 0
     num_stems = len(STEMS)
+    total_stems_sdr = [0.0] * num_stems
 
     with tqdm(track_dirs, desc="Validating", leave=False) as pbar:
         for track_dir in pbar:
@@ -410,14 +414,23 @@ def validate(model, test_dir, device, chunk_size, overlap):
                 with torch.no_grad():
                     pred_audios = inference(model, None, mixture, chunk_size, overlap, device, return_tensors=True)
 
-                track_sdr = sum(calculate_sdr(p, g) for p, g in zip(pred_audios, gt_audios)) / num_stems
+                stems_sdr = [calculate_sdr(p, g) for p, g in zip(pred_audios, gt_audios)]
+                for i, s in enumerate(stems_sdr):
+                    total_stems_sdr[i] += s
+                
+                track_sdr = sum(stems_sdr) / num_stems
                 total_sdr += track_sdr
                 count += 1
                 pbar.set_postfix({'sdr': f"{track_sdr:.2f}"})
             except Exception:
                 continue
 
-    return total_sdr / count if count > 0 else 0.0
+    if count == 0:
+        print("No valid test files processed.")
+        return [0.0] * num_stems, 0.0
+
+    avg_stems_sdr = [s / count for s in total_stems_sdr]
+    return avg_stems_sdr, total_sdr / count
 
 class EMA:
     def __init__(self, model, decay=0.999):
@@ -478,12 +491,18 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
         if 'ema_state_dict' in checkpoint_data:
             ema.load_state_dict(checkpoint_data['ema_state_dict'])
+            print("EMA state loaded from checkpoint.")
+        else:
+            print("No EMA state found in checkpoint. Initializing from current model weights.")
         
         step = checkpoint_data.get('step', 0)
         avg_loss = checkpoint_data.get('avg_loss', 0.0)
 
         if not reset_optimizer and 'optimizer_state_dict' in checkpoint_data:
             optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
+            print(f"Resuming training from step {step}. MODEL AND OPTIMIZER LOADED.")
+        else:
+            print(f"Resuming training from step {step}. MODEL LOADED, OPTIMIZER RESET.")
 
     progress_bar = tqdm(initial=step, total=None, dynamic_ncols=True)
 
@@ -535,10 +554,11 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                     os.remove(regular_checkpoints[0])
 
                 ema.apply_shadow()
-                avg_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
+                avg_stems_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
                 ema.restore()
 
-                print(f"\nValidation Step {step} (EMA): Combined SDR: {avg_sdr:.4f}")
+                sdr_str = ", ".join([f"{STEMS[i].capitalize()} SDR: {avg_stems_sdr[i]:.4f}" for i in range(len(STEMS))])
+                print(f"\nValidation Step {step} (EMA): {sdr_str}, Combined SDR: {avg_combined_sdr:.4f}")
 
                 best_sdr_checkpoints = []
                 if os.path.exists('best_ckpts'):
@@ -551,8 +571,8 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 best_sdr_checkpoints.sort(key=lambda x: x[0])
 
                 current_best_sdr = best_sdr_checkpoints[-1][0] if best_sdr_checkpoints else -float('inf')
-                if avg_sdr > current_best_sdr:
-                    best_sdr = avg_sdr
+                if avg_combined_sdr > current_best_sdr:
+                    best_sdr = avg_combined_sdr
 
                     for _, path in best_sdr_checkpoints:
                         try:
@@ -560,8 +580,11 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                         except Exception:
                             pass
 
-                    best_ckpt_filename = f"best_ckpts/checkpoint_step_{step}_sdr_{avg_sdr:.4f}.pt"
+                    best_ckpt_filename = f"best_ckpts/checkpoint_step_{step}_sdr_{avg_combined_sdr:.4f}.pt"
                     torch.save(checkpoint_payload, best_ckpt_filename)
+                    print(f"New best SDR! Saved checkpoint: {best_ckpt_filename}\n")
+                else:
+                    print(f"SDR did not improve. Best SDR remains {best_sdr:.4f}\n")
                 
                 model.train()
 
@@ -752,6 +775,8 @@ def main():
         checkpoint_to_load = args.checkpoint_path
         if not checkpoint_to_load:
             checkpoint_to_load = find_latest_checkpoint('ckpts')
+            if checkpoint_to_load:
+                print(f"Automatically resuming from latest checkpoint: {checkpoint_to_load}")
 
         train_dataset = Dataset(root_dir=args.data_dir, segment_length=segment_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
