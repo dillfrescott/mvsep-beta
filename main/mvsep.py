@@ -421,7 +421,8 @@ def validate(model, test_dir, device, chunk_size, overlap):
                 track_sdr = sum(stems_sdr) / num_stems
                 total_sdr += track_sdr
                 count += 1
-                pbar.set_postfix({'sdr': f"{track_sdr:.2f}"})
+                sdr_info = " | ".join([f"{STEMS[i].capitalize()}: {stems_sdr[i]:.4f} SDR" for i in range(num_stems)])
+                pbar.set_postfix_str(sdr_info)
             except Exception:
                 continue
 
