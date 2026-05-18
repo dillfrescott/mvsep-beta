@@ -769,7 +769,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window = torch.hann_window(4096).to(device)
-    model = NeuralModel(use_checkpoint=args.ckpt) 
+    model = NeuralModel(use_checkpoint=args.ckpt)
     optimizer = AdamAtan2(model.parameters(), lr=1e-4)
 
     if args.train:
