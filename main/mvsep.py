@@ -161,13 +161,14 @@ class NeuralModel(nn.Module):
         self.out_masks = sources * in_channels
         self.freq_bins = freq_bins
         self.downsample = downsample
-
-        self.input = nn.Conv2d(
-            in_channels=in_channels * 2,
+        
+        unshuffled_channels = in_channels * 2 * downsample
+        self.input_proj = nn.Conv2d(
+            in_channels=unshuffled_channels,
             out_channels=embed_dim,
-            kernel_size=(downsample, 1),
-            stride=(downsample, 1)
+            kernel_size=1
         )
+        
         self.norm = nn.LayerNorm(embed_dim)
 
         self.model = DualPathEncoder(
@@ -177,18 +178,26 @@ class NeuralModel(nn.Module):
             use_checkpoint=use_checkpoint
         )
 
-        self.output = nn.ConvTranspose2d(
+        upsample_dim = self.out_masks * 2 * downsample
+        self.proj_to_pixel_shuffle = nn.Conv2d(
             in_channels=embed_dim,
-            out_channels=self.out_masks * 2,
-            kernel_size=(downsample, 1),
-            stride=(downsample, 1),
-            output_padding=(freq_bins % downsample, 0)
+            out_channels=upsample_dim,
+            kernel_size=1
         )
 
     def forward(self, x_stft):
         x = torch.cat([x_stft.real, x_stft.imag], dim=1)
 
-        x = self.input(x)
+        rem = x.shape[2] % self.downsample
+        if rem != 0:
+            pad_amount = self.downsample - rem
+            x = F.pad(x, (0, 0, 0, pad_amount))
+
+        B, C, F_len, T = x.shape
+        x = x.view(B, C, F_len // self.downsample, self.downsample, T)
+        x = x.permute(0, 1, 3, 2, 4).reshape(B, C * self.downsample, F_len // self.downsample, T)
+
+        x = self.input_proj(x)
         
         x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
@@ -196,7 +205,16 @@ class NeuralModel(nn.Module):
         x = self.model(x)
 
         x = x.permute(0, 3, 1, 2)
-        x = self.output(x)
+        x = self.proj_to_pixel_shuffle(x)
+        
+        B, C, F_down, T = x.shape
+        x = x.view(B, self.out_masks * 2, self.downsample, F_down, T)
+        x = x.permute(0, 1, 3, 2, 4).reshape(B, self.out_masks * 2, F_down * self.downsample, T)
+
+        if x.shape[2] < self.freq_bins:
+            x = F.pad(x, (0, 0, 0, self.freq_bins - x.shape[2]))
+        elif x.shape[2] > self.freq_bins:
+            x = x[:, :, :self.freq_bins, :]
 
         return torch.tanh(x)
 
