@@ -201,8 +201,9 @@ class NeuralModel(nn.Module):
         
         x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
-
+        res = x
         x = self.model(x)
+        x = x + res
 
         x = x.permute(0, 3, 1, 2)
         x = self.proj_to_pixel_shuffle(x)
@@ -269,6 +270,15 @@ def loss_fn(pred_output,
     pred_output_reshaped = pred_output.contiguous().view(B, 2, num_stems * 2, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
+
+    pr = pred_real.view(B, num_stems, 2, F_dim, T)
+    pi = pred_imag.view(B, num_stems, 2, F_dim, T)
+    sr = pr.sum(dim=1, keepdim=True)
+    si = pi.sum(dim=1, keepdim=True)
+    pr = pr + (1.0 - sr) / num_stems
+    pi = pi + (0.0 - si) / num_stems
+    pred_real = pr.view(B, num_stems * 2, F_dim, T)
+    pred_imag = pi.view(B, num_stems * 2, F_dim, T)
 
     n_fft = stft_params_for_istft['n_fft']
     hop_length = stft_params_for_istft['hop_length']
@@ -717,6 +727,16 @@ def inference(model, checkpoint_path, input_data,
             _, F_spec, T_spec = spec.shape
             pred_output_reshaped = pred_output.contiguous().view(2, num_stems * 2, F_spec, T_spec)
             pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
+
+            B_inf = 1
+            pr = pred_real.view(B_inf, num_stems, 2, F_spec, T_spec)
+            pi = pred_imag.view(B_inf, num_stems, 2, F_spec, T_spec)
+            sr = pr.sum(dim=1, keepdim=True)
+            si = pi.sum(dim=1, keepdim=True)
+            pr = pr + (1.0 - sr) / num_stems
+            pi = pi + (0.0 - si) / num_stems
+            pred_real = pr.view(num_stems * 2, F_spec, T_spec)
+            pred_imag = pi.view(num_stems * 2, F_spec, T_spec)
 
             if L == chunk_size:
                 w = ola_window
