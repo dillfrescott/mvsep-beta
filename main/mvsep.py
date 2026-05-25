@@ -19,6 +19,16 @@ warnings.filterwarnings("ignore")
 
 STEMS = ['vocals', 'other']
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps) * self.weight
+
 class PoPE(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
@@ -35,7 +45,6 @@ class PoPE(nn.Module):
         freqs = torch.einsum("i,j->ij", pos, self.inv_freqs)
 
         bias = self.bias.clamp(-2 * math.pi, 0)
-
         freqs_with_bias = freqs.unsqueeze(0) + bias.unsqueeze(1)
 
         return freqs, freqs_with_bias
@@ -47,26 +56,41 @@ def apply_pope(q, k, freqs, freqs_with_bias):
     q_phase = freqs.unsqueeze(0).unsqueeze(0).float()
     k_phase = freqs_with_bias.unsqueeze(0).float()
 
-    q_complex = torch.polar(q_mag, q_phase)
-    k_complex = torch.polar(k_mag, k_phase)
+    q_cos = torch.cos(q_phase)
+    q_sin = torch.sin(q_phase)
+    k_cos = torch.cos(k_phase)
+    k_sin = torch.sin(k_phase)
 
-    q_embed = torch.view_as_real(q_complex).flatten(-2)
-    k_embed = torch.view_as_real(k_complex).flatten(-2)
+    q_real = q_mag * q_cos
+    q_imag = q_mag * q_sin
+    k_real = k_mag * k_cos
+    k_imag = k_mag * k_sin
+
+    q_embed = torch.stack([q_real, q_imag], dim=-1).flatten(-2)
+    k_embed = torch.stack([k_real, k_imag], dim=-1).flatten(-2)
 
     return q_embed.type_as(q), k_embed.type_as(k)
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads=8):
+    def __init__(self, dim, heads=8, depth=1):
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
+        self.half_dim = self.head_dim // 2
 
         self.wq = nn.Linear(dim, dim, bias=False)
         self.wk = nn.Linear(dim, dim, bias=False)
         self.wv = nn.Linear(dim, dim, bias=False)
 
         self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.pope = PoPE(self.head_dim, heads)
+
+        self.pope = PoPE(self.half_dim, heads)
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(heads, self.half_dim).normal_(mean=0, std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(heads, self.half_dim).normal_(mean=0, std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(heads, self.half_dim).normal_(mean=0, std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(heads, self.half_dim).normal_(mean=0, std=0.1))
+        self.subln = RMSNorm(self.head_dim)
 
     def forward(self, x):
         B, S, C = x.shape
@@ -76,13 +100,30 @@ class Attention(nn.Module):
         k = self.wk(x).view(B, S, H, D).transpose(1, 2)
         v = self.wv(x).view(B, S, H, D).transpose(1, 2)
 
+        q1, q2 = q.chunk(2, dim=-1)
+        k1, k2 = k.chunk(2, dim=-1)
+
         freqs, bias = self.pope(S, x.device)
 
-        q, k = apply_pope(q, k, freqs, bias)
+        q1, k1 = apply_pope(q1, k1, freqs, bias)
+        q2, k2 = apply_pope(q2, k2, freqs, bias)
 
-        out = F.scaled_dot_product_attention(q, k, v, scale=(2*D)**-0.5)
+        scale = D ** -0.5
 
-        out = out.transpose(1, 2).reshape(B, S, C)
+        attn1 = F.softmax((q1 @ k1.transpose(-2, -1)) * scale, dim=-1)
+        attn2 = F.softmax((q2 @ k2.transpose(-2, -1)) * scale, dim=-1)
+
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1, keepdim=True).unsqueeze(-1))
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1, keepdim=True).unsqueeze(-1))
+        lambda_val = lambda_1 - lambda_2 + self.lambda_init
+
+        attn = attn1 - lambda_val * attn2
+        out = attn @ v
+
+        out = out.transpose(1, 2)
+        out = self.subln(out)
+        out = out * (1 - self.lambda_init)
+        out = out.reshape(B, S, C)
 
         return self.out_proj(out)
 
@@ -117,24 +158,24 @@ class DualPathEncoder(nn.Module):
     def __init__(self, dim, depth, heads, use_checkpoint=False):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
-        self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
-        self.norm = nn.LayerNorm(dim)
+        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for i in range(depth)])
+        self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for i in range(depth)])
+        self.norm = RMSNorm(dim)
 
     def forward(self, x):
         B, F_b, T, E = x.shape
         for t_layer, f_layer in zip(self.time_layers, self.freq_layers):
-            x = x.reshape(B * F_b, T, E)
+            x = x.contiguous().view(B * F_b, T, E)
 
             if self.use_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(t_layer, x, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(t_layer, x, use_reentrant=True)
             else:
                 x = t_layer(x)
             x = x.view(B, F_b, T, E)
 
-            x = x.transpose(1, 2).reshape(B * T, F_b, E)
+            x = x.transpose(1, 2).contiguous().view(B * T, F_b, E)
             if self.use_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(f_layer, x, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(f_layer, x, use_reentrant=True)
             else:
                 x = f_layer(x)
             x = x.view(B, T, F_b, E).transpose(1, 2)
@@ -169,7 +210,7 @@ class NeuralModel(nn.Module):
             kernel_size=1
         )
         
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = RMSNorm(embed_dim)
 
         self.model = DualPathEncoder(
             dim=embed_dim,
@@ -451,29 +492,42 @@ def validate(model, test_dir, device, chunk_size, overlap):
     avg_stems_sdr = [s / count for s in total_stems_sdr]
     return avg_stems_sdr, total_sdr / count
 
+def clean_state_dict(state_dict):
+    cleaned = {}
+    for k, v in state_dict.items():
+        new_k = k.replace("_orig_mod.", "").replace("._orig_mod", "")
+        cleaned[new_k] = v
+    return cleaned
+
 class EMA:
     def __init__(self, model, decay=0.999):
         self.model = model
         self.decay = decay
-        self.shadow = {name: param.data.clone() for name, param in model.named_parameters() if param.requires_grad}
+        self.shadow = {self.clean_name(name): param.data.clone() for name, param in model.named_parameters() if param.requires_grad}
         self.backup = {}
+
+    def clean_name(self, name):
+        return name.replace("_orig_mod.", "").replace("._orig_mod", "")
 
     def update(self):
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
-                    self.shadow[name].copy_(self.decay * self.shadow[name] + (1.0 - self.decay) * param.data)
+                    clean = self.clean_name(name)
+                    self.shadow[clean].copy_(self.decay * self.shadow[clean] + (1.0 - self.decay) * param.data)
 
     def apply_shadow(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
+                clean = self.clean_name(name)
+                self.backup[clean] = param.data.clone()
+                param.data.copy_(self.shadow[clean])
 
     def restore(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                param.data.copy_(self.backup[name])
+                clean = self.clean_name(name)
+                param.data.copy_(self.backup[clean])
         self.backup = {}
 
     def state_dict(self):
@@ -481,8 +535,9 @@ class EMA:
 
     def load_state_dict(self, state_dict):
         for name, value in state_dict.items():
-            if name in self.shadow:
-                self.shadow[name].copy_(value)
+            clean = self.clean_name(name)
+            if clean in self.shadow:
+                self.shadow[clean].copy_(value)
 
 def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args, segment_length, checkpoint_path=None, window=None, reset_optimizer=False):
     model.to(device)
@@ -506,10 +561,10 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
+        model.load_state_dict(clean_state_dict(checkpoint_data['model_state_dict']), strict=False)
 
         if 'ema_state_dict' in checkpoint_data:
-            ema.load_state_dict(checkpoint_data['ema_state_dict'])
+            ema.load_state_dict(clean_state_dict(checkpoint_data['ema_state_dict']))
             print("EMA state loaded from checkpoint.")
         else:
             print("No EMA state found in checkpoint. Initializing from current model weights.")
@@ -525,8 +580,16 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
     progress_bar = tqdm(initial=step, total=None, dynamic_ncols=True)
 
+    if args.ckpt:
+        for i in range(len(model.model.time_layers)):
+            model.model.time_layers[i] = torch.compile(model.model.time_layers[i])
+            model.model.freq_layers[i] = torch.compile(model.model.freq_layers[i])
+        compiled_model = model
+    else:
+        compiled_model = torch.compile(model)
+
     while True:
-        model.train()
+        compiled_model.train()
         for batch in dataloader:
             mixture_spec, target_audios, target_specs = batch
 
@@ -536,7 +599,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
             optimizer.zero_grad()
             with autocast():
-                pred_masks = model(mixture_spec)
+                pred_masks = compiled_model(mixture_spec)
                 loss = loss_fn(pred_masks, mixture_spec, target_audios, target_specs, stft_params_for_istft, multi_res_complex_loss_calculator)
 
             if torch.isnan(loss).any(): continue
@@ -555,8 +618,8 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             if step > 0 and step % checkpoint_steps == 0:
                 checkpoint_payload = {
                     'step': step, 
-                    'model_state_dict': model.state_dict(), 
-                    'ema_state_dict': ema.state_dict(),
+                    'model_state_dict': clean_state_dict(model.state_dict()), 
+                    'ema_state_dict': clean_state_dict(ema.state_dict()),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
                     'stems': STEMS
@@ -605,7 +668,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 else:
                     print(f"SDR did not improve. Best SDR remains {best_sdr:.4f}\n")
                 
-                model.train()
+                compiled_model.train()
 
 def find_latest_checkpoint(folder='ckpts'):
     if not os.path.exists(folder) or not os.listdir(folder):
@@ -648,7 +711,7 @@ def inference(model, checkpoint_path, input_data,
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         if 'stems' in checkpoint_data:
             STEMS = checkpoint_data['stems']
-        model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
+        model.load_state_dict(clean_state_dict(checkpoint_data['model_state_dict']), strict=False)
 
     num_stems = len(STEMS)
     model.eval().to(device)
@@ -786,6 +849,8 @@ def main():
     os.makedirs('best_ckpts', exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
     window = torch.hann_window(4096).to(device)
     model = NeuralModel(use_checkpoint=args.ckpt)
     optimizer = AdamAtan2(model.parameters(), lr=1e-4)
