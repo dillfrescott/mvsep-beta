@@ -45,6 +45,7 @@ class PoPE(nn.Module):
         freqs = torch.einsum("i,j->ij", pos, self.inv_freqs)
 
         bias = self.bias.clamp(-2 * math.pi, 0)
+
         freqs_with_bias = freqs.unsqueeze(0) + bias.unsqueeze(1)
 
         return freqs, freqs_with_bias
@@ -56,41 +57,26 @@ def apply_pope(q, k, freqs, freqs_with_bias):
     q_phase = freqs.unsqueeze(0).unsqueeze(0).float()
     k_phase = freqs_with_bias.unsqueeze(0).float()
 
-    q_cos = torch.cos(q_phase)
-    q_sin = torch.sin(q_phase)
-    k_cos = torch.cos(k_phase)
-    k_sin = torch.sin(k_phase)
+    q_complex = torch.polar(q_mag, q_phase)
+    k_complex = torch.polar(k_mag, k_phase)
 
-    q_real = q_mag * q_cos
-    q_imag = q_mag * q_sin
-    k_real = k_mag * k_cos
-    k_imag = k_mag * k_sin
-
-    q_embed = torch.stack([q_real, q_imag], dim=-1).flatten(-2)
-    k_embed = torch.stack([k_real, k_imag], dim=-1).flatten(-2)
+    q_embed = torch.view_as_real(q_complex).flatten(-2)
+    k_embed = torch.view_as_real(k_complex).flatten(-2)
 
     return q_embed.type_as(q), k_embed.type_as(k)
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads=8, depth=1):
+    def __init__(self, dim, heads=8):
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
-        self.half_dim = self.head_dim // 2
 
         self.wq = nn.Linear(dim, dim, bias=False)
         self.wk = nn.Linear(dim, dim, bias=False)
         self.wv = nn.Linear(dim, dim, bias=False)
 
         self.out_proj = nn.Linear(dim, dim, bias=False)
-
-        self.pope = PoPE(self.half_dim, heads)
-        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(heads, self.half_dim).normal_(mean=0, std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(heads, self.half_dim).normal_(mean=0, std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(heads, self.half_dim).normal_(mean=0, std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(heads, self.half_dim).normal_(mean=0, std=0.1))
-        self.subln = RMSNorm(self.head_dim)
+        self.pope = PoPE(self.head_dim, heads)
 
     def forward(self, x):
         B, S, C = x.shape
@@ -100,30 +86,13 @@ class Attention(nn.Module):
         k = self.wk(x).view(B, S, H, D).transpose(1, 2)
         v = self.wv(x).view(B, S, H, D).transpose(1, 2)
 
-        q1, q2 = q.chunk(2, dim=-1)
-        k1, k2 = k.chunk(2, dim=-1)
-
         freqs, bias = self.pope(S, x.device)
 
-        q1, k1 = apply_pope(q1, k1, freqs, bias)
-        q2, k2 = apply_pope(q2, k2, freqs, bias)
+        q, k = apply_pope(q, k, freqs, bias)
 
-        scale = D ** -0.5
+        out = F.scaled_dot_product_attention(q, k, v, scale=(2*D)**-0.5)
 
-        attn1 = F.softmax((q1 @ k1.transpose(-2, -1)) * scale, dim=-1)
-        attn2 = F.softmax((q2 @ k2.transpose(-2, -1)) * scale, dim=-1)
-
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1, keepdim=True).unsqueeze(-1))
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1, keepdim=True).unsqueeze(-1))
-        lambda_val = lambda_1 - lambda_2 + self.lambda_init
-
-        attn = attn1 - lambda_val * attn2
-        out = attn @ v
-
-        out = out.transpose(1, 2)
-        out = self.subln(out)
-        out = out * (1 - self.lambda_init)
-        out = out.reshape(B, S, C)
+        out = out.transpose(1, 2).reshape(B, S, C)
 
         return self.out_proj(out)
 
@@ -144,9 +113,9 @@ class GatedFF(nn.Module):
 class EncoderLayer(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = RMSNorm(dim)
         self.attn = Attention(dim, heads)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = RMSNorm(dim)
         self.ff = GatedFF(dim)
 
     def forward(self, x):
@@ -188,7 +157,7 @@ class NeuralModel(nn.Module):
         sources=len(STEMS),
         freq_bins=2049,
         embed_dim=256,
-        depth=8,
+        depth=10,
         heads=8,
         hop_length=1024,
         window_size=4096,
