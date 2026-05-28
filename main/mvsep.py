@@ -157,7 +157,7 @@ class NeuralModel(nn.Module):
         sources=len(STEMS),
         freq_bins=2049,
         embed_dim=384,
-        depth=12,
+        depth=8,
         heads=8,
         hop_length=1024,
         window_size=4096,
