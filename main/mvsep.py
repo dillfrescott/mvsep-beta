@@ -542,7 +542,10 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         avg_loss = checkpoint_data.get('avg_loss', 0.0)
 
         if not reset_optimizer and 'optimizer_state_dict' in checkpoint_data:
+            current_lrs = [group['lr'] for group in optimizer.param_groups]
             optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
+            for i, group in enumerate(optimizer.param_groups):
+                group['lr'] = current_lrs[i]
             print(f"Resuming training from step {step}. MODEL AND OPTIMIZER LOADED.")
         else:
             print(f"Resuming training from step {step}. MODEL LOADED, OPTIMIZER RESET.")
