@@ -428,7 +428,9 @@ def validate(model, test_dir, device, chunk_size, overlap):
                 gt_audios = []
                 for stem in STEMS:
                     path = next(os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.startswith(stem) and f.endswith(('.wav', '.flac')))
-                    audio, sr = torchaudio.load(path)
+                    audio_np, sr = sf.read(path, dtype='float32')
+                    audio = torch.from_numpy(audio_np)
+                    audio = audio.unsqueeze(0) if audio.dim() == 1 else audio.t()
                     if sr != 44100: continue
                     if audio.shape[0] == 1: audio = audio.repeat(2, 1)
                     gt_audios.append(audio)
@@ -689,7 +691,9 @@ def inference(model, checkpoint_path, input_data,
     model.eval().to(device)
 
     if isinstance(input_data, str):
-        input_audio, sr = torchaudio.load(input_data)
+        input_audio_np, sr = sf.read(input_data, dtype='float32')
+        input_audio = torch.from_numpy(input_audio_np)
+        input_audio = input_audio.unsqueeze(0) if input_audio.dim() == 1 else input_audio.t()
         if sr != 44100: raise ValueError(f"Input audio must be 44100Hz, but got {sr}Hz.")
     else:
         input_audio = input_data
@@ -791,7 +795,7 @@ def inference(model, checkpoint_path, input_data,
         for j, stem_name in enumerate(STEMS):
             path = os.path.join('outputs', f"{stem_name}.wav")
             print(f"Saving {stem_name} to {path}...")
-            torchaudio.save(path, pred_stems[j].cpu(), 44100)
+            sf.write(path, pred_stems[j].cpu().numpy().T, 44100)
         print("Done.")
 
 def main():
