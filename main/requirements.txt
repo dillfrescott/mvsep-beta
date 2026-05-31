@@ -2,5 +2,6 @@ torch
 torchaudio
 torchcodec
 adam-atan2-pytorch
+einops
 soundfile
 tqdm
