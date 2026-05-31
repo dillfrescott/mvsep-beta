@@ -3,5 +3,6 @@ torchaudio
 torchcodec
 adam-atan2-pytorch
 einops
+triton # triton-windows for windows
 soundfile
 tqdm
