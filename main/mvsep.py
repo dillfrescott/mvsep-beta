@@ -545,6 +545,12 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         else:
             print(f"Resuming training from step {step}. MODEL LOADED, OPTIMIZER RESET.")
 
+    current_lrs = [group['lr'] for group in optimizer.param_groups]
+    if len(set(current_lrs)) == 1:
+        print(f"Currently applied learning rate: {current_lrs[0]}")
+    else:
+        print(f"Currently applied learning rates: {current_lrs}")
+
     progress_bar = tqdm(initial=step, total=None, dynamic_ncols=True)
 
     if args.ckpt:
@@ -821,7 +827,7 @@ def main():
         torch.set_float32_matmul_precision('high')
     window = torch.hann_window(4096).to(device)
     model = NeuralModel(use_checkpoint=args.ckpt)
-    optimizer = AdamAtan2(model.parameters(), lr=1e-4)
+    optimizer = AdamAtan2(model.parameters(), lr=1e-5)
 
     if args.train:
         checkpoint_to_load = args.checkpoint_path
