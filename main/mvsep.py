@@ -269,7 +269,6 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
 def loss_fn(pred_output,
             mixture_spec,
             target_audios,
-            target_specs,
             stft_params_for_istft,
             multi_res_complex_loss_calculator):
     device = pred_output.device
@@ -390,13 +389,7 @@ class Dataset(Dataset):
                 mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                           window=self.window, return_complex=True, center=True)
 
-                target_specs = []
-                for audio in target_audios:
-                    spec = torch.stft(audio, n_fft=self.n_fft, hop_length=self.hop_length,
-                                      window=self.window, return_complex=True, center=True)
-                    target_specs.append(spec)
-
-                return mixture_spec, torch.stack(target_audios), torch.stack(target_specs)
+                return mixture_spec, torch.stack(target_audios)
             except Exception:
                 continue
 
@@ -565,16 +558,15 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
     while True:
         compiled_model.train()
         for batch in dataloader:
-            mixture_spec, target_audios, target_specs = batch
+            mixture_spec, target_audios = batch
 
             mixture_spec = mixture_spec.to(device, non_blocking=True)
             target_audios = target_audios.to(device, non_blocking=True)
-            target_specs = target_specs.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             with autocast():
                 pred_masks = compiled_model(mixture_spec)
-                loss = loss_fn(pred_masks, mixture_spec, target_audios, target_specs, stft_params_for_istft, multi_res_complex_loss_calculator)
+                loss = loss_fn(pred_masks, mixture_spec, target_audios, stft_params_for_istft, multi_res_complex_loss_calculator)
 
             if torch.isnan(loss).any(): continue
             scaler.scale(loss).backward()
