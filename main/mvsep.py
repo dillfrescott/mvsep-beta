@@ -377,7 +377,9 @@ class Dataset(Dataset):
                 for stem in self.stems:
                     if self.tracks[stem]:
                         track_info = random.choice(self.tracks[stem])
-                        target_audios.append(self._load_chunk(track_info))
+                        audio = self._load_chunk(track_info)
+                        gain = random.uniform(0.2, 1.2)
+                        target_audios.append(audio * gain)
                     else:
                         target_audios.append(torch.zeros(2, self.segment_length))
 
