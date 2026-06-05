@@ -1,6 +1,5 @@
 import os
 import argparse
-import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,8 +31,6 @@ class RMSNorm(nn.Module):
 class PoPE(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
-        self.heads = heads
-        self.dim = dim
 
         inv_freqs = 10000 ** -(torch.arange(0, dim, 1).float() / dim)
         self.register_buffer('inv_freqs', inv_freqs)
@@ -127,8 +124,8 @@ class DualPathEncoder(nn.Module):
     def __init__(self, dim, depth, heads, use_checkpoint=False):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for i in range(depth)])
-        self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for i in range(depth)])
+        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
+        self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
         self.norm = RMSNorm(dim)
 
     def forward(self, x):
@@ -159,15 +156,11 @@ class NeuralModel(nn.Module):
         embed_dim=384,
         depth=8,
         heads=8,
-        hop_length=1024,
-        window_size=4096,
         use_checkpoint=False,
         downsample=12
     ):
         super().__init__()
 
-        self.in_channels = in_channels
-        self.sources = sources
         self.out_masks = sources * in_channels
         self.freq_bins = freq_bins
         self.downsample = downsample
@@ -226,7 +219,7 @@ class NeuralModel(nn.Module):
         elif x.shape[2] > self.freq_bins:
             x = x[:, :, :self.freq_bins, :]
 
-        return torch.tanh(x)
+        return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -259,10 +252,14 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
                                    win_length=win_length, window=window, return_complex=True, center=True)
 
+            mag_pred = torch.abs(stft_pred)
+            mag_true = torch.abs(stft_true)
+            lin_mag_loss = F.l1_loss(mag_pred, mag_true)
+            log_mag_loss = F.l1_loss(torch.log(mag_pred + 1e-7), torch.log(mag_true + 1e-7))
             real_loss = F.l1_loss(stft_pred.real, stft_true.real)
             imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
 
-            complex_loss_total += (real_loss + imag_loss) * self.weights[i]
+            complex_loss_total += (lin_mag_loss + log_mag_loss + real_loss + imag_loss) * self.weights[i]
 
         return complex_loss_total
 
@@ -298,13 +295,11 @@ def loss_fn(pred_output,
         ).reshape(B_s, C_s, -1)
 
         total_loss += multi_res_complex_loss_calculator(pred_audio, target_audios[:, i])
-        total_loss += F.l1_loss(pred_audio, target_audios[:, i])
 
     return total_loss
 
 class Dataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=264600, segment=True):
-        self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
         self.segment = segment
@@ -328,7 +323,8 @@ class Dataset(Dataset):
 
         self.size = 50000
 
-    def _find_audio_file(self, directory, base_name):
+    @staticmethod
+    def _find_audio_file(directory, base_name):
         for ext in ['.wav', '.flac']:
             path = os.path.join(directory, base_name + ext)
             if os.path.exists(path):
@@ -374,7 +370,7 @@ class Dataset(Dataset):
     def __len__(self):
         return self.size
 
-    def __getitem__(self, idx):
+    def __getitem__(self, _):
         while True:
             try:
                 target_audios = []
@@ -470,7 +466,8 @@ class EMA:
         self.shadow = {self.clean_name(name): param.data.clone() for name, param in model.named_parameters() if param.requires_grad}
         self.backup = {}
 
-    def clean_name(self, name):
+    @staticmethod
+    def clean_name(name):
         return name.replace("_orig_mod.", "").replace("._orig_mod", "")
 
     def update(self):
@@ -520,7 +517,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         'n_fft': 4096, 'hop_length': 1024, 'window': window.to(device)
     }
     multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
-        fft_sizes=[1024, 2048, 8192], hop_sizes=[256, 512, 2048], win_lengths=[1024, 2048, 8192]
+        fft_sizes=[1024, 2048, 4096, 8192], hop_sizes=[256, 512, 1024, 2048], win_lengths=[1024, 2048, 4096, 8192]
     ).to(device)
 
     if checkpoint_path:
@@ -833,7 +830,7 @@ def main():
         torch.set_float32_matmul_precision('high')
     window = torch.hann_window(4096).to(device)
     model = NeuralModel(use_checkpoint=args.ckpt)
-    optimizer = AdamAtan2(model.parameters(), lr=1e-5)
+    optimizer = AdamAtan2(model.parameters(), lr=1e-4)
 
     if args.train:
         checkpoint_to_load = args.checkpoint_path
