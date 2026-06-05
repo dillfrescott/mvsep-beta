@@ -298,6 +298,37 @@ def loss_fn(pred_output,
 
     return total_loss
 
+def safe_pitch_shift(
+    waveform,
+    sample_rate,
+    n_steps,
+    bins_per_octave=12,
+    n_fft=512,
+    win_length=None,
+    hop_length=None,
+    window=None,
+):
+    from fractions import Fraction
+    from torchaudio.functional.functional import _stretch_waveform, _fix_waveform_shape, resample
+
+    waveform_stretch = _stretch_waveform(
+        waveform,
+        n_steps,
+        bins_per_octave,
+        n_fft,
+        win_length,
+        hop_length,
+        window,
+    )
+    rate = 2.0 ** (-float(n_steps) / bins_per_octave)
+    
+    frac = Fraction(rate).limit_denominator(256)
+    orig_freq = frac.denominator
+    new_freq = frac.numerator
+    
+    waveform_shift = resample(waveform_stretch, orig_freq, new_freq)
+    return _fix_waveform_shape(waveform_shift, waveform.size())
+
 class Dataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=264600, segment=True):
         self.sample_rate = sample_rate
@@ -379,7 +410,11 @@ class Dataset(Dataset):
                         track_info = random.choice(self.tracks[stem])
                         audio = self._load_chunk(track_info)
                         gain = random.uniform(0.2, 1.2)
-                        target_audios.append(audio * gain)
+                        audio = audio * gain
+                        if random.random() < 0.5:
+                            n_steps = random.uniform(-3.0, 3.0)
+                            audio = safe_pitch_shift(audio, self.sample_rate, n_steps)
+                        target_audios.append(audio)
                     else:
                         target_audios.append(torch.zeros(2, self.segment_length))
 
