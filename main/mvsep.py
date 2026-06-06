@@ -221,7 +221,7 @@ class NeuralModel(nn.Module):
         elif x.shape[2] > self.freq_bins:
             x = x[:, :, :self.freq_bins, :]
 
-        return x
+        return torch.tanh(x)
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -257,7 +257,7 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
             mag_pred = torch.abs(stft_pred)
             mag_true = torch.abs(stft_true)
             lin_mag_loss = F.l1_loss(mag_pred, mag_true)
-            log_mag_loss = F.l1_loss(torch.log(mag_pred + 1e-7), torch.log(mag_true + 1e-7))
+            log_mag_loss = F.l1_loss(torch.log(mag_pred + 1e-3), torch.log(mag_true + 1e-3))
             real_loss = F.l1_loss(stft_pred.real, stft_true.real)
             imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
 
@@ -297,6 +297,7 @@ def loss_fn(pred_output,
         ).reshape(B_s, C_s, -1)
 
         total_loss += multi_res_complex_loss_calculator(pred_audio, target_audios[:, i])
+        total_loss += F.l1_loss(pred_audio, target_audios[:, i])
 
     return total_loss
 
@@ -304,7 +305,7 @@ def safe_pitch_shift(
     waveform,
     n_steps,
     bins_per_octave=12,
-    n_fft=512,
+    n_fft=2048,
     win_length=None,
     hop_length=None,
     window=None,
