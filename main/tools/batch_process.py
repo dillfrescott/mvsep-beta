@@ -7,14 +7,19 @@ import torchaudio
 from tqdm import tqdm
 import math
 import warnings
-from mvsep import NeuralModel
+from mvsep import NeuralModel, clean_state_dict
 
 warnings.filterwarnings("ignore")
 
 def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=264600, overlap=88200, device='cpu'):
     stems = checkpoint_data.get('stems', ['vocals', 'other'])
     num_stems = len(stems)
-    model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
+    if 'ema_state_dict' in checkpoint_data:
+        print("Loading EMA weights for inference.")
+        model.load_state_dict(clean_state_dict(checkpoint_data['ema_state_dict']), strict=False)
+    else:
+        print("Loading regular model weights for inference.")
+        model.load_state_dict(clean_state_dict(checkpoint_data['model_state_dict']), strict=False)
     model.eval().to(device)
 
     os.makedirs(output_dir, exist_ok=True)
