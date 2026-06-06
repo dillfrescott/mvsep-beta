@@ -13,6 +13,8 @@ import random
 import math
 import re
 import warnings
+from fractions import Fraction
+from torchaudio.functional.functional import _stretch_waveform, _fix_waveform_shape, resample
 
 warnings.filterwarnings("ignore")
 
@@ -300,7 +302,6 @@ def loss_fn(pred_output,
 
 def safe_pitch_shift(
     waveform,
-    sample_rate,
     n_steps,
     bins_per_octave=12,
     n_fft=512,
@@ -308,9 +309,6 @@ def safe_pitch_shift(
     hop_length=None,
     window=None,
 ):
-    from fractions import Fraction
-    from torchaudio.functional.functional import _stretch_waveform, _fix_waveform_shape, resample
-
     waveform_stretch = _stretch_waveform(
         waveform,
         n_steps,
@@ -413,7 +411,7 @@ class Dataset(Dataset):
                         audio = audio * gain
                         if random.random() < 0.5:
                             n_steps = random.uniform(-3.0, 3.0)
-                            audio = safe_pitch_shift(audio, self.sample_rate, n_steps)
+                            audio = safe_pitch_shift(audio, n_steps)
                         target_audios.append(audio)
                     else:
                         target_audios.append(torch.zeros(2, self.segment_length))
