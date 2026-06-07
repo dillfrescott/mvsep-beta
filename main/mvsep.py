@@ -1,6 +1,5 @@
 import os
 import argparse
-import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -129,8 +128,8 @@ class DualPathEncoder(nn.Module):
     def __init__(self, dim, depth, heads, use_checkpoint=False):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for i in range(depth)])
-        self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for i in range(depth)])
+        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
+        self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
         self.norm = RMSNorm(dim)
 
     def forward(self, x):
@@ -161,8 +160,6 @@ class NeuralModel(nn.Module):
         embed_dim=384,
         depth=8,
         heads=8,
-        hop_length=1024,
-        window_size=4096,
         use_checkpoint=False,
         downsample=12
     ):
@@ -866,7 +863,7 @@ def main():
         torch.set_float32_matmul_precision('high')
     window = torch.hann_window(4096).to(device)
     model = NeuralModel(use_checkpoint=args.ckpt)
-    optimizer = AdamAtan2(model.parameters(), lr=1e-5)
+    optimizer = AdamAtan2(model.parameters(), lr=1e-4)
 
     if args.train:
         checkpoint_to_load = args.checkpoint_path
