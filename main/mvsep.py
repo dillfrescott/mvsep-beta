@@ -18,18 +18,6 @@ from torchaudio.functional.functional import _stretch_waveform, _fix_waveform_sh
 
 warnings.filterwarnings("ignore")
 
-STEMS = ['vocals', 'other']
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        variance = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(variance + self.eps) * self.weight
-
 class PoPE(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
@@ -114,9 +102,9 @@ class GatedFF(nn.Module):
 class EncoderLayer(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
-        self.norm1 = RMSNorm(dim)
+        self.norm1 = nn.RMSNorm(dim)
         self.attn = Attention(dim, heads)
-        self.norm2 = RMSNorm(dim)
+        self.norm2 = nn.RMSNorm(dim)
         self.ff = GatedFF(dim)
 
     def forward(self, x):
@@ -130,7 +118,7 @@ class DualPathEncoder(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
         self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
-        self.norm = RMSNorm(dim)
+        self.norm = nn.RMSNorm(dim)
 
     def forward(self, x):
         B, F_b, T, E = x.shape
@@ -155,7 +143,7 @@ class NeuralModel(nn.Module):
     def __init__(
         self,
         in_channels=2,
-        sources=None,
+        sources=2,
         freq_bins=2049,
         embed_dim=384,
         depth=8,
@@ -165,23 +153,20 @@ class NeuralModel(nn.Module):
     ):
         super().__init__()
 
-        if sources is None:
-            sources = len(STEMS) - 1
-
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
         self.freq_bins = freq_bins
         self.downsample = downsample
-
+        
         unshuffled_channels = in_channels * 2 * downsample
         self.input_proj = nn.Conv2d(
             in_channels=unshuffled_channels,
             out_channels=embed_dim,
             kernel_size=1
         )
-
-        self.norm = RMSNorm(embed_dim)
+        
+        self.norm = nn.RMSNorm(embed_dim)
 
         self.model = DualPathEncoder(
             dim=embed_dim,
@@ -210,7 +195,7 @@ class NeuralModel(nn.Module):
         x = x.permute(0, 1, 3, 2, 4).reshape(B, C * self.downsample, F_len // self.downsample, T)
 
         x = self.input_proj(x)
-
+        
         x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
 
@@ -218,8 +203,8 @@ class NeuralModel(nn.Module):
 
         x = x.permute(0, 3, 1, 2)
         x = self.proj_to_pixel_shuffle(x)
-
-        B, C, F_down, T = x.shape
+        
+        B, _, F_down, T = x.shape
         x = x.view(B, self.out_masks * 2, self.downsample, F_down, T)
         x = x.permute(0, 1, 3, 2, 4).reshape(B, self.out_masks * 2, F_down * self.downsample, T)
 
@@ -228,7 +213,7 @@ class NeuralModel(nn.Module):
         elif x.shape[2] > self.freq_bins:
             x = x[:, :, :self.freq_bins, :]
 
-        return x
+        return torch.tanh(x)
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -256,25 +241,15 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
         for i, (n_fft, hop_length, win_length) in enumerate(zip(self.fft_sizes, self.hop_sizes, self.win_lengths)):
             window = getattr(self, f'window_{i}')
 
-            stft_pred = torch.stft(y_pred_flat.float(), n_fft=n_fft, hop_length=hop_length,
-                                   win_length=win_length, window=window.float(), return_complex=True, center=True)
-            stft_true = torch.stft(y_true_flat.float(), n_fft=n_fft, hop_length=hop_length,
-                                   win_length=win_length, window=window.float(), return_complex=True, center=True)
+            stft_pred = torch.stft(y_pred_flat, n_fft=n_fft, hop_length=hop_length,
+                                   win_length=win_length, window=window, return_complex=True, center=True)
+            stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
+                                   win_length=win_length, window=window, return_complex=True, center=True)
 
             real_loss = F.l1_loss(stft_pred.real, stft_true.real)
             imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
-            complex_loss = real_loss + imag_loss
 
-            mag_pred = torch.abs(stft_pred)
-            mag_true = torch.abs(stft_true)
-
-            norm_diff = torch.linalg.norm(mag_true - mag_pred, ord='fro', dim=(-2, -1))
-            norm_true = torch.linalg.norm(mag_true, ord='fro', dim=(-2, -1))
-            sc_loss = (norm_diff / norm_true.clamp(min=1e-8)).mean()
-
-            log_mag_loss = F.l1_loss(torch.log(mag_pred + 1e-5), torch.log(mag_true + 1e-5))
-
-            complex_loss_total += (complex_loss + sc_loss + log_mag_loss) * self.weights[i]
+            complex_loss_total += (real_loss + imag_loss) * self.weights[i]
 
         return complex_loss_total
 
@@ -287,9 +262,7 @@ def loss_fn(pred_output,
 
     B, _, F_dim, T = pred_output.shape
     num_stems = target_audios.shape[1]
-    num_pred_stems = num_stems - 1
-
-    pred_output_reshaped = pred_output.contiguous().view(B, 2, num_pred_stems * 2, F_dim, T)
+    pred_output_reshaped = pred_output.contiguous().view(B, 2, num_stems * 2, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
 
@@ -298,30 +271,21 @@ def loss_fn(pred_output,
     window = stft_params_for_istft['window'].to(device)
     recon_len = target_audios.shape[-1]
 
-    pred_audios = []
-
-    for i in range(num_pred_stems):
+    total_loss = 0.0
+    for i in range(num_stems):
         cmask = pred_real[:, 2*i:2*i+2] + 1j * pred_imag[:, 2*i:2*i+2]
         stem_spec_pred = cmask * mixture_spec
 
         B_s, C_s, freq, T_spec = stem_spec_pred.shape
         stem_spec_pred_reshaped = stem_spec_pred.reshape(B_s * C_s, freq, T_spec)
 
-        stem_audio_pred = torch.istft(
+        pred_audio = torch.istft(
             stem_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
             window=window, center=True, length=recon_len
         ).reshape(B_s, C_s, -1)
-        pred_audios.append(stem_audio_pred)
 
-    mixture_audio = target_audios.sum(dim=1)
-    sum_pred_audio = sum(pred_audios)
-    other_audio_pred = mixture_audio - sum_pred_audio
-    pred_audios.append(other_audio_pred)
-
-    total_loss = 0.0
-    for i in range(num_stems):
-        total_loss += multi_res_complex_loss_calculator(pred_audios[i], target_audios[:, i])
-        total_loss += F.l1_loss(pred_audios[i], target_audios[:, i])
+        total_loss += multi_res_complex_loss_calculator(pred_audio, target_audios[:, i])
+        total_loss += F.l1_loss(pred_audio, target_audios[:, i])
 
     return total_loss
 
@@ -361,7 +325,7 @@ class Dataset(Dataset):
         self.hop_length = 1024
         self.window = torch.hann_window(self.n_fft)
 
-        self.stems = STEMS
+        self.stems = ['vocals', 'other']
         self.tracks = {stem: [] for stem in self.stems}
 
         track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, track))]
@@ -436,9 +400,15 @@ class Dataset(Dataset):
                             n_steps = random.uniform(-3.0, 3.0)
                             audio = safe_pitch_shift(audio, n_steps)
                         if random.random() < 0.5:
-                            audio = torch.flip(audio, dims=[0])
-                        if random.random() < 0.5:
                             audio = -audio
+                        if random.random() < 0.5:
+                            if random.random() < 0.5:
+                                audio = audio.flip(0)
+                            pan = random.uniform(-0.5, 0.5)
+                            if pan > 0:
+                                audio = audio * torch.tensor([[1.0 - pan], [1.0]])
+                            else:
+                                audio = audio * torch.tensor([[1.0], [1.0 + pan]])
                         target_audios.append(audio)
                     else:
                         target_audios.append(torch.zeros(2, self.segment_length))
@@ -470,14 +440,15 @@ def validate(model, test_dir, device, chunk_size, overlap):
         return 0.0
 
     total_sdr, count = 0.0, 0
-    num_stems = len(STEMS)
+    stems = ['vocals', 'other']
+    num_stems = len(stems)
     total_stems_sdr = [0.0] * num_stems
 
     with tqdm(track_dirs, desc="Validating", leave=False) as pbar:
         for track_dir in pbar:
             try:
                 gt_audios = []
-                for stem in STEMS:
+                for stem in stems:
                     path = next(os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.startswith(stem) and f.endswith(('.wav', '.flac')))
                     audio_np, sr = sf.read(path, dtype='float32')
                     audio = torch.from_numpy(audio_np)
@@ -498,11 +469,11 @@ def validate(model, test_dir, device, chunk_size, overlap):
                 stems_sdr = [calculate_sdr(p, g) for p, g in zip(pred_audios, gt_audios)]
                 for i, s in enumerate(stems_sdr):
                     total_stems_sdr[i] += s
-
+                
                 track_sdr = sum(stems_sdr) / num_stems
                 total_sdr += track_sdr
                 count += 1
-                sdr_info = " | ".join([f"{STEMS[i].capitalize()}: {stems_sdr[i]:.4f} SDR" for i in range(num_stems)])
+                sdr_info = " | ".join([f"{stems[i].capitalize()}: {stems_sdr[i]:.4f} SDR" for i in range(num_stems)])
                 pbar.set_postfix_str(sdr_info)
             except Exception:
                 continue
@@ -590,7 +561,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             print("EMA state loaded from checkpoint.")
         else:
             print("No EMA state found in checkpoint. Initializing from current model weights.")
-
+        
         step = checkpoint_data.get('step', 0)
         avg_loss = checkpoint_data.get('avg_loss', 0.0)
 
@@ -647,12 +618,12 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
             if step > 0 and step % checkpoint_steps == 0:
                 checkpoint_payload = {
-                    'step': step,
-                    'model_state_dict': clean_state_dict(model.state_dict()),
+                    'step': step, 
+                    'model_state_dict': clean_state_dict(model.state_dict()), 
                     'ema_state_dict': clean_state_dict(ema.state_dict()),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
-                    'stems': STEMS
+                    'stems': ['vocals', 'other']
                 }
 
                 reg_checkpoint_path = f"ckpts/checkpoint_step_{step}.pt"
@@ -669,7 +640,8 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 avg_stems_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
                 ema.restore()
 
-                sdr_str = ", ".join([f"{STEMS[i].capitalize()} SDR: {avg_stems_sdr[i]:.4f}" for i in range(len(STEMS))])
+                stems = ['vocals', 'other']
+                sdr_str = ", ".join([f"{stems[i].capitalize()} SDR: {avg_stems_sdr[i]:.4f}" for i in range(len(stems))])
                 print(f"\nValidation Step {step} (EMA): {sdr_str}, Combined SDR: {avg_combined_sdr:.4f}")
 
                 best_sdr_checkpoints = []
@@ -697,7 +669,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                     print(f"New best SDR! Saved checkpoint: {best_ckpt_filename}\n")
                 else:
                     print(f"SDR did not improve. Best SDR remains {best_sdr:.4f}\n")
-
+                
                 compiled_model.train()
 
 def find_latest_checkpoint(folder='ckpts'):
@@ -736,14 +708,12 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
 
 def inference(model, checkpoint_path, input_data,
               chunk_size=485100, overlap=88200, device='cpu', return_tensors=False):
-    global STEMS
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        if 'stems' in checkpoint_data:
-            STEMS = checkpoint_data['stems']
         model.load_state_dict(clean_state_dict(checkpoint_data['model_state_dict']), strict=False)
 
-    num_stems = len(STEMS)
+    stems = ['vocals', 'other']
+    num_stems = len(stems)
     model.eval().to(device)
 
     if isinstance(input_data, str):
@@ -816,9 +786,7 @@ def inference(model, checkpoint_path, input_data,
                     pred_output = model(spec.unsqueeze(0)).squeeze(0)
 
             _, F_spec, T_spec = spec.shape
-
-            num_pred_stems = num_stems - 1
-            pred_output_reshaped = pred_output.contiguous().view(2, num_pred_stems * 2, F_spec, T_spec)
+            pred_output_reshaped = pred_output.contiguous().view(2, num_stems * 2, F_spec, T_spec)
             pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
             if L == chunk_size:
@@ -839,43 +807,37 @@ def inference(model, checkpoint_path, input_data,
             actual_end = min(start + L, total_length)
             usable = actual_end - start
 
-            pred_chunks = []
+            cmask_v = pred_real[0:2] + 1j * pred_imag[0:2]
+            stem_spec_v = cmask_v * spec
+            stem_chunk_v = torch.istft(stem_spec_v, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
+            pred_stems[0][:, start:actual_end] += stem_chunk_v[:, :usable] * w[:usable]
 
-            for j in range(num_pred_stems):
-                cmask = pred_real[2*j:2*j+2] + 1j * pred_imag[2*j:2*j+2]
-                stem_spec = cmask * spec
-                stem_chunk_full = torch.istft(stem_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
-                pred_chunks.append(stem_chunk_full)
-
-            sum_pred_chunk = sum(pred_chunks)
-            other_chunk_full = padded_chunk - sum_pred_chunk
-            pred_chunks.append(other_chunk_full)
-
-            for j in range(num_stems):
-                pred_stems[j][:, start:actual_end] += pred_chunks[j][:, :usable] * w[:usable]
+            cmask_i = pred_real[2:4] + 1j * pred_imag[2:4]
+            stem_spec_i = cmask_i * spec
+            stem_chunk_i = torch.istft(stem_spec_i, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
+            pred_stems[1][:, start:actual_end] += stem_chunk_i[:, :usable] * w[:usable]
 
             sum_weights[start:actual_end] += w[:usable]
             pbar.update(1)
 
     sum_weights = sum_weights.clamp(min=1e-8)
-    for j in range(num_stems):
-        pred_stems[j] = (pred_stems[j] / sum_weights).clamp(-1.0, 1.0)
+    v_reconstructed = pred_stems[0] / sum_weights
+    i_reconstructed = pred_stems[1] / sum_weights
+    residual = input_audio - (v_reconstructed + i_reconstructed)
+    pred_stems[0] = (v_reconstructed + 0.5 * residual).clamp(-1.0, 1.0)
+    pred_stems[1] = (i_reconstructed + 0.5 * residual).clamp(-1.0, 1.0)
 
     if return_tensors:
         return pred_stems
     else:
         os.makedirs('outputs', exist_ok=True)
-        for j, stem_name in enumerate(STEMS):
+        for j, stem_name in enumerate(stems):
             path = os.path.join('outputs', f"{stem_name}.wav")
             print(f"Saving {stem_name} to {path}...")
             sf.write(path, pred_stems[j].cpu().numpy().T, 44100)
         print("Done.")
 
 def main():
-    if len(STEMS) < 2:
-        print("Error: At least 2 stems must be defined in STEMS.")
-        return
-
     parser = argparse.ArgumentParser(description='Train or run inference on a source separation model.')
     parser.add_argument('--train', action='store_true', help='Train the model.')
     parser.add_argument('--infer', action='store_true', help='Run inference.')
@@ -925,7 +887,7 @@ def main():
             checkpoint_to_load = find_latest_checkpoint('ckpts') if args.latest else find_best_sdr_checkpoint('best_ckpts')
             if checkpoint_to_load:
                 print(f"No checkpoint specified. Automatically using {'latest' if args.latest else 'best SDR'} checkpoint: {checkpoint_to_load}")
-
+        
         if not checkpoint_to_load:
             print("Error: No checkpoint found.")
             return
