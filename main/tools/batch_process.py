@@ -5,8 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
-import math
 import warnings
+from torch.cuda.amp import autocast
 from mvsep import NeuralModel, clean_state_dict
 
 warnings.filterwarnings("ignore")
@@ -91,12 +91,18 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=264600, 
 
                 spec = torch.stft(padded_chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
 
+                device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
+                if device_type == 'cuda' and torch.cuda.is_bf16_supported():
+                    autocast_ctx = autocast(dtype=torch.bfloat16)
+                else:
+                    autocast_ctx = autocast()
+
                 with torch.no_grad():
-                    pred_output = model(spec.unsqueeze(0)).squeeze(0)
+                    with autocast_ctx:
+                        pred_output = model(spec.unsqueeze(0)).squeeze(0)
 
                 _, F_spec, T_spec = spec.shape
-                num_pred_stems = num_stems - 1
-                pred_output_reshaped = pred_output.contiguous().view(2, num_pred_stems * 2, F_spec, T_spec)
+                pred_output_reshaped = pred_output.contiguous().view(2, num_stems * 2, F_spec, T_spec)
                 pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
                 if L == chunk_size:
@@ -117,26 +123,20 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=264600, 
                 actual_end = min(start + L, total_length)
                 usable = actual_end - start
 
-                pred_chunks = []
-                for j in range(num_pred_stems):
+                for j in range(num_stems):
                     cmask = pred_real[2*j:2*j+2] + 1j * pred_imag[2*j:2*j+2]
                     stem_spec = cmask * spec
-                    stem_chunk_full = torch.istft(stem_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
-                    pred_chunks.append(stem_chunk_full)
-
-                sum_pred_chunk = sum(pred_chunks)
-                other_chunk_full = padded_chunk - sum_pred_chunk
-                pred_chunks.append(other_chunk_full)
-
-                for j in range(num_stems):
-                    pred_stems[j][:, start:actual_end] += pred_chunks[j][:, :usable] * w[:usable]
+                    stem_chunk = torch.istft(stem_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
+                    pred_stems[j][:, start:actual_end] += stem_chunk[:, :usable] * w[:usable]
 
                 sum_weights[start:actual_end] += w[:usable]
                 pbar.update(1)
 
         sum_weights = sum_weights.clamp(min=1e-8)
+        reconstructed_stems = [pred_stems[j] / sum_weights for j in range(num_stems)]
+        residual = input_audio - sum(reconstructed_stems)
         for j in range(num_stems):
-            res = (pred_stems[j] / sum_weights).clamp(-1.0, 1.0)
+            res = (reconstructed_stems[j] + (1.0 / num_stems) * residual).clamp(-1.0, 1.0)
             torchaudio.save(os.path.join(song_output_dir, f'{stems[j]}.flac'), res.cpu(), sr, format='flac')
 
 def main():
@@ -151,7 +151,7 @@ def main():
     
     checkpoint_data = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
     stems = checkpoint_data.get('stems', ['vocals', 'other'])
-    model = NeuralModel(sources=len(stems) - 1)
+    model = NeuralModel(sources=len(stems))
 
     if args.infer:
         inference(model, checkpoint_data, args.input_dir, args.output_dir, device=device)
