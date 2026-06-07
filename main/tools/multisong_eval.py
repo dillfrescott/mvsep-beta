@@ -91,7 +91,8 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=264600, 
                     pred_output = model(spec.unsqueeze(0)).squeeze(0)
 
                 _, F_spec, T_spec = spec.shape
-                pred_output_reshaped = pred_output.view(2, num_stems * 2, F_spec, T_spec)
+                num_pred_stems = num_stems - 1
+                pred_output_reshaped = pred_output.contiguous().view(2, num_pred_stems * 2, F_spec, T_spec)
                 pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
                 if L == chunk_size:
@@ -112,11 +113,19 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=264600, 
                 actual_end = min(start + L, total_length)
                 usable = actual_end - start
 
-                for j in range(num_stems):
+                pred_chunks = []
+                for j in range(num_pred_stems):
                     cmask = pred_real[2*j:2*j+2] + 1j * pred_imag[2*j:2*j+2]
                     stem_spec = cmask * spec
                     stem_chunk_full = torch.istft(stem_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
-                    pred_stems[j][:, start:actual_end] += stem_chunk_full[:, :usable] * w[:usable]
+                    pred_chunks.append(stem_chunk_full)
+
+                sum_pred_chunk = sum(pred_chunks)
+                other_chunk_full = padded_chunk - sum_pred_chunk
+                pred_chunks.append(other_chunk_full)
+
+                for j in range(num_stems):
+                    pred_stems[j][:, start:actual_end] += pred_chunks[j][:, :usable] * w[:usable]
 
                 sum_weights[start:actual_end] += w[:usable]
                 pbar.update(1)
@@ -155,7 +164,7 @@ def main():
     
     checkpoint_data = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
     stems = checkpoint_data.get('stems', ['vocals', 'other'])
-    model = NeuralModel(sources=len(stems))
+    model = NeuralModel(sources=len(stems) - 1)
 
     if args.infer:
         inference(model, checkpoint_data, args.input_dir,

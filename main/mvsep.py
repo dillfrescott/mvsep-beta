@@ -155,7 +155,7 @@ class NeuralModel(nn.Module):
     def __init__(
         self,
         in_channels=2,
-        sources=len(STEMS),
+        sources=None,
         freq_bins=2049,
         embed_dim=384,
         depth=8,
@@ -165,19 +165,22 @@ class NeuralModel(nn.Module):
     ):
         super().__init__()
 
+        if sources is None:
+            sources = len(STEMS) - 1
+
         self.in_channels = in_channels
         self.sources = sources
         self.out_masks = sources * in_channels
         self.freq_bins = freq_bins
         self.downsample = downsample
-        
+
         unshuffled_channels = in_channels * 2 * downsample
         self.input_proj = nn.Conv2d(
             in_channels=unshuffled_channels,
             out_channels=embed_dim,
             kernel_size=1
         )
-        
+
         self.norm = RMSNorm(embed_dim)
 
         self.model = DualPathEncoder(
@@ -207,7 +210,7 @@ class NeuralModel(nn.Module):
         x = x.permute(0, 1, 3, 2, 4).reshape(B, C * self.downsample, F_len // self.downsample, T)
 
         x = self.input_proj(x)
-        
+
         x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
 
@@ -215,7 +218,7 @@ class NeuralModel(nn.Module):
 
         x = x.permute(0, 3, 1, 2)
         x = self.proj_to_pixel_shuffle(x)
-        
+
         B, C, F_down, T = x.shape
         x = x.view(B, self.out_masks * 2, self.downsample, F_down, T)
         x = x.permute(0, 1, 3, 2, 4).reshape(B, self.out_masks * 2, F_down * self.downsample, T)
@@ -225,7 +228,7 @@ class NeuralModel(nn.Module):
         elif x.shape[2] > self.freq_bins:
             x = x[:, :, :self.freq_bins, :]
 
-        return torch.tanh(x)
+        return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -253,15 +256,25 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
         for i, (n_fft, hop_length, win_length) in enumerate(zip(self.fft_sizes, self.hop_sizes, self.win_lengths)):
             window = getattr(self, f'window_{i}')
 
-            stft_pred = torch.stft(y_pred_flat, n_fft=n_fft, hop_length=hop_length,
-                                   win_length=win_length, window=window, return_complex=True, center=True)
-            stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
-                                   win_length=win_length, window=window, return_complex=True, center=True)
+            stft_pred = torch.stft(y_pred_flat.float(), n_fft=n_fft, hop_length=hop_length,
+                                   win_length=win_length, window=window.float(), return_complex=True, center=True)
+            stft_true = torch.stft(y_true_flat.float(), n_fft=n_fft, hop_length=hop_length,
+                                   win_length=win_length, window=window.float(), return_complex=True, center=True)
 
             real_loss = F.l1_loss(stft_pred.real, stft_true.real)
             imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
+            complex_loss = real_loss + imag_loss
 
-            complex_loss_total += (real_loss + imag_loss) * self.weights[i]
+            mag_pred = torch.abs(stft_pred)
+            mag_true = torch.abs(stft_true)
+
+            norm_diff = torch.linalg.norm(mag_true - mag_pred, ord='fro', dim=(-2, -1))
+            norm_true = torch.linalg.norm(mag_true, ord='fro', dim=(-2, -1))
+            sc_loss = (norm_diff / norm_true.clamp(min=1e-8)).mean()
+
+            log_mag_loss = F.l1_loss(torch.log(mag_pred + 1e-5), torch.log(mag_true + 1e-5))
+
+            complex_loss_total += (complex_loss + sc_loss + log_mag_loss) * self.weights[i]
 
         return complex_loss_total
 
@@ -274,7 +287,9 @@ def loss_fn(pred_output,
 
     B, _, F_dim, T = pred_output.shape
     num_stems = target_audios.shape[1]
-    pred_output_reshaped = pred_output.contiguous().view(B, 2, num_stems * 2, F_dim, T)
+    num_pred_stems = num_stems - 1
+
+    pred_output_reshaped = pred_output.contiguous().view(B, 2, num_pred_stems * 2, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
 
@@ -283,21 +298,30 @@ def loss_fn(pred_output,
     window = stft_params_for_istft['window'].to(device)
     recon_len = target_audios.shape[-1]
 
-    total_loss = 0.0
-    for i in range(num_stems):
+    pred_audios = []
+
+    for i in range(num_pred_stems):
         cmask = pred_real[:, 2*i:2*i+2] + 1j * pred_imag[:, 2*i:2*i+2]
         stem_spec_pred = cmask * mixture_spec
 
         B_s, C_s, freq, T_spec = stem_spec_pred.shape
         stem_spec_pred_reshaped = stem_spec_pred.reshape(B_s * C_s, freq, T_spec)
 
-        pred_audio = torch.istft(
+        stem_audio_pred = torch.istft(
             stem_spec_pred_reshaped, n_fft=n_fft, hop_length=hop_length,
             window=window, center=True, length=recon_len
         ).reshape(B_s, C_s, -1)
+        pred_audios.append(stem_audio_pred)
 
-        total_loss += multi_res_complex_loss_calculator(pred_audio, target_audios[:, i])
-        total_loss += F.l1_loss(pred_audio, target_audios[:, i])
+    mixture_audio = target_audios.sum(dim=1)
+    sum_pred_audio = sum(pred_audios)
+    other_audio_pred = mixture_audio - sum_pred_audio
+    pred_audios.append(other_audio_pred)
+
+    total_loss = 0.0
+    for i in range(num_stems):
+        total_loss += multi_res_complex_loss_calculator(pred_audios[i], target_audios[:, i])
+        total_loss += F.l1_loss(pred_audios[i], target_audios[:, i])
 
     return total_loss
 
@@ -411,6 +435,10 @@ class Dataset(Dataset):
                         if random.random() < 0.5:
                             n_steps = random.uniform(-3.0, 3.0)
                             audio = safe_pitch_shift(audio, n_steps)
+                        if random.random() < 0.5:
+                            audio = torch.flip(audio, dims=[0])
+                        if random.random() < 0.5:
+                            audio = -audio
                         target_audios.append(audio)
                     else:
                         target_audios.append(torch.zeros(2, self.segment_length))
@@ -470,7 +498,7 @@ def validate(model, test_dir, device, chunk_size, overlap):
                 stems_sdr = [calculate_sdr(p, g) for p, g in zip(pred_audios, gt_audios)]
                 for i, s in enumerate(stems_sdr):
                     total_stems_sdr[i] += s
-                
+
                 track_sdr = sum(stems_sdr) / num_stems
                 total_sdr += track_sdr
                 count += 1
@@ -562,7 +590,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
             print("EMA state loaded from checkpoint.")
         else:
             print("No EMA state found in checkpoint. Initializing from current model weights.")
-        
+
         step = checkpoint_data.get('step', 0)
         avg_loss = checkpoint_data.get('avg_loss', 0.0)
 
@@ -619,8 +647,8 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
 
             if step > 0 and step % checkpoint_steps == 0:
                 checkpoint_payload = {
-                    'step': step, 
-                    'model_state_dict': clean_state_dict(model.state_dict()), 
+                    'step': step,
+                    'model_state_dict': clean_state_dict(model.state_dict()),
                     'ema_state_dict': clean_state_dict(ema.state_dict()),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
@@ -669,7 +697,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                     print(f"New best SDR! Saved checkpoint: {best_ckpt_filename}\n")
                 else:
                     print(f"SDR did not improve. Best SDR remains {best_sdr:.4f}\n")
-                
+
                 compiled_model.train()
 
 def find_latest_checkpoint(folder='ckpts'):
@@ -788,7 +816,9 @@ def inference(model, checkpoint_path, input_data,
                     pred_output = model(spec.unsqueeze(0)).squeeze(0)
 
             _, F_spec, T_spec = spec.shape
-            pred_output_reshaped = pred_output.contiguous().view(2, num_stems * 2, F_spec, T_spec)
+
+            num_pred_stems = num_stems - 1
+            pred_output_reshaped = pred_output.contiguous().view(2, num_pred_stems * 2, F_spec, T_spec)
             pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
             if L == chunk_size:
@@ -809,12 +839,21 @@ def inference(model, checkpoint_path, input_data,
             actual_end = min(start + L, total_length)
             usable = actual_end - start
 
-            for j in range(num_stems):
+            pred_chunks = []
+
+            for j in range(num_pred_stems):
                 cmask = pred_real[2*j:2*j+2] + 1j * pred_imag[2*j:2*j+2]
                 stem_spec = cmask * spec
                 stem_chunk_full = torch.istft(stem_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
-                pred_stems[j][:, start:actual_end] += stem_chunk_full[:, :usable] * w[:usable]
-            
+                pred_chunks.append(stem_chunk_full)
+
+            sum_pred_chunk = sum(pred_chunks)
+            other_chunk_full = padded_chunk - sum_pred_chunk
+            pred_chunks.append(other_chunk_full)
+
+            for j in range(num_stems):
+                pred_stems[j][:, start:actual_end] += pred_chunks[j][:, :usable] * w[:usable]
+
             sum_weights[start:actual_end] += w[:usable]
             pbar.update(1)
 
@@ -886,7 +925,7 @@ def main():
             checkpoint_to_load = find_latest_checkpoint('ckpts') if args.latest else find_best_sdr_checkpoint('best_ckpts')
             if checkpoint_to_load:
                 print(f"No checkpoint specified. Automatically using {'latest' if args.latest else 'best SDR'} checkpoint: {checkpoint_to_load}")
-        
+
         if not checkpoint_to_load:
             print("Error: No checkpoint found.")
             return
