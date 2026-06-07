@@ -143,7 +143,7 @@ class NeuralModel(nn.Module):
     def __init__(
         self,
         in_channels=2,
-        sources=2,
+        sources=3,
         freq_bins=2049,
         embed_dim=384,
         depth=8,
@@ -213,7 +213,15 @@ class NeuralModel(nn.Module):
         elif x.shape[2] > self.freq_bins:
             x = x[:, :, :self.freq_bins, :]
 
-        return torch.tanh(x)
+        masks = torch.tanh(x[:, :8])
+        repair = x[:, 8:]
+
+        masks_real = masks[:, 0:4]
+        masks_imag = masks[:, 4:8]
+        repair_real = repair[:, 0:2]
+        repair_imag = repair[:, 2:4]
+
+        return torch.cat([masks_real, repair_real, masks_imag, repair_imag], dim=1)
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -262,7 +270,7 @@ def loss_fn(pred_output,
 
     B, _, F_dim, T = pred_output.shape
     num_stems = target_audios.shape[1]
-    pred_output_reshaped = pred_output.contiguous().view(B, 2, num_stems * 2, F_dim, T)
+    pred_output_reshaped = pred_output.contiguous().view(B, 2, 6, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
 
@@ -274,7 +282,11 @@ def loss_fn(pred_output,
     total_loss = 0.0
     for i in range(num_stems):
         cmask = pred_real[:, 2*i:2*i+2] + 1j * pred_imag[:, 2*i:2*i+2]
-        stem_spec_pred = cmask * mixture_spec
+        if i == 0:
+            stem_spec_pred = cmask * mixture_spec
+        else:
+            repair = pred_real[:, 4:6] + 1j * pred_imag[:, 4:6]
+            stem_spec_pred = cmask * mixture_spec + repair
 
         B_s, C_s, freq, T_spec = stem_spec_pred.shape
         stem_spec_pred_reshaped = stem_spec_pred.reshape(B_s * C_s, freq, T_spec)
@@ -786,7 +798,7 @@ def inference(model, checkpoint_path, input_data,
                     pred_output = model(spec.unsqueeze(0)).squeeze(0)
 
             _, F_spec, T_spec = spec.shape
-            pred_output_reshaped = pred_output.contiguous().view(2, num_stems * 2, F_spec, T_spec)
+            pred_output_reshaped = pred_output.contiguous().view(2, 6, F_spec, T_spec)
             pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
             if L == chunk_size:
@@ -813,7 +825,8 @@ def inference(model, checkpoint_path, input_data,
             pred_stems[0][:, start:actual_end] += stem_chunk_v[:, :usable] * w[:usable]
 
             cmask_i = pred_real[2:4] + 1j * pred_imag[2:4]
-            stem_spec_i = cmask_i * spec
+            repair_i = pred_real[4:6] + 1j * pred_imag[4:6]
+            stem_spec_i = cmask_i * spec + repair_i
             stem_chunk_i = torch.istft(stem_spec_i, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
             pred_stems[1][:, start:actual_end] += stem_chunk_i[:, :usable] * w[:usable]
 
@@ -823,9 +836,8 @@ def inference(model, checkpoint_path, input_data,
     sum_weights = sum_weights.clamp(min=1e-8)
     v_reconstructed = pred_stems[0] / sum_weights
     i_reconstructed = pred_stems[1] / sum_weights
-    residual = input_audio - (v_reconstructed + i_reconstructed)
-    pred_stems[0] = (v_reconstructed + 0.5 * residual).clamp(-1.0, 1.0)
-    pred_stems[1] = (i_reconstructed + 0.5 * residual).clamp(-1.0, 1.0)
+    pred_stems[0] = v_reconstructed.clamp(-1.0, 1.0)
+    pred_stems[1] = i_reconstructed.clamp(-1.0, 1.0)
 
     if return_tensors:
         return pred_stems
