@@ -396,21 +396,26 @@ class Dataset(Dataset):
                     if self.tracks[stem]:
                         track_info = random.choice(self.tracks[stem])
                         audio = self._load_chunk(track_info)
-                        gain = random.uniform(0.2, 1.2)
-                        audio = audio * gain
+                        if random.random() < 0.5:
+                            gain_l = random.uniform(0.2, 1.2)
+                            gain_r = random.uniform(0.2, 1.2)
+                            audio = audio * torch.tensor([[gain_l], [gain_r]])
+                        else:
+                            gain = random.uniform(0.2, 1.2)
+                            audio = audio * gain
                         if random.random() < 0.5:
                             n_steps = random.uniform(-3.0, 3.0)
                             audio = safe_pitch_shift(audio, n_steps)
                         if random.random() < 0.5:
                             audio = -audio
                         if random.random() < 0.5:
-                            if random.random() < 0.5:
-                                audio = audio.flip(0)
-                            pan = random.uniform(-0.5, 0.5)
-                            if pan > 0:
-                                audio = audio * torch.tensor([[1.0 - pan], [1.0]])
-                            else:
-                                audio = audio * torch.tensor([[1.0], [1.0 + pan]])
+                            theta = random.uniform(0.0, math.pi / 2)
+                            phi = random.uniform(0.0, math.pi / 2)
+                            left, right = audio[0], audio[1]
+                            audio = torch.stack([
+                                math.cos(theta) * left + math.sin(theta) * right,
+                                math.sin(phi) * left + math.cos(phi) * right
+                            ])
                         target_audios.append(audio)
                     else:
                         target_audios.append(torch.zeros(2, self.segment_length))
