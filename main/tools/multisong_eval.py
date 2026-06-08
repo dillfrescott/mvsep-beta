@@ -7,12 +7,21 @@ import torchaudio
 from tqdm import tqdm
 import warnings
 from torch.cuda.amp import autocast
+import mvsep
 from mvsep import NeuralModel, clean_state_dict, inference as mvsep_inference
 
 warnings.filterwarnings("ignore")
 
 def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=264600, overlap=88200, device='cpu'):
-    stems = checkpoint_data.get('stems', ['vocals', 'other'])
+    stems = checkpoint_data.get('stems')
+    if stems is None:
+        sources = model.sources if hasattr(model, 'sources') else 2
+        if sources == 2:
+            stems = ['vocals', 'other']
+        else:
+            stems = [f'stem_{i}' for i in range(sources)]
+            
+    mvsep.STEMS = stems
     num_stems = len(stems)
     if 'ema_state_dict' in checkpoint_data:
         print("Loading EMA weights for inference.")
@@ -88,17 +97,23 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     checkpoint_data = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
-    stems = checkpoint_data.get('stems', ['vocals', 'other'])
     
-    # Dynamically determine the correct number of sources from checkpoint to avoid shape mismatch
     state_dict = checkpoint_data.get('model_state_dict', checkpoint_data.get('ema_state_dict', {}))
-    sources = 3  # default fallback
+    sources = 3
     for k in state_dict.keys():
         if k.endswith('proj_to_pixel_shuffle.weight'):
             out_channels = state_dict[k].shape[0]
             sources = out_channels // 48
             break
             
+    stems = checkpoint_data.get('stems')
+    if stems is None:
+        if sources == 2:
+            stems = ['vocals', 'other']
+        else:
+            stems = [f'stem_{i}' for i in range(sources)]
+            
+    mvsep.STEMS = stems
     model = NeuralModel(sources=sources)
 
     if args.infer:
