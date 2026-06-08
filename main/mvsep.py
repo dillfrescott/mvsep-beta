@@ -18,6 +18,8 @@ from torchaudio.functional.functional import _stretch_waveform, _fix_waveform_sh
 
 warnings.filterwarnings("ignore")
 
+STEMS = ['vocals', 'other']
+
 class PoPE(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
@@ -143,7 +145,7 @@ class NeuralModel(nn.Module):
     def __init__(
         self,
         in_channels=2,
-        sources=3,
+        sources=len(STEMS),
         freq_bins=2049,
         embed_dim=384,
         depth=8,
@@ -213,15 +215,7 @@ class NeuralModel(nn.Module):
         elif x.shape[2] > self.freq_bins:
             x = x[:, :, :self.freq_bins, :]
 
-        masks = torch.tanh(x[:, :8])
-        repair = x[:, 8:]
-
-        masks_real = masks[:, 0:4]
-        masks_imag = masks[:, 4:8]
-        repair_real = repair[:, 0:2]
-        repair_imag = repair[:, 2:4]
-
-        return torch.cat([masks_real, repair_real, masks_imag, repair_imag], dim=1)
+        return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
     def __init__(self, fft_sizes, hop_sizes, win_lengths):
@@ -270,7 +264,7 @@ def loss_fn(pred_output,
 
     B, _, F_dim, T = pred_output.shape
     num_stems = target_audios.shape[1]
-    pred_output_reshaped = pred_output.contiguous().view(B, 2, 6, F_dim, T)
+    pred_output_reshaped = pred_output.contiguous().view(B, 2, num_stems * 2, F_dim, T)
     pred_real = pred_output_reshaped[:, 0]
     pred_imag = pred_output_reshaped[:, 1]
 
@@ -282,11 +276,7 @@ def loss_fn(pred_output,
     total_loss = 0.0
     for i in range(num_stems):
         cmask = pred_real[:, 2*i:2*i+2] + 1j * pred_imag[:, 2*i:2*i+2]
-        if i == 0:
-            stem_spec_pred = cmask * mixture_spec
-        else:
-            repair = pred_real[:, 4:6] + 1j * pred_imag[:, 4:6]
-            stem_spec_pred = cmask * mixture_spec + repair
+        stem_spec_pred = cmask * mixture_spec
 
         B_s, C_s, freq, T_spec = stem_spec_pred.shape
         stem_spec_pred_reshaped = stem_spec_pred.reshape(B_s * C_s, freq, T_spec)
@@ -337,7 +327,7 @@ class Dataset(Dataset):
         self.hop_length = 1024
         self.window = torch.hann_window(self.n_fft)
 
-        self.stems = ['vocals', 'other']
+        self.stems = STEMS
         self.tracks = {stem: [] for stem in self.stems}
 
         track_dirs = [os.path.join(root_dir, track) for track in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, track))]
@@ -452,15 +442,14 @@ def validate(model, test_dir, device, chunk_size, overlap):
         return 0.0
 
     total_sdr, count = 0.0, 0
-    stems = ['vocals', 'other']
-    num_stems = len(stems)
+    num_stems = len(STEMS)
     total_stems_sdr = [0.0] * num_stems
 
     with tqdm(track_dirs, desc="Validating", leave=False) as pbar:
         for track_dir in pbar:
             try:
                 gt_audios = []
-                for stem in stems:
+                for stem in STEMS:
                     path = next(os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.startswith(stem) and f.endswith(('.wav', '.flac')))
                     audio_np, sr = sf.read(path, dtype='float32')
                     audio = torch.from_numpy(audio_np)
@@ -485,7 +474,7 @@ def validate(model, test_dir, device, chunk_size, overlap):
                 track_sdr = sum(stems_sdr) / num_stems
                 total_sdr += track_sdr
                 count += 1
-                sdr_info = " | ".join([f"{stems[i].capitalize()}: {stems_sdr[i]:.4f} SDR" for i in range(num_stems)])
+                sdr_info = " | ".join([f"{STEMS[i].capitalize()}: {stems_sdr[i]:.4f} SDR" for i in range(num_stems)])
                 pbar.set_postfix_str(sdr_info)
             except Exception:
                 continue
@@ -635,7 +624,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                     'ema_state_dict': clean_state_dict(ema.state_dict()),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
-                    'stems': ['vocals', 'other']
+                    'stems': STEMS
                 }
 
                 reg_checkpoint_path = f"ckpts/checkpoint_step_{step}.pt"
@@ -652,8 +641,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                 avg_stems_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
                 ema.restore()
 
-                stems = ['vocals', 'other']
-                sdr_str = ", ".join([f"{stems[i].capitalize()} SDR: {avg_stems_sdr[i]:.4f}" for i in range(len(stems))])
+                sdr_str = ", ".join([f"{STEMS[i].capitalize()} SDR: {avg_stems_sdr[i]:.4f}" for i in range(len(STEMS))])
                 print(f"\nValidation Step {step} (EMA): {sdr_str}, Combined SDR: {avg_combined_sdr:.4f}")
 
                 best_sdr_checkpoints = []
@@ -720,12 +708,14 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
 
 def inference(model, checkpoint_path, input_data,
               chunk_size=485100, overlap=88200, device='cpu', return_tensors=False):
+    global STEMS
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if 'stems' in checkpoint_data:
+            STEMS = checkpoint_data['stems']
         model.load_state_dict(clean_state_dict(checkpoint_data['model_state_dict']), strict=False)
 
-    stems = ['vocals', 'other']
-    num_stems = len(stems)
+    num_stems = len(STEMS)
     model.eval().to(device)
 
     if isinstance(input_data, str):
@@ -798,7 +788,7 @@ def inference(model, checkpoint_path, input_data,
                     pred_output = model(spec.unsqueeze(0)).squeeze(0)
 
             _, F_spec, T_spec = spec.shape
-            pred_output_reshaped = pred_output.contiguous().view(2, 6, F_spec, T_spec)
+            pred_output_reshaped = pred_output.contiguous().view(2, num_stems * 2, F_spec, T_spec)
             pred_real, pred_imag = pred_output_reshaped[0], pred_output_reshaped[1]
 
             if L == chunk_size:
@@ -819,37 +809,34 @@ def inference(model, checkpoint_path, input_data,
             actual_end = min(start + L, total_length)
             usable = actual_end - start
 
-            cmask_v = pred_real[0:2] + 1j * pred_imag[0:2]
-            stem_spec_v = cmask_v * spec
-            stem_chunk_v = torch.istft(stem_spec_v, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
-            pred_stems[0][:, start:actual_end] += stem_chunk_v[:, :usable] * w[:usable]
-
-            cmask_i = pred_real[2:4] + 1j * pred_imag[2:4]
-            repair_i = pred_real[4:6] + 1j * pred_imag[4:6]
-            stem_spec_i = cmask_i * spec + repair_i
-            stem_chunk_i = torch.istft(stem_spec_i, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
-            pred_stems[1][:, start:actual_end] += stem_chunk_i[:, :usable] * w[:usable]
+            for j in range(num_stems):
+                cmask = pred_real[2*j:2*j+2] + 1j * pred_imag[2*j:2*j+2]
+                stem_spec = cmask * spec
+                stem_chunk_full = torch.istft(stem_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
+                pred_stems[j][:, start:actual_end] += stem_chunk_full[:, :usable] * w[:usable]
 
             sum_weights[start:actual_end] += w[:usable]
             pbar.update(1)
 
     sum_weights = sum_weights.clamp(min=1e-8)
-    v_reconstructed = pred_stems[0] / sum_weights
-    i_reconstructed = pred_stems[1] / sum_weights
-    pred_stems[0] = v_reconstructed.clamp(-1.0, 1.0)
-    pred_stems[1] = i_reconstructed.clamp(-1.0, 1.0)
+    for j in range(num_stems):
+        pred_stems[j] = (pred_stems[j] / sum_weights).clamp(-1.0, 1.0)
 
     if return_tensors:
         return pred_stems
     else:
         os.makedirs('outputs', exist_ok=True)
-        for j, stem_name in enumerate(stems):
+        for j, stem_name in enumerate(STEMS):
             path = os.path.join('outputs', f"{stem_name}.wav")
             print(f"Saving {stem_name} to {path}...")
             sf.write(path, pred_stems[j].cpu().numpy().T, 44100)
         print("Done.")
 
 def main():
+    if len(STEMS) < 2:
+        print("Error: At least 2 stems must be defined in STEMS.")
+        return
+
     parser = argparse.ArgumentParser(description='Train or run inference on a source separation model.')
     parser.add_argument('--train', action='store_true', help='Train the model.')
     parser.add_argument('--infer', action='store_true', help='Run inference.')
