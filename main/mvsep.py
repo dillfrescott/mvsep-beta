@@ -13,8 +13,6 @@ import random
 import math
 import re
 import warnings
-from fractions import Fraction
-from torchaudio.functional.functional import _stretch_waveform, _fix_waveform_shape, resample
 
 warnings.filterwarnings("ignore")
 
@@ -291,31 +289,6 @@ def loss_fn(pred_output,
 
     return total_loss
 
-def safe_pitch_shift(
-    waveform,
-    n_steps,
-    bins_per_octave=12,
-    n_fft=2048,
-    win_length=None,
-    hop_length=None,
-    window=None,
-):
-    waveform_stretch = _stretch_waveform(
-        waveform,
-        n_steps,
-        bins_per_octave,
-        n_fft,
-        win_length,
-        hop_length,
-        window,
-    )
-    rate = 2.0 ** (-float(n_steps) / bins_per_octave)
-    frac = Fraction(rate).limit_denominator(256)
-    orig_freq = frac.denominator
-    new_freq = frac.numerator
-    waveform_shift = resample(waveform_stretch, orig_freq, new_freq)
-    return _fix_waveform_shape(waveform_shift, waveform.size())
-
 class Dataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=264600, segment=True):
         self.root_dir = root_dir
@@ -389,44 +362,45 @@ class Dataset(Dataset):
         return self.size
 
     def __getitem__(self, idx):
-        while True:
-            try:
-                target_audios = []
-                for stem in self.stems:
-                    if self.tracks[stem]:
-                        track_info = random.choice(self.tracks[stem])
-                        audio = self._load_chunk(track_info)
-                        if random.random() < 0.5:
-                            gain_l = random.uniform(0.2, 1.2)
-                            gain_r = random.uniform(0.2, 1.2)
-                            audio = audio * torch.tensor([[gain_l], [gain_r]])
+            while True:
+                try:
+                    target_audios = []
+                    
+                    global_gain = random.uniform(0.6, 1.1)
+                    swap_channels = random.random() < 0.5
+                    
+                    for stem in self.stems:
+                        if self.tracks[stem]:
+                            track_info = random.choice(self.tracks[stem])
+                            audio = self._load_chunk(track_info)
+                            
+                            stem_gain = random.uniform(0.7, 1.3)
+                            audio = audio * stem_gain
+                            
+                            if random.random() < 0.3:
+                                audio = -audio
+                                
+                            target_audios.append(audio)
                         else:
-                            gain = random.uniform(0.2, 1.2)
-                            audio = audio * gain
-                        if random.random() < 0.5:
-                            n_steps = random.uniform(-3.0, 3.0)
-                            audio = safe_pitch_shift(audio, n_steps)
-                        if random.random() < 0.5:
-                            audio = -audio
-                        if random.random() < 0.5:
-                            theta = random.uniform(0.0, math.pi / 2)
-                            phi = random.uniform(0.0, math.pi / 2)
-                            left, right = audio[0], audio[1]
-                            audio = torch.stack([
-                                math.cos(theta) * left + math.sin(theta) * right,
-                                math.sin(phi) * left + math.cos(phi) * right
-                            ])
-                        target_audios.append(audio)
-                    else:
-                        target_audios.append(torch.zeros(2, self.segment_length))
+                            target_audios.append(torch.zeros(2, self.segment_length))
 
-                mixture_seg = torch.stack(target_audios).sum(dim=0)
-                mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
-                                          window=self.window, return_complex=True, center=True)
+                    mixture_seg = torch.stack(target_audios).sum(dim=0)
+                    
+                    mixture_seg = mixture_seg * global_gain
+                    for j in range(len(target_audios)):
+                        target_audios[j] = target_audios[j] * global_gain
+                    
+                    if swap_channels:
+                        mixture_seg = mixture_seg.flip(0)
+                        for j in range(len(target_audios)):
+                            target_audios[j] = target_audios[j].flip(0)
 
-                return mixture_spec, torch.stack(target_audios)
-            except Exception:
-                continue
+                    mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
+                                              window=self.window, return_complex=True, center=True)
+
+                    return mixture_spec, torch.stack(target_audios)
+                except Exception:
+                    continue
 
 def calculate_sdr(pred, target, epsilon=1e-8):
     noise = pred - target
