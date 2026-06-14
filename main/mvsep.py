@@ -22,19 +22,18 @@ class PoPE(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
         self.heads = heads
-        self.dim = dim
+        self.dim = dim // 2
 
-        inv_freqs = 10000 ** -(torch.arange(0, dim, 1).float() / dim)
+        inv_freqs = 10000 ** -(torch.arange(0, self.dim, 1).float() / self.dim)
         self.register_buffer('inv_freqs', inv_freqs)
 
-        self.bias = nn.Parameter(torch.zeros(heads, dim))
+        self.bias = nn.Parameter(torch.zeros(heads, self.dim))
 
     def forward(self, seq_len, device):
         pos = torch.arange(seq_len, device=device, dtype=self.inv_freqs.dtype)
         freqs = torch.einsum("i,j->ij", pos, self.inv_freqs)
 
         bias = self.bias.clamp(-2 * math.pi, 0)
-
         freqs_with_bias = freqs.unsqueeze(0) + bias.unsqueeze(1)
 
         return freqs, freqs_with_bias
@@ -43,81 +42,80 @@ def apply_pope(q, k, freqs, freqs_with_bias):
     q_mag = F.softplus(q.float())
     k_mag = F.softplus(k.float())
 
-    q_phase = freqs.unsqueeze(0).unsqueeze(0).float()
-    k_phase = freqs_with_bias.unsqueeze(0).float()
+    B, H, L, D = q.shape
+    half_D = D // 2
 
-    q_complex = torch.polar(q_mag, q_phase)
-    k_complex = torch.polar(k_mag, k_phase)
+    q_mag_r, q_mag_i = q_mag[..., :half_D], q_mag[..., half_D:]
+    k_mag_r, k_mag_i = k_mag[..., :half_D], k_mag[..., half_D:]
 
-    q_embed = torch.view_as_real(q_complex).flatten(-2)
-    k_embed = torch.view_as_real(k_complex).flatten(-2)
+    q_phase = freqs.view(1, 1, L, half_D).to(dtype=q_mag.dtype)
+    k_phase = freqs_with_bias.view(1, H, L, half_D).to(dtype=k_mag.dtype)
+
+    cos_q, sin_q = torch.cos(q_phase), torch.sin(q_phase)
+    cos_k, sin_k = torch.cos(k_phase), torch.sin(k_phase)
+
+    q_out_r = q_mag_r * cos_q
+    q_out_i = q_mag_i * sin_q
+    k_out_r = k_mag_r * cos_k
+    k_out_i = k_mag_i * sin_k
+
+    q_embed = torch.cat([q_out_r, q_out_i], dim=-1)
+    k_embed = torch.cat([k_out_r, k_out_i], dim=-1)
 
     return q_embed.type_as(q), k_embed.type_as(k)
 
-class Attention(nn.Module):
-    def __init__(self, dim, heads=8):
+class PoPEAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
         super().__init__()
-        self.heads = heads
-        self.head_dim = dim // heads
+        assert d_model % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
 
-        self.wq = nn.Linear(dim, dim, bias=False)
-        self.wk = nn.Linear(dim, dim, bias=False)
-        self.wv = nn.Linear(dim, dim, bias=False)
-
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.pope = PoPE(self.head_dim, heads)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        self.pope = PoPE(dim=self.head_dim, heads=num_heads)
 
     def forward(self, x):
-        B, S, C = x.shape
-        H, D = self.heads, self.head_dim
+        B, L, E = x.shape
+        
+        q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        q = self.wq(x).view(B, S, H, D).transpose(1, 2)
-        k = self.wk(x).view(B, S, H, D).transpose(1, 2)
-        v = self.wv(x).view(B, S, H, D).transpose(1, 2)
+        freqs, freqs_with_bias = self.pope(L, x.device)
+        
+        q, k = apply_pope(q, k, freqs, freqs_with_bias)
 
-        freqs, bias = self.pope(S, x.device)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).contiguous().view(B, L, E)
+        return self.o_proj(out)
 
-        q, k = apply_pope(q, k, freqs, bias)
-
-        out = F.scaled_dot_product_attention(q, k, v, scale=(2*D)**-0.5)
-
-        out = out.transpose(1, 2).reshape(B, S, C)
-
-        return self.out_proj(out)
-
-class GatedFF(nn.Module):
-    def __init__(self, dim, hidden_dim=None):
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, num_heads):
         super().__init__()
-
-        if hidden_dim is None:
-            hidden_dim = int(8 * dim / 3)
-
-        self.gate_proj = nn.Linear(dim, hidden_dim)
-        self.up_proj = nn.Linear(dim, hidden_dim)
-        self.down_proj = nn.Linear(hidden_dim, dim)
-
-    def forward(self, x):
-        return self.down_proj(F.gelu(self.gate_proj(x)) * self.up_proj(x))
-
-class EncoderLayer(nn.Module):
-    def __init__(self, dim, heads):
-        super().__init__()
-        self.norm1 = nn.RMSNorm(dim)
-        self.attn = Attention(dim, heads)
-        self.norm2 = nn.RMSNorm(dim)
-        self.ff = GatedFF(dim)
+        self.norm1 = nn.RMSNorm(d_model)
+        self.attn = PoPEAttention(d_model, num_heads)
+        self.norm2 = nn.RMSNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model),
+        )
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
-        x = x + self.ff(self.norm2(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 class DualPathEncoder(nn.Module):
-    def __init__(self, dim, depth, heads, use_checkpoint=False):
+    def __init__(self, dim, depth, num_heads, use_checkpoint=False):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        self.time_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
-        self.freq_layers = nn.ModuleList([EncoderLayer(dim, heads) for _ in range(depth)])
+        self.time_layers = nn.ModuleList([TransformerBlock(d_model=dim, num_heads=num_heads) for _ in range(depth)])
+        self.freq_layers = nn.ModuleList([TransformerBlock(d_model=dim, num_heads=num_heads) for _ in range(depth)])
         self.norm = nn.RMSNorm(dim)
 
     def forward(self, x):
@@ -145,9 +143,9 @@ class NeuralModel(nn.Module):
         in_channels=2,
         sources=len(STEMS),
         freq_bins=2049,
-        embed_dim=384,
-        depth=8,
-        heads=8,
+        embed_dim=256,
+        depth=12,
+        num_heads=8,
         use_checkpoint=False,
         downsample=12
     ):
@@ -171,7 +169,7 @@ class NeuralModel(nn.Module):
         self.model = DualPathEncoder(
             dim=embed_dim,
             depth=depth,
-            heads=heads,
+            num_heads=num_heads,
             use_checkpoint=use_checkpoint
         )
 
@@ -291,7 +289,6 @@ def loss_fn(pred_output,
 
 class Dataset(Dataset):
     def __init__(self, root_dir, sample_rate=44100, segment_length=264600, segment=True):
-        self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
         self.segment = segment
@@ -315,7 +312,8 @@ class Dataset(Dataset):
 
         self.size = 50000
 
-    def _find_audio_file(self, directory, base_name):
+    @staticmethod
+    def _find_audio_file(directory, base_name):
         for ext in ['.wav', '.flac']:
             path = os.path.join(directory, base_name + ext)
             if os.path.exists(path):
@@ -361,46 +359,24 @@ class Dataset(Dataset):
     def __len__(self):
         return self.size
 
-    def __getitem__(self, idx):
-            while True:
-                try:
-                    target_audios = []
-                    
-                    global_gain = random.uniform(0.6, 1.1)
-                    swap_channels = random.random() < 0.5
-                    
-                    for stem in self.stems:
-                        if self.tracks[stem]:
-                            track_info = random.choice(self.tracks[stem])
-                            audio = self._load_chunk(track_info)
-                            
-                            stem_gain = random.uniform(0.7, 1.3)
-                            audio = audio * stem_gain
-                            
-                            if random.random() < 0.3:
-                                audio = -audio
-                                
-                            target_audios.append(audio)
-                        else:
-                            target_audios.append(torch.zeros(2, self.segment_length))
+    def __getitem__(self, _):
+        while True:
+            try:
+                target_audios = []
+                for stem in self.stems:
+                    if self.tracks[stem]:
+                        track_info = random.choice(self.tracks[stem])
+                        target_audios.append(self._load_chunk(track_info))
+                    else:
+                        target_audios.append(torch.zeros(2, self.segment_length))
 
-                    mixture_seg = torch.stack(target_audios).sum(dim=0)
-                    
-                    mixture_seg = mixture_seg * global_gain
-                    for j in range(len(target_audios)):
-                        target_audios[j] = target_audios[j] * global_gain
-                    
-                    if swap_channels:
-                        mixture_seg = mixture_seg.flip(0)
-                        for j in range(len(target_audios)):
-                            target_audios[j] = target_audios[j].flip(0)
+                mixture_seg = torch.stack(target_audios).sum(dim=0)
+                mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
+                                          window=self.window, return_complex=True, center=True)
 
-                    mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
-                                              window=self.window, return_complex=True, center=True)
-
-                    return mixture_spec, torch.stack(target_audios)
-                except Exception:
-                    continue
+                return mixture_spec, torch.stack(target_audios)
+            except Exception:
+                continue
 
 def calculate_sdr(pred, target, epsilon=1e-8):
     noise = pred - target
@@ -825,14 +801,14 @@ def main():
     parser.add_argument('--checkpoint_steps', type=int, default=4000, help='Save a checkpoint every X steps.')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Specific checkpoint path to resume training or for inference. Overrides automatic selection.')
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input audio file for inference.')
-    parser.add_argument('--num_workers', type=int, default=16, help='Number of data loading workers.')
+    parser.add_argument('--num_workers', type=int, default=8, help='Number of data loading workers.')
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     parser.add_argument('--latest', action='store_true', help='Use the latest checkpoint for inference instead of the best SDR one.')
     parser.add_argument('--ckpt', action='store_true', help='Enable gradient checkpointing to reduce memory usage during training.')
 
     args = parser.parse_args()
 
-    segment_length = 264600
+    segment_length = 441000
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)

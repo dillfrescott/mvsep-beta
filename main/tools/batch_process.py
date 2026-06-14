@@ -12,7 +12,7 @@ from mvsep import NeuralModel, clean_state_dict, inference as mvsep_inference
 
 warnings.filterwarnings("ignore")
 
-def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=264600, overlap=88200, device='cpu'):
+def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=441000, overlap=88200, device='cpu'):
     stems = checkpoint_data.get('stems')
     if stems is None:
         sources = model.sources if hasattr(model, 'sources') else 2
