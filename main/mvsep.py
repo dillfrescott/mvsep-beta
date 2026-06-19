@@ -526,7 +526,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
                     os.remove(regular_checkpoints[0])
 
                 ema.apply_shadow()
-                avg_stems_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=88200)
+                avg_stems_sdr, avg_combined_sdr = validate(model, args.test_dir, device, segment_length, overlap=44100)
                 ema.restore()
 
                 sdr_str = ", ".join([f"{STEMS[i].capitalize()} SDR: {avg_stems_sdr[i]:.4f}" for i in range(len(STEMS))])
@@ -595,7 +595,7 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
     return best_ckpt
 
 def inference(model, checkpoint_path, input_data,
-              chunk_size=485100, overlap=88200, device='cpu', return_tensors=False):
+              chunk_size=485100, overlap=44100, device='cpu', return_tensors=False):
     global STEMS
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
