@@ -9,7 +9,6 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from adam_atan2_pytorch import AdamAtan2
 from torch.cuda.amp import autocast, GradScaler
-from poly_attention import PolyAttention
 import random
 import math
 import re
@@ -19,11 +18,86 @@ warnings.filterwarnings("ignore")
 
 STEMS = ['vocals', 'other']
 
+class PoPE(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.heads = heads
+        self.dim = dim // 2
+
+        inv_freqs = 10000 ** -(torch.arange(0, self.dim, 1).float() / self.dim)
+        self.register_buffer('inv_freqs', inv_freqs)
+
+        self.bias = nn.Parameter(torch.zeros(heads, self.dim))
+
+    def forward(self, seq_len, device):
+        pos = torch.arange(seq_len, device=device, dtype=self.inv_freqs.dtype)
+        freqs = torch.einsum("i,j->ij", pos, self.inv_freqs)
+
+        bias = self.bias.clamp(-2 * math.pi, 0)
+        freqs_with_bias = freqs.unsqueeze(0) + bias.unsqueeze(1)
+
+        return freqs, freqs_with_bias
+
+def apply_pope(q, k, freqs, freqs_with_bias):
+    q_mag = F.softplus(q.float())
+    k_mag = F.softplus(k.float())
+
+    B, H, L, D = q.shape
+    half_D = D // 2
+
+    q_mag_r, q_mag_i = q_mag[..., :half_D], q_mag[..., half_D:]
+    k_mag_r, k_mag_i = k_mag[..., :half_D], k_mag[..., half_D:]
+
+    q_phase = freqs.view(1, 1, L, half_D).to(dtype=q_mag.dtype)
+    k_phase = freqs_with_bias.view(1, H, L, half_D).to(dtype=k_mag.dtype)
+
+    cos_q, sin_q = torch.cos(q_phase), torch.sin(q_phase)
+    cos_k, sin_k = torch.cos(k_phase), torch.sin(k_phase)
+
+    q_out_r = q_mag_r * cos_q
+    q_out_i = q_mag_i * sin_q
+    k_out_r = k_mag_r * cos_k
+    k_out_i = k_mag_i * sin_k
+
+    q_embed = torch.cat([q_out_r, q_out_i], dim=-1)
+    k_embed = torch.cat([k_out_r, k_out_i], dim=-1)
+
+    return q_embed.type_as(q), k_embed.type_as(k)
+
+class PoPEAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        self.pope = PoPE(dim=self.head_dim, heads=num_heads)
+
+    def forward(self, x):
+        B, L, E = x.shape
+        
+        q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+
+        freqs, freqs_with_bias = self.pope(L, x.device)
+        
+        q, k = apply_pope(q, k, freqs, freqs_with_bias)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).contiguous().view(B, L, E)
+        return self.o_proj(out)
+
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
-        self.attn = PolyAttention(dim=d_model, heads=num_heads, causal=False, use_rotary_embed=True)
+        self.attn = PoPEAttention(d_model, num_heads)
         self.norm2 = nn.RMSNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
@@ -70,7 +144,7 @@ class NeuralModel(nn.Module):
         sources=len(STEMS),
         freq_bins=2049,
         embed_dim=256,
-        depth=8,
+        depth=12,
         num_heads=8,
         use_checkpoint=False,
         downsample=12
@@ -741,7 +815,7 @@ def main():
 
     args = parser.parse_args()
 
-    segment_length = 264600
+    segment_length = 529200
 
     os.makedirs('ckpts', exist_ok=True)
     os.makedirs('best_ckpts', exist_ok=True)
