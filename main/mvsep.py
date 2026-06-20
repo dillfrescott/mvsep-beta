@@ -101,7 +101,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.RMSNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(d_model * 4, d_model),
         )
 
