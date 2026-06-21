@@ -772,9 +772,7 @@ def inference(model, checkpoint_path, input_data,
             usable = actual_end - start
 
             for j in range(num_stems):
-                real_part = pred_real[2*j:2*j+2].float()
-                imag_part = pred_imag[2*j:2*j+2].float()
-                cmask = torch.complex(real_part, imag_part)
+                cmask = pred_real[2*j:2*j+2] + 1j * pred_imag[2*j:2*j+2]
                 stem_spec = cmask * spec
                 stem_chunk_full = torch.istft(stem_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
                 pred_stems[j][:, start:actual_end] += stem_chunk_full[:, :usable] * w[:usable]
