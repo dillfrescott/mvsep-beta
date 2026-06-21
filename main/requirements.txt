@@ -6,4 +6,3 @@ einops
 triton # triton-windows for windows
 soundfile
 tqdm
-poly-attention==0.0.8
