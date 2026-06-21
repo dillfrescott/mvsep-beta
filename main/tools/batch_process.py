@@ -6,7 +6,6 @@ import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
 import warnings
-from torch.cuda.amp import autocast
 import mvsep
 from mvsep import NeuralModel, clean_state_dict, inference as mvsep_inference
 
