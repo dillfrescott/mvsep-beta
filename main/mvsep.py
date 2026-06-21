@@ -739,14 +739,8 @@ def inference(model, checkpoint_path, input_data,
 
             spec = torch.stft(padded_chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
 
-            device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
-            if device_type == 'cuda' and torch.cuda.is_bf16_supported():
-                autocast_ctx = autocast(dtype=torch.bfloat16)
-            else:
-                autocast_ctx = autocast()
-
             with torch.no_grad():
-                with autocast_ctx:
+                with autocast(dtype=torch.float32):
                     pred_output = model(spec.unsqueeze(0)).squeeze(0)
 
             _, F_spec, T_spec = spec.shape
