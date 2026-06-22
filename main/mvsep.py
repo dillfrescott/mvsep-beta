@@ -368,7 +368,7 @@ class Dataset(Dataset):
         while True:
             try:
                 target_audios = []
-                if random.random() < 0.2:
+                if random.random() < 0.3:
                     for stem in self.stems:
                         track = random.choice(self.tracks)
                         total_frames = track[stem]['frames']
