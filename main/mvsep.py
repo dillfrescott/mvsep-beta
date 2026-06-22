@@ -368,14 +368,24 @@ class Dataset(Dataset):
         while True:
             try:
                 target_audios = []
-                track = random.choice(self.tracks)
-                ref_frames = min(track[stem]['frames'] for stem in self.stems)
-                if ref_frames > self.segment_length and self.segment:
-                    start_frame = random.randint(0, ref_frames - self.segment_length)
+                if random.random() < 0.2:
+                    for stem in self.stems:
+                        track = random.choice(self.tracks)
+                        total_frames = track[stem]['frames']
+                        if total_frames > self.segment_length and self.segment:
+                            start_frame = random.randint(0, total_frames - self.segment_length)
+                        else:
+                            start_frame = None
+                        target_audios.append(self._load_chunk(track[stem], start_frame=start_frame))
                 else:
-                    start_frame = None
-                for stem in self.stems:
-                    target_audios.append(self._load_chunk(track[stem], start_frame=start_frame))
+                    track = random.choice(self.tracks)
+                    ref_frames = min(track[stem]['frames'] for stem in self.stems)
+                    if ref_frames > self.segment_length and self.segment:
+                        start_frame = random.randint(0, ref_frames - self.segment_length)
+                    else:
+                        start_frame = None
+                    for stem in self.stems:
+                        target_audios.append(self._load_chunk(track[stem], start_frame=start_frame))
 
                 mixture_seg = torch.stack(target_audios).sum(dim=0)
                 mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
