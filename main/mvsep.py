@@ -214,19 +214,16 @@ class NeuralModel(nn.Module):
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
-    def __init__(self, fft_sizes, hop_sizes, win_lengths):
+    def __init__(self, win_lengths, hop_length, n_fft_base=4096):
         super(MultiResolutionComplexSTFTLoss, self).__init__()
-        assert len(fft_sizes) == len(hop_sizes) == len(win_lengths)
-        self.fft_sizes = fft_sizes
-        self.hop_sizes = hop_sizes
         self.win_lengths = win_lengths
-        inv = torch.tensor([1.0 / n for n in fft_sizes])
-        self.register_buffer('weights', inv / inv.sum(), persistent=False)
+        self.hop_length = hop_length
+        self.n_fft_base = n_fft_base
         for i, win_len in enumerate(win_lengths):
             self.register_buffer(f'window_{i}', torch.hann_window(win_len), persistent=False)
 
     def forward(self, y_pred, y_true):
-        complex_loss_total = 0.0
+        loss_total = 0.0
 
         if y_pred.dim() == 2:
             y_pred = y_pred.unsqueeze(1)
@@ -236,20 +233,20 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
         y_pred_flat = y_pred.reshape(B * C, L)
         y_true_flat = y_true.reshape(B * C, L)
 
-        for i, (n_fft, hop_length, win_length) in enumerate(zip(self.fft_sizes, self.hop_sizes, self.win_lengths)):
+        for i, win_len in enumerate(self.win_lengths):
             window = getattr(self, f'window_{i}')
+            n_fft = max(win_len, self.n_fft_base)
 
-            stft_pred = torch.stft(y_pred_flat, n_fft=n_fft, hop_length=hop_length,
-                                   win_length=win_length, window=window, return_complex=True, center=True)
-            stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
-                                   win_length=win_length, window=window, return_complex=True, center=True)
+            stft_pred = torch.stft(y_pred_flat, n_fft=n_fft, hop_length=self.hop_length,
+                                   win_length=win_len, window=window, return_complex=True, center=True, normalized=False)
+            stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=self.hop_length,
+                                   win_length=win_len, window=window, return_complex=True, center=True, normalized=False)
 
-            real_loss = F.l1_loss(stft_pred.real, stft_true.real)
-            imag_loss = F.l1_loss(stft_pred.imag, stft_true.imag)
+            complex_l1_loss = F.l1_loss(stft_pred, stft_true)
 
-            complex_loss_total += (real_loss + imag_loss) * self.weights[i]
+            loss_total = loss_total + complex_l1_loss
 
-        return complex_loss_total
+        return loss_total
 
 def loss_fn(pred_output,
             mixture_spec,
@@ -282,8 +279,8 @@ def loss_fn(pred_output,
             window=window, center=True, length=recon_len
         ).reshape(B_s, C_s, -1)
 
-        total_loss += multi_res_complex_loss_calculator(pred_audio, target_audios[:, i])
         total_loss += F.l1_loss(pred_audio, target_audios[:, i])
+        total_loss += multi_res_complex_loss_calculator(pred_audio, target_audios[:, i])
 
     return total_loss
 
@@ -522,7 +519,7 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         'n_fft': 4096, 'hop_length': 1024, 'window': window.to(device)
     }
     multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
-        fft_sizes=[1024, 2048, 8192], hop_sizes=[256, 512, 2048], win_lengths=[1024, 2048, 8192]
+        win_lengths=[4096, 2048, 1024, 512, 256], hop_length=1024, n_fft_base=4096
     ).to(device)
 
     if checkpoint_path:
