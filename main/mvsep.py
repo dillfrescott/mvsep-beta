@@ -267,7 +267,6 @@ def loss_fn(pred_output,
     recon_len = target_audios.shape[-1]
 
     total_loss = 0.0
-    eps = 1e-7
     
     pred_wave_sum = torch.zeros(B, 2, recon_len, device=device)
 
@@ -317,16 +316,10 @@ def loss_fn(pred_output,
             target_diff_time_imag = torch.diff(target_spec.imag, dim=-1)
             target_diff_freq_imag = torch.diff(target_spec.imag, dim=-2)
 
-        if STEMS[i] == 'vocals':
-            total_loss += 0.1 * F.l1_loss(pred_diff_time_real, target_diff_time_real)
-            total_loss += 0.1 * F.l1_loss(pred_diff_time_imag, target_diff_time_imag)
-            total_loss += 0.05 * F.l1_loss(pred_diff_freq_real, target_diff_freq_real)
-            total_loss += 0.05 * F.l1_loss(pred_diff_freq_imag, target_diff_freq_imag)
-        else:
-            total_loss += 0.02 * F.l1_loss(pred_diff_time_real, target_diff_time_real)
-            total_loss += 0.02 * F.l1_loss(pred_diff_time_imag, target_diff_time_imag)
-            total_loss += 0.05 * F.l1_loss(pred_diff_freq_real, target_diff_freq_real)
-            total_loss += 0.05 * F.l1_loss(pred_diff_freq_imag, target_diff_freq_imag)
+        total_loss += 0.05 * F.l1_loss(pred_diff_time_real, target_diff_time_real)
+        total_loss += 0.05 * F.l1_loss(pred_diff_time_imag, target_diff_time_imag)
+        total_loss += 0.05 * F.l1_loss(pred_diff_freq_real, target_diff_freq_real)
+        total_loss += 0.05 * F.l1_loss(pred_diff_freq_imag, target_diff_freq_imag)
 
     true_mixture_wave = target_audios.sum(dim=1)
     
@@ -362,6 +355,42 @@ class Dataset(Dataset):
                 self.tracks.append(stem_infos)
 
         self.size = 50000
+    
+    def _apply_threshold(self, target_tensor, threshold_db=-50.0):
+        epsilon = 1e-8
+        
+        orig_shape = target_tensor.shape
+        flat_tensor = target_tensor.view(-1, orig_shape[-1])
+        
+        target_spec = torch.stft(
+            flat_tensor, 
+            n_fft=self.n_fft, 
+            hop_length=self.hop_length, 
+            window=self.window, 
+            return_complex=True, 
+            center=True
+        )
+        
+        magnitude = torch.abs(target_spec)
+        
+        max_mag = torch.max(magnitude, dim=-1, keepdim=True)[0]
+        max_mag = torch.max(max_mag, dim=-2, keepdim=True)[0]
+        
+        magnitude_db = 20 * torch.log10(magnitude / (max_mag + epsilon) + epsilon)
+        
+        mask = magnitude_db > threshold_db
+        cleaned_spec = target_spec * mask
+        
+        cleaned_audio = torch.istft(
+            cleaned_spec, 
+            n_fft=self.n_fft, 
+            hop_length=self.hop_length, 
+            window=self.window, 
+            center=True, 
+            length=orig_shape[-1]
+        )
+        
+        return cleaned_audio.view(orig_shape)
 
     @staticmethod
     def _find_audio_file(directory, base_name):
@@ -435,11 +464,14 @@ class Dataset(Dataset):
                     for stem in self.stems:
                         target_audios.append(self._load_chunk(track[stem], start_frame=start_frame))
 
-                mixture_seg = torch.stack(target_audios).sum(dim=0)
+                cleaned_targets = [self._apply_threshold(audio, threshold_db=-50.0) for audio in target_audios]
+                stacked_targets = torch.stack(cleaned_targets)
+
+                mixture_seg = stacked_targets.sum(dim=0)
                 mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                           window=self.window, return_complex=True, center=True)
 
-                return mixture_spec, torch.stack(target_audios)
+                return mixture_spec, stacked_targets
             except Exception:
                 continue
 
