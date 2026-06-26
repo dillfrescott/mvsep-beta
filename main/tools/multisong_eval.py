@@ -3,7 +3,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
+import soundfile as sf
 from tqdm import tqdm
 import warnings
 import mvsep
@@ -39,7 +39,9 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=529200, 
         input_wav_path = os.path.join(input_dir, filename)
         song_id = filename.replace('_mixture.wav', '')
 
-        input_audio, sr = torchaudio.load(input_wav_path)
+        input_audio_np, sr = sf.read(input_wav_path, dtype='float32')
+        input_audio = torch.from_numpy(input_audio_np)
+        input_audio = input_audio.unsqueeze(0) if input_audio.dim() == 1 else input_audio.t()
         if sr != 44100:
             continue
         if input_audio.shape[0] == 1:
@@ -82,8 +84,8 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=529200, 
                 instrum += distributed_stems[j]
         instrum = instrum.clamp(-1.0, 1.0)
 
-        torchaudio.save(os.path.join(output_dir, f'{song_id}_vocals.flac'), vocals.cpu(), sr)
-        torchaudio.save(os.path.join(output_dir, f'{song_id}_instrum.flac'), instrum.cpu(), sr)
+        sf.write(os.path.join(output_dir, f'{song_id}_vocals.flac'), vocals.cpu().t().numpy(), sr)
+        sf.write(os.path.join(output_dir, f'{song_id}_instrum.flac'), instrum.cpu().t().numpy(), sr)
 
 def main():
     parser = argparse.ArgumentParser()

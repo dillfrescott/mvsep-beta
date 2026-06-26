@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import soundfile as sf
 from tqdm import tqdm
 import warnings
 import mvsep
@@ -41,7 +42,9 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=529200, 
         song_output_dir = os.path.join(output_dir, wav_name)
         os.makedirs(song_output_dir, exist_ok=True)
 
-        input_audio, sr = torchaudio.load(input_path)
+        input_audio_np, sr = sf.read(input_path, dtype='float32')
+        input_audio = torch.from_numpy(input_audio_np)
+        input_audio = input_audio.unsqueeze(0) if input_audio.dim() == 1 else input_audio.t()
         if sr != 44100:
             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=44100)
             input_audio = resampler(input_audio)
@@ -66,7 +69,7 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=529200, 
         residual = input_audio - sum(pred_stems)
         for j in range(num_stems):
             res = (pred_stems[j] + (1.0 / num_stems) * residual).clamp(-1.0, 1.0)
-            torchaudio.save(os.path.join(song_output_dir, f'{stems[j]}.flac'), res.cpu(), sr, format='flac')
+            sf.write(os.path.join(song_output_dir, f'{stems[j]}.flac'), res.cpu().t().numpy(), sr)
 
 def main():
     parser = argparse.ArgumentParser()
