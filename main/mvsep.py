@@ -355,42 +355,6 @@ class Dataset(Dataset):
                 self.tracks.append(stem_infos)
 
         self.size = 50000
-    
-    def _apply_threshold(self, target_tensor, threshold_db=-50.0):
-        epsilon = 1e-8
-        
-        orig_shape = target_tensor.shape
-        flat_tensor = target_tensor.view(-1, orig_shape[-1])
-        
-        target_spec = torch.stft(
-            flat_tensor, 
-            n_fft=self.n_fft, 
-            hop_length=self.hop_length, 
-            window=self.window, 
-            return_complex=True, 
-            center=True
-        )
-        
-        magnitude = torch.abs(target_spec)
-        
-        max_mag = torch.max(magnitude, dim=-1, keepdim=True)[0]
-        max_mag = torch.max(max_mag, dim=-2, keepdim=True)[0]
-        
-        magnitude_db = 20 * torch.log10(magnitude / (max_mag + epsilon) + epsilon)
-        
-        mask = magnitude_db > threshold_db
-        cleaned_spec = target_spec * mask
-        
-        cleaned_audio = torch.istft(
-            cleaned_spec, 
-            n_fft=self.n_fft, 
-            hop_length=self.hop_length, 
-            window=self.window, 
-            center=True, 
-            length=orig_shape[-1]
-        )
-        
-        return cleaned_audio.view(orig_shape)
 
     @staticmethod
     def _find_audio_file(directory, base_name):
@@ -464,14 +428,11 @@ class Dataset(Dataset):
                     for stem in self.stems:
                         target_audios.append(self._load_chunk(track[stem], start_frame=start_frame))
 
-                cleaned_targets = [self._apply_threshold(audio, threshold_db=-50.0) for audio in target_audios]
-                stacked_targets = torch.stack(cleaned_targets)
-
-                mixture_seg = stacked_targets.sum(dim=0)
+                mixture_seg = torch.stack(target_audios).sum(dim=0)
                 mixture_spec = torch.stft(mixture_seg, n_fft=self.n_fft, hop_length=self.hop_length,
                                           window=self.window, return_complex=True, center=True)
 
-                return mixture_spec, stacked_targets
+                return mixture_spec, torch.stack(target_audios)
             except Exception:
                 continue
 
