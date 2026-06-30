@@ -18,53 +18,30 @@ warnings.filterwarnings("ignore")
 
 STEMS = ['vocals', 'other']
 
-class PoPE(nn.Module):
-    def __init__(self, dim, heads):
+class RoPE(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        self.heads = heads
-        self.dim = dim // 2
-
-        inv_freqs = 10000 ** -(torch.arange(0, self.dim, 1).float() / self.dim)
+        self.dim = dim
+        inv_freqs = 10000 ** -(torch.arange(0, self.dim, 2).float() / self.dim)
         self.register_buffer('inv_freqs', inv_freqs)
-
-        self.bias = nn.Parameter(torch.zeros(heads, self.dim))
 
     def forward(self, seq_len, device):
         pos = torch.arange(seq_len, device=device, dtype=self.inv_freqs.dtype)
         freqs = torch.einsum("i,j->ij", pos, self.inv_freqs)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos(), emb.sin()
 
-        bias = self.bias.clamp(-2 * math.pi, 0)
-        freqs_with_bias = freqs.unsqueeze(0) + bias.unsqueeze(1)
+def rotate_half(x):
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
 
-        return freqs, freqs_with_bias
+def apply_rope(x, cos, sin):
+    cos = cos.unsqueeze(0).unsqueeze(1)
+    sin = sin.unsqueeze(0).unsqueeze(1)
+    return (x * cos) + (rotate_half(x) * sin)
 
-def apply_pope(q, k, freqs, freqs_with_bias):
-    q_mag = F.softplus(q.float())
-    k_mag = F.softplus(k.float())
-
-    B, H, L, D = q.shape
-    half_D = D // 2
-
-    q_mag_r, q_mag_i = q_mag[..., :half_D], q_mag[..., half_D:]
-    k_mag_r, k_mag_i = k_mag[..., :half_D], k_mag[..., half_D:]
-
-    q_phase = freqs.view(1, 1, L, half_D).to(dtype=q_mag.dtype)
-    k_phase = freqs_with_bias.view(1, H, L, half_D).to(dtype=k_mag.dtype)
-
-    cos_q, sin_q = torch.cos(q_phase), torch.sin(q_phase)
-    cos_k, sin_k = torch.cos(k_phase), torch.sin(k_phase)
-
-    q_out_r = q_mag_r * cos_q
-    q_out_i = q_mag_i * sin_q
-    k_out_r = k_mag_r * cos_k
-    k_out_i = k_mag_i * sin_k
-
-    q_embed = torch.cat([q_out_r, q_out_i], dim=-1)
-    k_embed = torch.cat([k_out_r, k_out_i], dim=-1)
-
-    return q_embed.type_as(q), k_embed.type_as(k)
-
-class PoPEAttention(nn.Module):
+class GatedRoPEAttention(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
         assert d_model % num_heads == 0
@@ -74,9 +51,10 @@ class PoPEAttention(nn.Module):
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.g_proj = nn.Linear(d_model, d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
         
-        self.pope = PoPE(dim=self.head_dim, heads=num_heads)
+        self.rope = RoPE(dim=self.head_dim)
 
     def forward(self, x):
         B, L, E = x.shape
@@ -84,26 +62,39 @@ class PoPEAttention(nn.Module):
         q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        g = self.g_proj(x)
 
-        freqs, freqs_with_bias = self.pope(L, x.device)
+        cos, sin = self.rope(L, x.device)
+        cos, sin = cos.to(dtype=q.dtype), sin.to(dtype=k.dtype)
         
-        q, k = apply_pope(q, k, freqs, freqs_with_bias)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).contiguous().view(B, L, E)
+        
+        out = out * F.silu(g)
         return self.o_proj(out)
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, d_ff, bias=False)
+        self.w2 = nn.Linear(d_model, d_ff, bias=False)
+        self.w3 = nn.Linear(d_ff, d_model, bias=False)
+
+    def forward(self, x):
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
-        self.attn = PoPEAttention(d_model, num_heads)
+        self.attn = GatedRoPEAttention(d_model, num_heads)
         self.norm2 = nn.RMSNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.SiLU(),
-            nn.Linear(d_model * 4, d_model),
-        )
+        
+        d_ff = int(2 * (d_model * 4) / 3)
+        self.mlp = SwiGLU(d_model, d_ff)
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
@@ -144,8 +135,8 @@ class NeuralModel(nn.Module):
         sources=len(STEMS),
         freq_bins=2049,
         embed_dim=256,
-        depth=12,
-        num_heads=8,
+        depth=10,
+        num_heads=16,
         use_checkpoint=False,
         downsample=12
     ):
