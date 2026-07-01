@@ -711,7 +711,8 @@ def find_best_sdr_checkpoint(folder='best_ckpts'):
     return best_ckpt
 
 def inference(model, checkpoint_path, input_data,
-              chunk_size=485100, overlap=44100, device='cpu', return_tensors=False):
+              chunk_size=485100, overlap=44100, device='cpu', return_tensors=False,
+              softmask=True, softmask_alpha=2.0):
     global STEMS
     if checkpoint_path:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -807,9 +808,29 @@ def inference(model, checkpoint_path, input_data,
             actual_end = min(start + L, total_length)
             usable = actual_end - start
 
+            raw_stems = []
             for j in range(num_stems):
                 cmask = pred_real[2*j:2*j+2] + 1j * pred_imag[2*j:2*j+2]
-                stem_spec = cmask * spec
+                raw_stems.append(cmask * spec)
+
+            if softmask:
+                eps = 1e-12
+                mags = [torch.clamp(torch.abs(s), min=eps) for s in raw_stems]
+                
+                if softmask_alpha == 1.0:
+                    total_mag = sum(mags)
+                    scale = torch.abs(spec) / total_mag
+                    for j in range(num_stems):
+                        raw_stems[j] = raw_stems[j] * scale
+                else:
+                    mags_alpha = [m ** softmask_alpha for m in mags]
+                    total_mag_alpha = sum(mags_alpha)
+                    for j in range(num_stems):
+                        scale = (torch.abs(spec) * (mags[j] ** (softmask_alpha - 1.0))) / total_mag_alpha
+                        raw_stems[j] = raw_stems[j] * scale
+
+            for j in range(num_stems):
+                stem_spec = raw_stems[j]
                 stem_chunk_full = torch.istft(stem_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=target_length, center=True)
                 pred_stems[j][:, start:actual_end] += stem_chunk_full[:, :usable] * w[:usable]
 
@@ -848,6 +869,7 @@ def main():
     parser.add_argument('--reset_optimizer', action='store_true', help='Reset optimizer state when resuming from a checkpoint.')
     parser.add_argument('--latest', action='store_true', help='Use the latest checkpoint for inference instead of the best SDR one.')
     parser.add_argument('--ckpt', action='store_true', help='Enable gradient checkpointing to reduce memory usage during training.')
+    parser.add_argument('--softmask_alpha', type=float, default=2.0, help='Exponent for softmasking/Wiener filter. Higher values reduce leakage/bleed (default: 2.0).')
 
     args = parser.parse_args()
 
@@ -890,7 +912,8 @@ def main():
             return
 
         inference(model, checkpoint_to_load, args.input_file,
-                  chunk_size=segment_length, device=device)
+                  chunk_size=segment_length, device=device,
+                  softmask=True, softmask_alpha=args.softmask_alpha)
 
     else:
         print("Please specify either --train or --infer.")
