@@ -283,35 +283,6 @@ def loss_fn(pred_output,
         total_loss += 10.0 * F.l1_loss(pred_audio, target_audio)
         total_loss += multi_res_complex_loss_calculator(pred_audio, target_audio)
 
-        pred_mag = torch.abs(stem_spec_pred)
-        with torch.no_grad():
-            target_spec = torch.stft(
-                target_audio.reshape(B_s * C_s, -1), n_fft=n_fft, hop_length=hop_length,
-                window=window, return_complex=True, center=True
-            ).reshape(B_s, C_s, freq, T_spec)
-
-        log_pred = torch.log1p(pred_mag)
-        log_target = torch.log1p(torch.abs(target_spec))
-        total_loss += 0.02 * F.l1_loss(log_pred, log_target)
-
-        pred_spec_real = stem_spec_pred.real
-        pred_spec_imag = stem_spec_pred.imag
-        pred_diff_time_real = torch.diff(pred_spec_real, dim=-1)
-        pred_diff_freq_real = torch.diff(pred_spec_real, dim=-2)
-        pred_diff_time_imag = torch.diff(pred_spec_imag, dim=-1)
-        pred_diff_freq_imag = torch.diff(pred_spec_imag, dim=-2)
-
-        with torch.no_grad():
-            target_diff_time_real = torch.diff(target_spec.real, dim=-1)
-            target_diff_freq_real = torch.diff(target_spec.real, dim=-2)
-            target_diff_time_imag = torch.diff(target_spec.imag, dim=-1)
-            target_diff_freq_imag = torch.diff(target_spec.imag, dim=-2)
-
-        total_loss += 0.05 * F.l1_loss(pred_diff_time_real, target_diff_time_real)
-        total_loss += 0.05 * F.l1_loss(pred_diff_time_imag, target_diff_time_imag)
-        total_loss += 0.05 * F.l1_loss(pred_diff_freq_real, target_diff_freq_real)
-        total_loss += 0.05 * F.l1_loss(pred_diff_freq_imag, target_diff_freq_imag)
-
     true_mixture_wave = target_audios.sum(dim=1)
     
     mixture_consistency_loss = F.l1_loss(pred_wave_sum, true_mixture_wave)
