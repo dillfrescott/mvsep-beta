@@ -11,8 +11,7 @@ from mvsep import NeuralModel, clean_state_dict, inference as mvsep_inference
 
 warnings.filterwarnings("ignore")
 
-def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=529200, overlap=44100, device='cpu',
-              softmask=True, softmask_alpha=2.0):
+def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=529200, overlap=44100, device='cpu'):
     stems = checkpoint_data.get('stems')
     if stems is None:
         sources = model.sources if hasattr(model, 'sources') else 2
@@ -59,9 +58,7 @@ def inference(model, checkpoint_data, input_dir, output_dir, chunk_size=529200, 
                 chunk_size=chunk_size,
                 overlap=overlap,
                 device=device,
-                return_tensors=True,
-                softmask=softmask,
-                softmask_alpha=softmask_alpha
+                return_tensors=True
             )
 
         residual = input_audio - sum(pred_stems)
@@ -96,7 +93,6 @@ def main():
     parser.add_argument('--checkpoint_path', type=str, required=True)
     parser.add_argument('--input_dir', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='output')
-    parser.add_argument('--softmask_alpha', type=float, default=2.0, help='Exponent for softmasking/Wiener filter. Higher values reduce leakage/bleed (default: 2.0).')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -123,8 +119,7 @@ def main():
 
     if args.infer:
         inference(model, checkpoint_data, args.input_dir,
-                  args.output_dir, device=device,
-                  softmask=True, softmask_alpha=args.softmask_alpha)
+                  args.output_dir, device=device)
 
 if __name__ == '__main__':
     main()
