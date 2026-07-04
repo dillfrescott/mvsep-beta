@@ -205,11 +205,10 @@ class NeuralModel(nn.Module):
         return x
 
 class MultiResolutionComplexSTFTLoss(nn.Module):
-    def __init__(self, win_lengths, hop_length, n_fft_base=4096):
+    def __init__(self, win_lengths, hop_factor=4):
         super(MultiResolutionComplexSTFTLoss, self).__init__()
         self.win_lengths = win_lengths
-        self.hop_length = hop_length
-        self.n_fft_base = n_fft_base
+        self.hop_factor = hop_factor
         for i, win_len in enumerate(win_lengths):
             self.register_buffer(f'window_{i}', torch.hann_window(win_len), persistent=False)
 
@@ -226,11 +225,12 @@ class MultiResolutionComplexSTFTLoss(nn.Module):
 
         for i, win_len in enumerate(self.win_lengths):
             window = getattr(self, f'window_{i}')
-            n_fft = max(win_len, self.n_fft_base)
+            hop_length = win_len // self.hop_factor
+            n_fft = win_len
 
-            stft_pred = torch.stft(y_pred_flat, n_fft=n_fft, hop_length=self.hop_length,
+            stft_pred = torch.stft(y_pred_flat, n_fft=n_fft, hop_length=hop_length,
                                    win_length=win_len, window=window, return_complex=True, center=True, normalized=False)
-            stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=self.hop_length,
+            stft_true = torch.stft(y_true_flat, n_fft=n_fft, hop_length=hop_length,
                                    win_length=win_len, window=window, return_complex=True, center=True, normalized=False)
 
             complex_l1_loss = F.l1_loss(stft_pred, stft_true)
@@ -277,11 +277,22 @@ def loss_fn(pred_output,
         ).reshape(B_s, C_s, -1)
 
         pred_wave_sum = pred_wave_sum + pred_audio
-
         target_audio = target_audios[:, i]
 
         total_loss += 10.0 * F.l1_loss(pred_audio, target_audio)
         total_loss += multi_res_complex_loss_calculator(pred_audio, target_audio)
+
+        pred_mid = (pred_audio[:, 0] + pred_audio[:, 1]) / 2.0
+        true_mid = (target_audio[:, 0] + target_audio[:, 1]) / 2.0
+        
+        pred_side = (pred_audio[:, 0] - pred_audio[:, 1]) / 2.0
+        true_side = (target_audio[:, 0] - target_audio[:, 1]) / 2.0
+
+        total_loss += 10.0 * F.l1_loss(pred_mid, true_mid)
+        total_loss += 10.0 * F.l1_loss(pred_side, true_side)
+
+        total_loss += multi_res_complex_loss_calculator(pred_mid.unsqueeze(1), true_mid.unsqueeze(1))
+        total_loss += multi_res_complex_loss_calculator(pred_side.unsqueeze(1), true_side.unsqueeze(1))
 
     true_mixture_wave = target_audios.sum(dim=1)
     
@@ -525,7 +536,8 @@ def train(model, dataloader, optimizer, loss_fn, device, checkpoint_steps, args,
         'n_fft': 4096, 'hop_length': 1024, 'window': window.to(device)
     }
     multi_res_complex_loss_calculator = MultiResolutionComplexSTFTLoss(
-        win_lengths=[4096, 2048, 1024, 512, 256], hop_length=1024, n_fft_base=4096
+        win_lengths=[4096, 2048, 1024, 512, 256],
+        hop_factor=4
     ).to(device)
 
     if checkpoint_path:
