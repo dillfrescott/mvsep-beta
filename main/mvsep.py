@@ -135,7 +135,7 @@ class NeuralModel(nn.Module):
         sources=len(STEMS),
         freq_bins=2049,
         embed_dim=256,
-        depth=10,
+        depth=12,
         num_heads=16,
         use_checkpoint=False,
         downsample=12
