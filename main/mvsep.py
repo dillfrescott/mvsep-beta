@@ -700,7 +700,12 @@ def inference(model, checkpoint_path, input_data,
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
         if 'stems' in checkpoint_data:
             STEMS = checkpoint_data['stems']
-        model.load_state_dict(clean_state_dict(checkpoint_data['model_state_dict']), strict=False)
+        if 'ema_state_dict' in checkpoint_data:
+            model.load_state_dict(clean_state_dict(checkpoint_data['ema_state_dict']), strict=False)
+            print("Loaded EMA weights for inference.")
+        else:
+            model.load_state_dict(clean_state_dict(checkpoint_data['model_state_dict']), strict=False)
+            print("Loaded raw model weights (no EMA found) for inference.")
 
     num_stems = len(STEMS)
     model.eval().to(device)
