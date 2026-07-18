@@ -62,6 +62,7 @@ def run_external_flash_attention(
 
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
+TRAINING_LR = 1e-4
 
 
 def _environment_path_contains(variable: str, filename: str) -> bool:
@@ -1630,7 +1631,7 @@ class StemDataset(Dataset):
 
 
 # -----------------------------------------------------------------------------
-# EMA, optimizer, scheduler, checkpointing
+# EMA, optimizer, checkpointing
 # -----------------------------------------------------------------------------
 
 
@@ -1721,7 +1722,6 @@ class _EMAStateView(nn.Module):
 
 def build_optimizer(
     model: nn.Module,
-    lr: float,
     weight_decay: float,
     optimizer_name: str,
     fused: bool = False,
@@ -1746,39 +1746,17 @@ def build_optimizer(
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
     if optimizer_name == "atan2" and AdamAtan2 is not None:
-        return AdamAtan2(parameter_groups, lr=lr)
+        return AdamAtan2(parameter_groups, lr=TRAINING_LR)
     if optimizer_name == "atan2" and AdamAtan2 is None:
         print("adam_atan2_pytorch is unavailable; falling back to AdamW.")
     if fused:
         print("Optimizer: fused CUDA AdamW.")
     return torch.optim.AdamW(
         parameter_groups,
-        lr=lr,
+        lr=TRAINING_LR,
         betas=(0.9, 0.95),
         fused=fused,
     )
-
-
-def build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    max_steps: int,
-    min_lr_ratio: float,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """Linear warmup followed by cosine decay for a finite quality run."""
-    if not 0.0 <= min_lr_ratio <= 1.0:
-        raise ValueError("min_lr_ratio must be in [0, 1].")
-
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return max(1e-8, (step + 1) / max(1, warmup_steps))
-        if max_steps <= warmup_steps or max_steps <= 0:
-            return 1.0
-        progress = min(1.0, (step - warmup_steps) / (max_steps - warmup_steps))
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def find_latest_checkpoint(folder: str = "ckpts") -> str | None:
@@ -1828,7 +1806,6 @@ def save_checkpoint(
     model: BSRoFormerSeparator,
     ema: EMA,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
     step: int,
     best_sdr: float,
@@ -1840,7 +1817,6 @@ def save_checkpoint(
         "ema_state_dict": clean_state_dict(ema.state_dict()),
         "ema_updates": ema.updates,
         "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "best_sdr": best_sdr,
         "avg_loss": avg_loss,
@@ -2121,7 +2097,6 @@ def train(
     model: BSRoFormerSeparator,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
     loss_module: SeparationLoss,
     device: torch.device,
     args: argparse.Namespace,
@@ -2160,7 +2135,7 @@ def train(
         if args.reset_optimizer:
             print(
                 "Loaded exact raw weights, but --reset_optimizer starts fresh "
-                "optimizer, scheduler, EMA, and global-step timelines."
+                "optimizer, EMA, and global-step timelines."
             )
         else:
             if "ema_state_dict" in checkpoint_data:
@@ -2182,19 +2157,22 @@ def train(
                 optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
             else:
                 raise RuntimeError("Continuation checkpoint has no optimizer state.")
-            if "scheduler_state_dict" in checkpoint_data:
-                scheduler.load_state_dict(checkpoint_data["scheduler_state_dict"])
-            else:
-                raise RuntimeError("Continuation checkpoint has no scheduler state.")
+            # Optimizer checkpoints include their current learning rates. Override
+            # older scheduled values so resumed runs remain locked to TRAINING_LR.
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = TRAINING_LR
+                parameter_group["initial_lr"] = TRAINING_LR
             if "scaler_state_dict" in checkpoint_data:
                 scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
             print(f"Resuming at optimizer step {step}.")
     elif checkpoint_data is not None:
         print(
             "Checkpoint is not an exact continuation. Using shape-matched weights "
-            "as a transfer initialization with a fresh optimizer, scheduler, EMA "
+            "as a transfer initialization with a fresh optimizer, EMA "
             "timeline, and global step."
         )
+
+    print(f"Learning rate locked at {TRAINING_LR:.1e}.")
 
     if args.compile:
         compiler_environment = configure_windows_compile_environment()
@@ -2297,7 +2275,6 @@ def train(
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
         ema.update()
 
         step += 1
@@ -2377,7 +2354,6 @@ def train(
                 model,
                 ema,
                 optimizer,
-                scheduler,
                 scaler,
                 step,
                 best_sdr,
@@ -2394,7 +2370,6 @@ def train(
                     model,
                     ema,
                     optimizer,
-                    scheduler,
                     scaler,
                     step,
                     best_sdr,
@@ -2416,7 +2391,6 @@ def train(
             model,
             ema,
             optimizer,
-            scheduler,
             scaler,
             step,
             best_sdr,
@@ -2581,10 +2555,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eq_probability", type=float, default=0.25)
     parser.add_argument("--stem_dropout_probability", type=float, default=0.05)
     parser.add_argument("--checkpoint_steps", type=int, default=5_000)
-    parser.add_argument("--warmup_steps", type=int, default=5_000)
-    parser.add_argument("--max_steps", type=int, default=300_000)
-    parser.add_argument("--min_lr_ratio", type=float, default=0.05)
-    parser.add_argument("--lr", type=float, default=1.5e-4)
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=0,
+        help="Stop after this many optimizer steps; 0 trains until stopped.",
+    )
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--optimizer", choices=("adamw", "atan2"), default="adamw")
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -2609,18 +2585,10 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--num_workers cannot be negative.")
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch_factor must be positive.")
-    if args.warmup_steps < 0:
-        raise ValueError("--warmup_steps cannot be negative.")
     if args.max_steps < 0:
         raise ValueError("--max_steps cannot be negative.")
-    if args.max_steps and args.max_steps <= args.warmup_steps:
-        raise ValueError("--max_steps must exceed --warmup_steps, or be zero.")
-    if not 0.0 <= args.min_lr_ratio <= 1.0:
-        raise ValueError("--min_lr_ratio must be in [0, 1].")
     if args.grad_clip <= 0.0:
         raise ValueError("--grad_clip must be positive.")
-    if args.lr <= 0.0:
-        raise ValueError("--lr must be positive.")
     if args.weight_decay < 0.0:
         raise ValueError("--weight_decay cannot be negative.")
     if not 0.0 <= args.remix_probability <= 1.0:
@@ -2781,23 +2749,15 @@ def main() -> None:
         )
         optimizer = build_optimizer(
             model,
-            lr=args.lr,
             weight_decay=args.weight_decay,
             optimizer_name=args.optimizer,
             fused=device.type == "cuda",
-        )
-        scheduler = build_scheduler(
-            optimizer,
-            warmup_steps=args.warmup_steps,
-            max_steps=args.max_steps,
-            min_lr_ratio=args.min_lr_ratio,
         )
         loss_module = SeparationLoss(config, LossConfig())
         train(
             model,
             dataloader,
             optimizer,
-            scheduler,
             loss_module,
             device,
             args,
