@@ -1412,6 +1412,34 @@ def build_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def rebase_learning_rate(
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    lr: float,
+) -> None:
+    """Apply a new base LR without resetting the scheduler's resumed position."""
+    if len(optimizer.param_groups) != len(scheduler.lr_lambdas):
+        raise RuntimeError(
+            "Optimizer parameter groups do not match the learning-rate scheduler."
+        )
+
+    scheduler.base_lrs = [lr for _ in optimizer.param_groups]
+    if scheduler.last_epoch < 0:
+        scheduled_lrs = scheduler.base_lrs.copy()
+    else:
+        scheduled_lrs = [
+            lr * lr_lambda(scheduler.last_epoch)
+            for lr_lambda in scheduler.lr_lambdas
+        ]
+
+    for parameter_group, scheduled_lr in zip(
+        optimizer.param_groups, scheduled_lrs
+    ):
+        parameter_group["initial_lr"] = lr
+        parameter_group["lr"] = scheduled_lr
+    scheduler._last_lr = scheduled_lrs  # Keep its serialized/public state consistent.
+
+
 def find_latest_checkpoint(folder: str = "ckpts") -> str | None:
     paths = list(Path(folder).glob("checkpoint_step_*.pt"))
     if not paths:
@@ -1794,9 +1822,13 @@ def train(
                 scheduler.load_state_dict(checkpoint_data["scheduler_state_dict"])
             else:
                 raise RuntimeError("Continuation checkpoint has no scheduler state.")
+            rebase_learning_rate(optimizer, scheduler, args.lr)
             if "scaler_state_dict" in checkpoint_data:
                 scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
-            print(f"Resuming at optimizer step {step}.")
+            print(
+                f"Resuming at optimizer step {step} with --lr={args.lr:.2e} "
+                f"(scheduled LR {optimizer.param_groups[0]['lr']:.2e})."
+            )
     elif checkpoint_data is not None:
         print(
             "Checkpoint is not an exact continuation. Using shape-matched weights "
