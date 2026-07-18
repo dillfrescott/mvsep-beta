@@ -2287,6 +2287,23 @@ def train(
         progress.update(1)
 
         if step % args.checkpoint_steps == 0:
+            # Write the resumable checkpoint before validation, which can take a
+            # long time or be interrupted.  best_sdr is the most recently known
+            # validation score; a newly improved score is stored separately in
+            # best_ckpts after this validation finishes.
+            regular_path = f"ckpts/checkpoint_step_{step}.pt"
+            save_checkpoint(
+                regular_path,
+                model,
+                ema,
+                optimizer,
+                scaler,
+                step,
+                best_sdr,
+                avg_loss,
+            )
+            prune_old_checkpoints("ckpts", keep=3)
+
             with ema.average_parameters():
                 # The transformer units are compiled for training with gradients
                 # enabled.  Validation runs under inference_mode, which requires
@@ -2322,21 +2339,6 @@ def train(
                 )
                 if improved:
                     best_sdr = combined_sdr
-
-            # Save after validation so latest checkpoints never contain a stale
-            # pre-validation best score.
-            regular_path = f"ckpts/checkpoint_step_{step}.pt"
-            save_checkpoint(
-                regular_path,
-                model,
-                ema,
-                optimizer,
-                scaler,
-                step,
-                best_sdr,
-                avg_loss,
-            )
-            prune_old_checkpoints("ckpts", keep=3)
 
             if improved and combined_sdr is not None:
                 best_path = (
