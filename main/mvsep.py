@@ -1891,7 +1891,6 @@ def separate_tensor(
     overlap: int,
     device: torch.device,
     precision: str = "bf16",
-    tta_channel_swap: bool = False,
     show_progress: bool = False,
 ) -> list[torch.Tensor]:
     if mixture.ndim != 2:
@@ -1949,27 +1948,6 @@ def separate_tensor(
             win_length=model.config.win_length,
             window=stft_window,
         ).squeeze(0)
-
-        if tta_channel_swap:
-            swapped = chunk.flip(0)
-            swapped_spec = make_stft(
-                swapped.unsqueeze(0),
-                n_fft=model.config.n_fft,
-                hop_length=model.config.hop_length,
-                win_length=model.config.win_length,
-                window=stft_window,
-            )
-            with autocast_context(device, precision):
-                swapped_specs, _ = model.estimate_specs(swapped_spec)
-            swapped_estimated = make_istft(
-                swapped_specs,
-                length=chunk_size,
-                n_fft=model.config.n_fft,
-                hop_length=model.config.hop_length,
-                win_length=model.config.win_length,
-                window=stft_window,
-            ).squeeze(0).flip(1)
-            estimated = 0.5 * (estimated + swapped_estimated)
 
         is_first = start == 0
         is_last = start + chunk_size >= total_length
@@ -2067,7 +2045,6 @@ def validate(
                 overlap=overlap,
                 device=device,
                 precision=precision,
-                tta_channel_swap=False,
                 show_progress=False,
             )
             scores = [calculate_sdr(pred, target) for pred, target in zip(predictions, targets)]
@@ -2567,7 +2544,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--tta", action="store_true")
     return parser
 
 
@@ -2780,7 +2756,6 @@ def main() -> None:
         overlap=args.inference_overlap,
         device=device,
         precision=args.precision,
-        tta_channel_swap=args.tta,
         show_progress=True,
     )
     for stem, prediction in zip(STEMS, predictions):
