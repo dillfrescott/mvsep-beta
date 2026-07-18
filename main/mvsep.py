@@ -7,8 +7,6 @@ import os
 import random
 import re
 import signal
-import subprocess
-import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -38,137 +36,8 @@ else:
     FLASH_ATTN_IMPORT_ERROR = None
 
 
-@torch.compiler.disable(
-    recursive=True,
-    reason="flash-attn custom-op fake strides differ from its CUDA output",
-)
-def run_external_flash_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float,
-) -> torch.Tensor:
-    """Run fused FlashAttention outside AOTAutograd's fake-layout graph."""
-    if external_flash_attn_func is None:
-        raise RuntimeError("External flash-attn is unavailable.")
-    return external_flash_attn_func(
-        q,
-        k,
-        v,
-        dropout_p=dropout_p,
-        causal=False,
-    )
-
-
 STEMS = ("vocals", "other")
 AUDIO_EXTENSIONS = (".wav", ".flac")
-TRAINING_LR = 1e-4
-
-
-def _environment_path_contains(variable: str, filename: str) -> bool:
-    return any(
-        (Path(directory) / filename).is_file()
-        for directory in os.environ.get(variable, "").split(os.pathsep)
-        if directory
-    )
-
-
-def configure_windows_compile_environment() -> Path | None:
-    """Initialize MSVC variables needed by TorchInductor when launched normally."""
-    if os.name != "nt" or _environment_path_contains("INCLUDE", "omp.h"):
-        return None
-
-    candidates: list[Path] = []
-    program_files_x86 = Path(
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-    )
-    vswhere = program_files_x86 / "Microsoft Visual Studio/Installer/vswhere.exe"
-    if vswhere.is_file():
-        result = subprocess.run(
-            (
-                str(vswhere),
-                "-latest",
-                "-products",
-                "*",
-                "-requires",
-                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                "-property",
-                "installationPath",
-            ),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        installation = result.stdout.strip()
-        if result.returncode == 0 and installation:
-            candidates.append(Path(installation) / "Common7/Tools/VsDevCmd.bat")
-
-    for environment_name, fallback in (
-        ("ProgramFiles", r"C:\Program Files"),
-        ("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-    ):
-        visual_studio_root = (
-            Path(os.environ.get(environment_name, fallback)) / "Microsoft Visual Studio"
-        )
-        if visual_studio_root.is_dir():
-            candidates.extend(
-                visual_studio_root.glob("*/*/Common7/Tools/VsDevCmd.bat")
-            )
-
-    attempted: list[str] = []
-    failures: list[str] = []
-    for candidate in dict.fromkeys(candidates):
-        if not candidate.is_file():
-            continue
-        attempted.append(str(candidate))
-        # Pass a complete command line so cmd.exe receives the nested quotes
-        # around installations below "Program Files" unchanged.
-        command = (
-            f'cmd.exe /d /s /c ""{candidate}" -arch=x64 -host_arch=x64 '
-            '>nul && set"'
-        )
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            failure = (result.stderr or result.stdout).strip().splitlines()
-            failures.append(failure[-1] if failure else f"exit code {result.returncode}")
-            continue
-        environment = dict(
-            line.split("=", 1)
-            for line in result.stdout.splitlines()
-            if "=" in line and not line.startswith("=")
-        )
-        os.environ.update(environment)
-        if _environment_path_contains("INCLUDE", "omp.h"):
-            return candidate
-
-    detail = f" Tried: {', '.join(attempted)}." if attempted else ""
-    if failures:
-        detail += f" Last error: {failures[-1]}"
-    raise RuntimeError(
-        "--compile on Windows requires the MSVC C++ build tools, but their "
-        "environment could not be initialized. Install the Visual Studio "
-        f"'Desktop development with C++' workload or omit --compile.{detail}"
-    )
-
-
-def configure_torchinductor_cache() -> Path:
-    """Avoid stale graphs after attention custom-op layout changes."""
-    configured = os.environ.get("MVSEP_TORCHINDUCTOR_CACHE_DIR")
-    cache_dir = (
-        Path(configured)
-        if configured
-        else Path(tempfile.gettempdir()) / "torchinductor_mvsep_submodules_v4"
-    )
-    # Override a legacy/global TORCHINDUCTOR_CACHE_DIR: it may contain an
-    # attention graph whose custom-op fake strides predate this script's
-    # contiguous FlashAttention boundary.
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_dir)
-    return cache_dir
 
 
 # -----------------------------------------------------------------------------
@@ -187,14 +56,10 @@ class ModelConfig:
     num_bands: int = 124
     dim: int = 384
     depth: int = 12
-    refine_depth: int = 2
     heads: int = 8
     ff_mult: float = 8.0 / 3.0
     dropout: float = 0.0
-    drop_path: float = 0.05
-    local_kernel: int = 7
     layer_scale_init: float = 0.1
-    refine_mask_scale: float = 0.05
     use_checkpoint: bool = True
     mixture_consistency: bool = True
     architecture: str = "bs_roformer_124"
@@ -218,8 +83,6 @@ class ModelConfig:
             raise ValueError("num_bands must be greater than one.")
         if self.dim <= 0 or self.depth <= 0 or self.heads <= 0:
             raise ValueError("dim, depth, and heads must be positive.")
-        if self.refine_depth < 0:
-            raise ValueError("refine_depth cannot be negative.")
         if self.dim % self.heads != 0:
             raise ValueError("dim must be divisible by heads.")
         if (self.dim // self.heads) % 2 != 0:
@@ -228,31 +91,23 @@ class ModelConfig:
             raise ValueError("ff_mult must be positive.")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
-        if not 0.0 <= self.drop_path < 1.0:
-            raise ValueError("drop_path must be in [0, 1).")
-        if self.local_kernel <= 0 or self.local_kernel % 2 == 0:
-            raise ValueError("local_kernel must be a positive odd integer.")
         if self.layer_scale_init < 0.0:
             raise ValueError("layer_scale_init must be non-negative.")
-        if self.refine_mask_scale < 0.0:
-            raise ValueError("refine_mask_scale must be non-negative.")
         if self.architecture != "bs_roformer_124":
             raise ValueError(
-                f"Unsupported architecture {self.architecture!r}; expected "
-                "bs_roformer_124."
+                f"Unsupported architecture {self.architecture!r}; expected bs_roformer_124."
             )
 
 
 @dataclass
 class LossConfig:
-    waveform_weight: float = 0.5
-    main_stft_weight: float = 1.0
-    mrstft_weight: float = 0.5
-    mask_weight: float = 0.05
-    sdr_weight: float = 0.10
-    midside_weight: float = 0.05
-    stage1_weight: float = 0.15
-    silence_weight: float = 0.05
+    waveform_weight: float = 1.0
+    main_stft_weight: float = 0.5
+    mrstft_weight: float = 1.0
+    mask_weight: float = 0.1
+    sdr_weight: float = 0.05
+    midside_weight: float = 0.1
+
 
 # -----------------------------------------------------------------------------
 # Small utilities
@@ -332,44 +187,30 @@ def db_to_gain(db: float) -> float:
     return 10.0 ** (db / 20.0)
 
 
-
-@dataclass(frozen=True)
-class BandDefinition:
-    """One disjoint frequency interval owned by exactly one band token."""
-
-    start: int
-    end: int
-    weights: torch.Tensor
-
-    @property
-    def width(self) -> int:
-        return self.end - self.start
-
-
 def build_bs_bands(
     n_fft: int,
     num_bands: int,
-) -> list[BandDefinition]:
-    """Build disjoint BS-RoFormer bands with exact one-owner bin coverage.
+) -> list[tuple[int, int]]:
+    """Build disjoint BS-RoFormer frequency bands.
 
-    The default 4096-FFT / 124-band layout is a doubled-resolution version of
-    the widely used handcrafted 62-band BS-RoFormer partition. The original
-    1025-bin layout has widths::
+    The default 124-band / 4096-FFT preset is a high-resolution adaptation of
+    the commonly used handcrafted 62-band BS-RoFormer layout.  The original
+    layout covers 1025 bins with widths
 
-        24 x 2, 12 x 4, 8 x 12, 8 x 24, 8 x 48, 128, 129
+        24x2, 12x4, 8x12, 8x24, 8x48, 128, 129.
 
-    At 4096 FFT resolution there are 2049 real-spectrum bins. Repeating each
-    original interval twice gives 124 bands while retaining dense low/mid
-    frequency resolution; the final interval is shortened by one bin.
+    At 4096 FFT resolution, each original frequency interval has twice as many
+    bins. Splitting each doubled interval in half yields 124 disjoint bands
+    while preserving the same piecewise frequency allocation. The final band
+    is shortened by one bin because a real 4096-point STFT has 2049 bins.
 
-    For non-default FFT/band counts, a deterministic quadratic boundary layout
-    supplies many narrow low-frequency bands and progressively wider upper
-    bands. In all cases every FFT bin is present exactly once, with no overlap,
-    averaging, duplication, or gaps.
+    For non-default settings, a deterministic power-law layout is used. It is
+    still a strict band split: no overlap, no duplicated bins, and no mask
+    averaging.
     """
     freq_bins = n_fft // 2 + 1
-    if num_bands <= 1:
-        raise ValueError("num_bands must be greater than one.")
+    if num_bands <= 0:
+        raise ValueError("num_bands must be positive.")
     if num_bands > freq_bins:
         raise ValueError(
             f"Cannot create {num_bands} non-empty bands from {freq_bins} bins."
@@ -385,11 +226,14 @@ def build_bs_bands(
             + [128, 129]
         )
         widths = [width for width in base_62 for _ in range(2)]
-        # Repetition covers 2050 bins, while a real 4096-point STFT has 2049.
+        # Repeating the 1025-bin layout gives 2050 bins; real STFT has 2049.
         widths[-1] -= 1
     else:
+        # A handcrafted-style fallback with many narrow low-frequency bands
+        # and progressively wider high-frequency bands. This is deliberately
+        # not a Mel filterbank and never overlaps bins.
         positions = torch.linspace(0.0, 1.0, num_bands + 1)
-        boundaries = torch.round(positions.square() * freq_bins).long()
+        boundaries = torch.round((positions.square()) * freq_bins).long()
         boundaries[0] = 0
         boundaries[-1] = freq_bins
         for index in range(1, num_bands):
@@ -403,30 +247,26 @@ def build_bs_bands(
 
     if len(widths) != num_bands or sum(widths) != freq_bins:
         raise RuntimeError(
-            f"Invalid BS layout: {len(widths)} bands cover {sum(widths)} bins; "
-            f"expected {num_bands} bands covering {freq_bins} bins."
+            f"Invalid band layout: {len(widths)} bands cover {sum(widths)} "
+            f"bins, expected {num_bands} bands covering {freq_bins} bins."
         )
     if any(width <= 0 for width in widths):
-        raise RuntimeError("BS layout contains an empty band.")
+        raise RuntimeError("Band layout contains an empty band.")
 
-    definitions: list[BandDefinition] = []
-    coverage = torch.zeros(freq_bins, dtype=torch.int64)
+    bands: list[tuple[int, int]] = []
     start = 0
     for width in widths:
         end = start + width
-        definitions.append(
-            BandDefinition(
-                start=start,
-                end=end,
-                weights=torch.ones(width, dtype=torch.float32),
-            )
-        )
-        coverage[start:end] += 1
+        bands.append((start, end))
         start = end
 
+    coverage = torch.zeros(freq_bins, dtype=torch.int64)
+    for start, end in bands:
+        coverage[start:end] += 1
     if not torch.all(coverage == 1):
-        raise RuntimeError("BS bands must cover every FFT bin exactly once.")
-    return definitions
+        raise RuntimeError("BS band construction must cover every bin exactly once.")
+    return bands
+
 
 def make_stft(
     audio: torch.Tensor,
@@ -478,7 +318,6 @@ def make_istft(
 # -----------------------------------------------------------------------------
 
 
-
 class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int, base: float = 10_000.0):
         super().__init__()
@@ -526,20 +365,6 @@ class SwiGLU(nn.Module):
         return self.dropout(self.out_proj(F.silu(gate) * value))
 
 
-class DropPath(nn.Module):
-    def __init__(self, probability: float = 0.0):
-        super().__init__()
-        self.probability = probability
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.probability == 0.0 or not self.training:
-            return x
-        keep = 1.0 - self.probability
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask = x.new_empty(shape).bernoulli_(keep)
-        return x * mask / keep
-
-
 class GatedRoPEAttention(nn.Module):
     def __init__(
         self,
@@ -555,11 +380,12 @@ class GatedRoPEAttention(nn.Module):
         self.head_dim = dim // heads
         self.dropout = dropout
         self.use_value_residual = use_value_residual
+        # This is a runtime performance setting, not part of the model or its
+        # checkpoint compatibility. ``fused`` prevents an unnoticed fallback
+        # to the much slower quadratic-memory math implementation on CUDA.
         self.attention_backend = "fused"
 
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.q_norm = nn.RMSNorm(self.head_dim)
-        self.k_norm = nn.RMSNorm(self.head_dim)
         self.head_gate = nn.Linear(dim, heads)
         self.value_mix = nn.Linear(dim, heads) if use_value_residual else None
         self.out_proj = nn.Linear(dim, dim, bias=False)
@@ -574,12 +400,8 @@ class GatedRoPEAttention(nn.Module):
         batch, length, dim = x.shape
         qkv = self.qkv(x).reshape(batch, length, 3, self.heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        # RMSNorm accumulates in FP32 under CUDA autocast. Preserve that
-        # numerical behavior, then restore the projection dtype so fused
-        # FP16/BF16 attention kernels remain eligible and Q/K/V agree.
-        attention_dtype = qkv.dtype
-        q = self.q_norm(q).to(dtype=attention_dtype).transpose(1, 2)
-        k = self.k_norm(k).to(dtype=attention_dtype).transpose(1, 2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         original_v = v
 
@@ -599,26 +421,26 @@ class GatedRoPEAttention(nn.Module):
             and self.attention_backend in ("fused", "flash")
         )
         if use_external_flash:
-            # flash-attn's fake implementation models its output with
-            # empty_like(q), while the CUDA kernel returns contiguous BLHD.
-            # Materialize BLHD inputs so fake and runtime strides agree when
-            # the encoder's axial input itself is non-contiguous.
-            flash_q = q.transpose(1, 2).contiguous()
-            flash_k = k.transpose(1, 2).contiguous()
-            flash_v = v.transpose(1, 2).contiguous()
-            out = run_external_flash_attention(
-                flash_q,
-                flash_k,
-                flash_v,
-                attention_dropout,
-            ).transpose(1, 2)
+            # flash-attn uses [batch, sequence, heads, head_dim], whereas
+            # PyTorch SDPA below uses [batch, heads, sequence, head_dim].
+            out = external_flash_attn_func(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                dropout_p=attention_dropout,
+                causal=False,
+            )
+            out = out.transpose(1, 2)
         else:
             if q.device.type != "cuda" or self.attention_backend == "auto":
                 attention_context = contextlib.nullcontext()
             elif self.attention_backend == "fused":
+                # Prefer built-in Flash when available, then cuDNN and
+                # memory-efficient SDPA. Deliberately omit the math fallback.
                 attention_context = sdpa_kernel(
                     [
                         SDPBackend.FLASH_ATTENTION,
+                        SDPBackend.CUDNN_ATTENTION,
                         SDPBackend.EFFICIENT_ATTENTION,
                     ],
                     set_priority=True,
@@ -635,37 +457,10 @@ class GatedRoPEAttention(nn.Module):
                     dropout_p=attention_dropout,
                     is_causal=False,
                 )
-
         gates = torch.sigmoid(self.head_gate(x)).transpose(1, 2).unsqueeze(-1)
         out = out * gates
         out = out.transpose(1, 2).reshape(batch, length, dim)
         return self.out_dropout(self.out_proj(out)), original_v
-
-
-class AxisConvModule(nn.Module):
-    """Conformer-style local sequence mixer used on both time and frequency axes."""
-
-    def __init__(self, dim: int, kernel_size: int, dropout: float):
-        super().__init__()
-        self.in_proj = nn.Linear(dim, dim * 2, bias=False)
-        self.depthwise = nn.Conv1d(
-            dim,
-            dim,
-            kernel_size,
-            padding=kernel_size // 2,
-            groups=dim,
-            bias=False,
-        )
-        self.norm = nn.GroupNorm(1, dim)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        value, gate = self.in_proj(x).chunk(2, dim=-1)
-        value = self.depthwise(value.transpose(1, 2))
-        value = self.norm(value).transpose(1, 2)
-        value = F.silu(value) * torch.sigmoid(gate)
-        return self.dropout(self.out_proj(value))
 
 
 class TransformerUnit(nn.Module):
@@ -675,23 +470,19 @@ class TransformerUnit(nn.Module):
         heads: int,
         ff_mult: float,
         dropout: float,
-        drop_path: float,
-        local_kernel: int,
         layer_scale_init: float,
     ):
         super().__init__()
+        # 8/3 gives SwiGLU approximately the parameter count of a standard
+        # 4x GELU FFN. Round the product, then align it for Tensor Cores.
         hidden_dim = round_up_to_multiple(round(dim * ff_mult), 64)
 
         self.attn_norm = nn.RMSNorm(dim)
         self.attn = GatedRoPEAttention(dim, heads, dropout=dropout)
-        self.conv_norm = nn.RMSNorm(dim)
-        self.conv = AxisConvModule(dim, local_kernel, dropout)
         self.ff_norm = nn.RMSNorm(dim)
         self.ff = SwiGLU(dim, hidden_dim, dropout=dropout)
         self.attn_scale = nn.Parameter(torch.full((dim,), layer_scale_init))
-        self.conv_scale = nn.Parameter(torch.full((dim,), layer_scale_init))
         self.ff_scale = nn.Parameter(torch.full((dim,), layer_scale_init))
-        self.drop_path = DropPath(drop_path)
 
     def forward(
         self,
@@ -699,59 +490,40 @@ class TransformerUnit(nn.Module):
         value_residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         attn_out, original_v = self.attn(self.attn_norm(x), value_residual)
-        x = x + self.drop_path(attn_out * self.attn_scale)
-        x = x + self.drop_path(self.conv(self.conv_norm(x)) * self.conv_scale)
-        x = x + self.drop_path(self.ff(self.ff_norm(x)) * self.ff_scale)
+        x = x + attn_out * self.attn_scale
+        x = x + self.ff(self.ff_norm(x)) * self.ff_scale
         return x, original_v
 
 
 class DualPathEncoder(nn.Module):
-    def __init__(self, config: ModelConfig, depth: int | None = None):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.depth = config.depth if depth is None else depth
-        if self.depth <= 0:
-            raise ValueError("DualPathEncoder depth must be positive.")
-
-        time_layers: list[TransformerUnit] = []
-        freq_layers: list[TransformerUnit] = []
-        for index in range(self.depth):
-            probability = config.drop_path * (index + 1) / self.depth
-            unit_kwargs = dict(
-                dim=config.dim,
-                heads=config.heads,
-                ff_mult=config.ff_mult,
-                dropout=config.dropout,
-                drop_path=probability,
-                local_kernel=config.local_kernel,
-                layer_scale_init=config.layer_scale_init,
-            )
-            time_layers.append(TransformerUnit(**unit_kwargs))
-            freq_layers.append(TransformerUnit(**unit_kwargs))
-        self.time_layers = nn.ModuleList(time_layers)
-        self.freq_layers = nn.ModuleList(freq_layers)
+        unit_kwargs = dict(
+            dim=config.dim,
+            heads=config.heads,
+            ff_mult=config.ff_mult,
+            dropout=config.dropout,
+            layer_scale_init=config.layer_scale_init,
+        )
+        self.time_layers = nn.ModuleList(
+            TransformerUnit(**unit_kwargs) for _ in range(config.depth)
+        )
+        self.freq_layers = nn.ModuleList(
+            TransformerUnit(**unit_kwargs) for _ in range(config.depth)
+        )
         self.output_norm = nn.RMSNorm(config.dim)
         self.use_checkpoint = config.use_checkpoint
 
-    def compile_layers(
-        self,
-        mode: str = "default",
-        recompile_limit: int = 8,
-    ) -> None:
+    def compile_layers(self, mode: str = "default") -> None:
+        """Compile transformer units without capturing checkpoint boundaries.
+
+        Compiling the complete separator graph makes TorchInductor capture the
+        activation-checkpointing loop as part of one large graph.  Keeping the
+        checkpoint calls eager and compiling only the work they wrap preserves
+        checkpoint recomputation and its expected peak-memory behavior.
+        """
         for unit in (*self.time_layers, *self.freq_layers):
-            # Keep attention eager: this nightly AOTAutograd build assigns
-            # unstable fake strides to saved FlashAttention and Q/K RMSNorm
-            # tensors. Compile only the pure local-convolution and feed-forward
-            # paths, which still benefit from fused pointwise kernels.
-            unit.conv.compile(
-                mode=mode,
-                recompile_limit=recompile_limit,
-                isolate_recompiles=True,
-            )
-            unit.ff.compile(
-                mode=mode,
-                recompile_limit=recompile_limit,
-                isolate_recompiles=True,
-            )
+            unit.compile(mode=mode)
 
     @staticmethod
     def _run_unit(
@@ -767,6 +539,7 @@ class DualPathEncoder(nn.Module):
         return checkpoint(unit, x, value_residual, use_reentrant=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, frames, bands, dim]
         batch, frames, bands, dim = x.shape
         time_value_residual: torch.Tensor | None = None
         freq_value_residual: torch.Tensor | None = None
@@ -775,7 +548,10 @@ class DualPathEncoder(nn.Module):
         for time_layer, freq_layer in zip(self.time_layers, self.freq_layers):
             time_x = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
             time_x, first_time_values = self._run_unit(
-                time_layer, time_x, time_value_residual, should_checkpoint
+                time_layer,
+                time_x,
+                time_value_residual,
+                should_checkpoint,
             )
             if time_value_residual is None:
                 time_value_residual = first_time_values
@@ -783,7 +559,10 @@ class DualPathEncoder(nn.Module):
 
             freq_x = x.reshape(batch * frames, bands, dim)
             freq_x, first_freq_values = self._run_unit(
-                freq_layer, freq_x, freq_value_residual, should_checkpoint
+                freq_layer,
+                freq_x,
+                freq_value_residual,
+                should_checkpoint,
             )
             if freq_value_residual is None:
                 freq_value_residual = first_freq_values
@@ -803,61 +582,73 @@ def round_up_to_multiple(value: float, multiple: int) -> int:
 
 
 class BandInputGroup(nn.Module):
+    """A batch of bands padded only to the next power-of-two width."""
+
     def __init__(
         self,
         config: ModelConfig,
-        bands: Sequence[BandDefinition],
+        bands: Sequence[tuple[int, int]],
         band_ids: Sequence[int],
         bucket_width: int,
-        input_channels: int,
     ):
         super().__init__()
-        self.input_channels = input_channels
+        self.audio_channels = config.audio_channels
         self.bucket_width = bucket_width
-        self.feature_width = bucket_width * input_channels * 2
+        self.feature_width = bucket_width * config.audio_channels * 2
         self.num_group_bands = len(band_ids)
 
         self.register_buffer(
             "band_ids", torch.tensor(band_ids, dtype=torch.long), persistent=False
         )
-        freq_indices = torch.zeros(self.num_group_bands, bucket_width, dtype=torch.long)
-        band_weight = torch.zeros(self.num_group_bands, bucket_width)
+        freq_indices = torch.zeros(
+            self.num_group_bands, bucket_width, dtype=torch.long
+        )
+        freq_valid = torch.zeros(
+            self.num_group_bands, bucket_width, dtype=torch.bool
+        )
+        valid_feature_counts = torch.zeros(
+            self.num_group_bands, dtype=torch.float32
+        )
         for local_index, band_id in enumerate(band_ids):
-            definition = bands[band_id]
-            width = definition.width
-            freq_indices[local_index, :width] = torch.arange(
-                definition.start, definition.end
-            )
-            band_weight[local_index, :width] = definition.weights
+            start, end = bands[band_id]
+            width = end - start
+            freq_indices[local_index, :width] = torch.arange(start, end)
+            freq_valid[local_index, :width] = True
+            valid_feature_counts[local_index] = width * config.audio_channels * 2
 
-        feature_weight = (
-            band_weight.sqrt()[:, :, None, None]
-            .expand(-1, -1, input_channels, 2)
+        feature_valid = (
+            freq_valid[:, :, None, None]
+            .expand(-1, -1, config.audio_channels, 2)
             .reshape(self.num_group_bands, self.feature_width)
         )
-        effective_counts = (band_weight.sum(dim=-1) * input_channels * 2).clamp_min(1.0)
         self.register_buffer("freq_indices", freq_indices, persistent=False)
-        self.register_buffer("feature_weight", feature_weight, persistent=False)
-        self.register_buffer("effective_counts", effective_counts, persistent=False)
+        self.register_buffer("feature_valid", feature_valid, persistent=False)
+        self.register_buffer(
+            "valid_feature_counts", valid_feature_counts, persistent=False
+        )
 
-        self.gamma = nn.Parameter(torch.ones(self.num_group_bands, self.feature_width))
+        self.gamma = nn.Parameter(
+            torch.ones(self.num_group_bands, self.feature_width)
+        )
         self.weight = nn.Parameter(
             torch.empty(self.num_group_bands, self.feature_width, config.dim)
         )
-        self.bias = nn.Parameter(torch.zeros(self.num_group_bands, config.dim))
+        self.bias = nn.Parameter(
+            torch.zeros(self.num_group_bands, config.dim)
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         with torch.no_grad():
-            nn.init.zeros_(self.weight)
+            self.weight.zero_()
             for band in range(self.num_group_bands):
-                valid = int((self.feature_weight[band] > 0).sum().item())
-                bound = math.sqrt(6.0 / max(1, valid + self.weight.shape[-1]))
-                self.weight[band, :valid].uniform_(-bound, bound)
-            self.gamma.masked_fill_(self.feature_weight == 0, 0.0)
+                fan_in = int(self.valid_feature_counts[band].item())
+                bound = math.sqrt(6.0 / (fan_in + self.weight.shape[-1]))
+                self.weight[band, :fan_in].uniform_(-bound, bound)
+            self.gamma.masked_fill_(~self.feature_valid, 0.0)
 
     def forward(self, real_imag: torch.Tensor) -> torch.Tensor:
-        # real_imag: [B, T, F, input_channels, 2]
+        # real_imag: [B, T, F, C, 2]
         gathered = real_imag[:, :, self.freq_indices]
         features = gathered.reshape(
             gathered.shape[0],
@@ -865,41 +656,33 @@ class BandInputGroup(nn.Module):
             self.num_group_bands,
             self.feature_width,
         )
-        features = features * self.feature_weight[None, None]
+        features = features * self.feature_valid[None, None]
         mean_square = features.square().sum(dim=-1, keepdim=True)
-        mean_square = mean_square / self.effective_counts[None, None, :, None]
+        mean_square = mean_square / self.valid_feature_counts[None, None, :, None]
         features = features * torch.rsqrt(mean_square + 1e-5)
         features = features * self.gamma[None, None]
         return torch.einsum("btni,nid->btnd", features, self.weight) + self.bias
 
 
 class BandSplit(nn.Module):
-    def __init__(
-        self,
-        config: ModelConfig,
-        bands: Sequence[BandDefinition],
-        input_channels: int,
-    ):
+    """Project each disjoint complex stereo band into one token."""
+
+    def __init__(self, config: ModelConfig, bands: Sequence[tuple[int, int]]):
         super().__init__()
         self.num_bands = len(bands)
-        self.input_channels = input_channels
         grouped_ids: dict[int, list[int]] = {}
-        for band_id, definition in enumerate(bands):
-            bucket = next_power_of_two(definition.width)
+        for band_id, (start, end) in enumerate(bands):
+            bucket = next_power_of_two(end - start)
             grouped_ids.setdefault(bucket, []).append(band_id)
+
         self.groups = nn.ModuleList(
-            BandInputGroup(config, bands, ids, bucket, input_channels)
+            BandInputGroup(config, bands, ids, bucket)
             for bucket, ids in sorted(grouped_ids.items())
         )
 
     def forward_real(self, real_imag: torch.Tensor) -> torch.Tensor:
-        # real_imag: [B, input_channels, F, T, 2]
-        if real_imag.shape[1] != self.input_channels:
-            raise ValueError(
-                f"Expected {self.input_channels} complex input channels, "
-                f"got {real_imag.shape[1]}."
-            )
-        real_imag = real_imag.permute(0, 3, 2, 1, 4)
+        """Project an STFT represented by a trailing real/imaginary dimension."""
+        real_imag = real_imag.permute(0, 3, 2, 1, 4)  # [B, T, F, C, 2]
         output = real_imag.new_zeros(
             real_imag.shape[0],
             real_imag.shape[1],
@@ -907,18 +690,19 @@ class BandSplit(nn.Module):
             self.groups[0].weight.shape[-1],
         )
         for group in self.groups:
-            output = output.index_copy(2, group.band_ids, group(real_imag))
+            group_tokens = group(real_imag)
+            output = output.index_copy(2, group.band_ids, group_tokens)
         return output
 
-    def forward(self, spec: torch.Tensor) -> torch.Tensor:
-        return self.forward_real(torch.view_as_real(spec.to(torch.complex64)))
+    def forward(self, mixture_spec: torch.Tensor) -> torch.Tensor:
+        return self.forward_real(torch.view_as_real(mixture_spec.to(torch.complex64)))
 
 
 class BandMaskGroup(nn.Module):
     def __init__(
         self,
         config: ModelConfig,
-        bands: Sequence[BandDefinition],
+        bands: Sequence[tuple[int, int]],
         band_ids: Sequence[int],
         bucket_width: int,
     ):
@@ -932,28 +716,50 @@ class BandMaskGroup(nn.Module):
         self.register_buffer(
             "band_ids", torch.tensor(band_ids, dtype=torch.long), persistent=False
         )
-        freq_indices = torch.zeros(self.num_group_bands, bucket_width, dtype=torch.long)
-        synthesis_weight = torch.zeros(self.num_group_bands, bucket_width)
+        freq_indices = torch.zeros(
+            self.num_group_bands, bucket_width, dtype=torch.long
+        )
+        freq_valid = torch.zeros(
+            self.num_group_bands, bucket_width, dtype=torch.bool
+        )
         for local_index, band_id in enumerate(band_ids):
-            definition = bands[band_id]
-            width = definition.width
-            freq_indices[local_index, :width] = torch.arange(
-                definition.start, definition.end
-            )
-            synthesis_weight[local_index, :width] = definition.weights
+            start, end = bands[band_id]
+            width = end - start
+            freq_indices[local_index, :width] = torch.arange(start, end)
+            freq_valid[local_index, :width] = True
+
+        feature_valid = (
+            freq_valid[:, :, None, None]
+            .expand(-1, -1, config.audio_channels, 2)
+            .reshape(self.num_group_bands, self.feature_width)
+        )
         self.register_buffer("freq_indices", freq_indices, persistent=False)
-        self.register_buffer("synthesis_weight", synthesis_weight, persistent=False)
+        self.register_buffer("feature_valid", feature_valid, persistent=False)
 
         output_width = config.num_stems * self.feature_width
         self.output_weight = nn.Parameter(
             torch.empty(self.num_group_bands, config.dim, output_width)
         )
-        self.output_bias = nn.Parameter(torch.zeros(self.num_group_bands, output_width))
+        self.output_bias = nn.Parameter(
+            torch.zeros(self.num_group_bands, output_width)
+        )
         nn.init.normal_(self.output_weight, std=1e-3)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # x: [B, T, group_bands, D]
         raw = torch.einsum("btnd,ndq->btnq", x, self.output_weight)
         raw = raw + self.output_bias[None, None]
+        raw = raw.reshape(
+            x.shape[0],
+            x.shape[1],
+            self.num_group_bands,
+            self.num_stems,
+            self.feature_width,
+        )
+        raw = raw * self.feature_valid[None, None, :, None]
         raw = raw.reshape(
             x.shape[0],
             x.shape[1],
@@ -963,7 +769,6 @@ class BandMaskGroup(nn.Module):
             self.audio_channels,
             2,
         )
-        raw = raw * self.synthesis_weight[None, None, :, None, :, None, None]
         source = raw.permute(0, 3, 5, 1, 2, 4, 6).reshape(
             x.shape[0],
             self.num_stems,
@@ -976,24 +781,24 @@ class BandMaskGroup(nn.Module):
 
 
 class BandMaskEstimator(nn.Module):
+    """Estimate one complex mask for every bin in each disjoint band."""
+
     def __init__(
         self,
         config: ModelConfig,
-        bands: Sequence[BandDefinition],
-        *,
-        add_partition_bias: bool,
-        initial_scale: float,
+        bands: Sequence[tuple[int, int]],
+        band_split: BandSplit,
     ):
         super().__init__()
+        del band_split  # groups are reconstructed from the same immutable layout
         self.num_stems = config.num_stems
         self.audio_channels = config.audio_channels
         self.freq_bins = config.n_fft // 2 + 1
         self.num_bands = len(bands)
-        self.add_partition_bias = add_partition_bias
 
         grouped_ids: dict[int, list[int]] = {}
-        for band_id, definition in enumerate(bands):
-            bucket = next_power_of_two(definition.width)
+        for band_id, (start, end) in enumerate(bands):
+            bucket = next_power_of_two(end - start)
             grouped_ids.setdefault(bucket, []).append(band_id)
         self.groups = nn.ModuleList(
             BandMaskGroup(config, bands, ids, bucket)
@@ -1001,19 +806,21 @@ class BandMaskEstimator(nn.Module):
         )
 
         coverage = torch.zeros(self.freq_bins, dtype=torch.int64)
-        for definition in bands:
-            coverage[definition.start : definition.end] += 1
+        for start, end in bands:
+            coverage[start:end] += 1
         if not torch.all(coverage == 1):
-            raise ValueError(
-                "BandMaskEstimator requires disjoint one-owner frequency coverage."
-            )
+            raise ValueError("BandMaskEstimator requires a disjoint full-band layout.")
 
         hidden_dim = round_up_to_multiple(config.dim * 2.0, 64)
         self.norm = nn.RMSNorm(config.dim)
-        self.shared_mlp = SwiGLU(config.dim, hidden_dim, dropout=config.dropout)
-        self.mask_residual_scale = nn.Parameter(torch.tensor(initial_scale))
+        self.shared_mlp = SwiGLU(
+            config.dim, hidden_dim, dropout=config.dropout
+        )
+        self.mask_residual_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward_real(self, x: torch.Tensor) -> torch.Tensor:
+        """Return masks represented by a trailing real/imaginary dimension."""
+        # x: [B, T, bands, D]
         x = x + self.shared_mlp(self.norm(x))
         output = x.new_zeros(
             x.shape[0],
@@ -1038,33 +845,14 @@ class BandMaskEstimator(nn.Module):
 
         output = output.permute(0, 1, 2, 4, 3, 5).contiguous().float()
         output = output * self.mask_residual_scale.float()
-        if self.add_partition_bias:
-            output = output + output.new_tensor((1.0 / self.num_stems, 0.0))
-        return output
+        mask_bias = output.new_tensor((1.0 / self.num_stems, 0.0))
+        return output + mask_bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.view_as_complex(self.forward_real(x))
 
 
-class GatedTokenFusion(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.norm = nn.RMSNorm(dim * 2)
-        self.in_proj = nn.Linear(dim * 2, dim * 2, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.scale = nn.Parameter(torch.tensor(0.1))
-
-    def forward(self, base: torch.Tensor, refinement: torch.Tensor) -> torch.Tensor:
-        gate, value = self.in_proj(self.norm(torch.cat((base, refinement), dim=-1))).chunk(
-            2, dim=-1
-        )
-        update = self.out_proj(torch.sigmoid(gate) * F.silu(value))
-        return base + self.scale * update
-
-
 class BSRoFormerSeparator(nn.Module):
-    """Disjoint BS-RoFormer with local mixing and two-stage mask refinement."""
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -1072,107 +860,29 @@ class BSRoFormerSeparator(nn.Module):
             config.n_fft,
             config.num_bands,
         )
-        self.band_split = BandSplit(
-            config,
-            self.bands,
-            input_channels=config.audio_channels,
-        )
-        self.encoder = DualPathEncoder(config, depth=config.depth)
+        self.band_split = BandSplit(config, self.bands)
+        self.encoder = DualPathEncoder(config)
         self.mask_estimator = BandMaskEstimator(
             config,
             self.bands,
-            add_partition_bias=True,
-            initial_scale=0.1,
+            self.band_split,
         )
-
-        if config.refine_depth > 0:
-            self.refine_split: BandSplit | None = BandSplit(
-                config,
-                self.bands,
-                input_channels=config.num_stems * config.audio_channels,
-            )
-            self.refine_fusion: GatedTokenFusion | None = GatedTokenFusion(config.dim)
-            self.refine_encoder: DualPathEncoder | None = DualPathEncoder(
-                config, depth=config.refine_depth
-            )
-            self.refine_mask_estimator: BandMaskEstimator | None = BandMaskEstimator(
-                config,
-                self.bands,
-                add_partition_bias=False,
-                initial_scale=config.refine_mask_scale,
-            )
-        else:
-            self.refine_split = None
-            self.refine_fusion = None
-            self.refine_encoder = None
-            self.refine_mask_estimator = None
-
-    def compile_layers(
-        self,
-        mode: str = "default",
-        recompile_limit: int = 8,
-    ) -> int:
-        self.encoder.compile_layers(mode=mode, recompile_limit=recompile_limit)
-        count = len(self.encoder.time_layers) + len(self.encoder.freq_layers)
-        if self.refine_encoder is not None:
-            self.refine_encoder.compile_layers(
-                mode=mode,
-                recompile_limit=recompile_limit,
-            )
-            count += len(self.refine_encoder.time_layers) + len(
-                self.refine_encoder.freq_layers
-            )
-        return count
-
-    def forward_real_stages(
-        self,
-        mixture_real_imag: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        tokens = self.band_split.forward_real(mixture_real_imag)
-        encoded = self.encoder(tokens)
-        stage1 = self.mask_estimator.forward_real(encoded)
-
-        if self.refine_encoder is None:
-            return stage1, stage1
-        assert self.refine_split is not None
-        assert self.refine_fusion is not None
-        assert self.refine_mask_estimator is not None
-
-        # Refine from the first-stage estimated spectra rather than raw masks.
-        # This suppresses meaningless mask values in near-silent mixture bins and
-        # gives the second stage a physically grounded representation to repair.
-        mixture = mixture_real_imag[:, None]
-        mix_real, mix_imag = mixture.unbind(dim=-1)
-        mask_real, mask_imag = stage1.unbind(dim=-1)
-        estimate_real = mask_real * mix_real - mask_imag * mix_imag
-        estimate_imag = mask_real * mix_imag + mask_imag * mix_real
-        stage1_estimates = torch.stack((estimate_real, estimate_imag), dim=-1)
-
-        batch, stems, channels, freq, frames, two = stage1_estimates.shape
-        stage1_channels = stage1_estimates.reshape(
-            batch, stems * channels, freq, frames, two
-        )
-        refinement_tokens = self.refine_split.forward_real(stage1_channels)
-        refinement_tokens = self.refine_fusion(encoded, refinement_tokens)
-        refinement_tokens = self.refine_encoder(refinement_tokens)
-        correction = self.refine_mask_estimator.forward_real(refinement_tokens)
-        return stage1 + correction, stage1
 
     def forward_real(self, mixture_real_imag: torch.Tensor) -> torch.Tensor:
-        final, _ = self.forward_real_stages(mixture_real_imag)
-        return final
+        """Run the separator with real-valued graph inputs and outputs.
 
-    def forward_stages(
-        self,
-        mixture_spec: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        mixture_real_imag = torch.view_as_real(mixture_spec.to(torch.complex64))
-        final, stage1 = self.forward_real_stages(mixture_real_imag)
-        return torch.view_as_complex(final), torch.view_as_complex(stage1)
+        Keeping complex tensors outside this method lets TorchInductor compile the
+        compute-heavy model on backends that cannot generate Triton signatures for
+        complex dtypes.
+        """
+        tokens = self.band_split.forward_real(mixture_real_imag)
+        tokens = self.encoder(tokens)
+        return self.mask_estimator.forward_real(tokens)
 
     def forward(self, mixture_spec: torch.Tensor) -> torch.Tensor:
-        final, _ = self.forward_stages(mixture_spec)
-        return final
+        mixture_real_imag = torch.view_as_real(mixture_spec.to(torch.complex64))
+        masks_real_imag = self.forward_real(mixture_real_imag)
+        return torch.view_as_complex(masks_real_imag)
 
     def estimate_specs(
         self,
@@ -1181,6 +891,7 @@ class BSRoFormerSeparator(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         masks = self(mixture_spec)
         estimates = masks * mixture_spec[:, None]
+
         use_consistency = (
             self.config.mixture_consistency
             if mixture_consistency is None
@@ -1193,31 +904,32 @@ class BSRoFormerSeparator(nn.Module):
             estimates = estimates + weights * residual[:, None]
         return estimates, masks
 
+
 # -----------------------------------------------------------------------------
 # Losses
 # -----------------------------------------------------------------------------
-
 
 
 class MultiResolutionSTFTLoss(nn.Module):
     def __init__(
         self,
         resolutions: Sequence[tuple[int, int, int]] = (
+            (4096, 1024, 4096),
             (2048, 512, 2048),
             (1024, 256, 1024),
             (512, 128, 512),
             (256, 64, 256),
         ),
         activity_threshold: float = 1e-4,
-        compression: float = 0.3,
     ):
         super().__init__()
         self.resolutions = tuple(resolutions)
         self.activity_threshold = activity_threshold
-        self.compression = compression
         for index, (_, _, win_length) in enumerate(self.resolutions):
             self.register_buffer(
-                f"window_{index}", torch.hann_window(win_length), persistent=False
+                f"window_{index}",
+                torch.hann_window(win_length),
+                persistent=False,
             )
 
     def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -1230,10 +942,8 @@ class MultiResolutionSTFTLoss(nn.Module):
 
         for index, (n_fft, hop_length, win_length) in enumerate(self.resolutions):
             window = getattr(self, f"window_{index}")
-            # One larger cuFFT launch is faster than separate prediction/target
-            # launches and has the same gradients (the target half is detached).
-            combined_spec = torch.stft(
-                torch.cat((pred_flat, target_flat), dim=0),
+            pred_spec = torch.stft(
+                pred_flat,
                 n_fft=n_fft,
                 hop_length=hop_length,
                 win_length=win_length,
@@ -1241,8 +951,14 @@ class MultiResolutionSTFTLoss(nn.Module):
                 center=True,
                 return_complex=True,
             )
-            pred_spec, target_spec = combined_spec.split(
-                (pred_flat.shape[0], target_flat.shape[0]), dim=0
+            target_spec = torch.stft(
+                target_flat,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                window=window,
+                center=True,
+                return_complex=True,
             )
             pred_mag = pred_spec.abs()
             target_mag = target_spec.abs()
@@ -1251,34 +967,24 @@ class MultiResolutionSTFTLoss(nn.Module):
                 (pred_mag - target_mag).flatten(1), dim=1
             )
             target_norm = torch.linalg.vector_norm(target_mag.flatten(1), dim=1)
+            # Spectral convergence is a relative error and is undefined for a
+            # silent target. Dividing leakage by a tiny epsilon made silent stem
+            # channels produce losses in the hundreds of millions. The absolute
+            # log-magnitude and complex terms below still train those channels
+            # toward silence.
             active_diff_norm = diff_norm[active_targets]
             active_target_norm = target_norm[active_targets]
             spectral_convergence = (
                 active_diff_norm / active_target_norm.clamp_min(1e-6)
             ).sum() / active_targets.count_nonzero().clamp_min(1)
 
-            log_magnitude = F.l1_loss(torch.log1p(pred_mag), torch.log1p(target_mag))
+            log_magnitude = F.l1_loss(
+                torch.log1p(pred_mag),
+                torch.log1p(target_mag),
+            )
             complex_normalizer = target_mag.mean().detach().clamp_min(1e-4)
             complex_loss = (pred_spec - target_spec).abs().mean() / complex_normalizer
-
-            pred_compressed = pred_spec / pred_mag.clamp_min(1e-8)
-            pred_compressed = pred_compressed * pred_mag.clamp_min(1e-8).pow(
-                self.compression
-            )
-            target_compressed = target_spec / target_mag.clamp_min(1e-8)
-            target_compressed = target_compressed * target_mag.clamp_min(1e-8).pow(
-                self.compression
-            )
-            compressed_loss = F.l1_loss(
-                torch.view_as_real(pred_compressed),
-                torch.view_as_real(target_compressed),
-            )
-            total = total + (
-                spectral_convergence
-                + log_magnitude
-                + 0.25 * complex_loss
-                + 0.25 * compressed_loss
-            )
+            total = total + spectral_convergence + log_magnitude + 0.25 * complex_loss
 
         return total / len(self.resolutions)
 
@@ -1311,18 +1017,6 @@ def mid_side(audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return mid, side
 
 
-def compressed_complex_loss(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    compression: float = 0.3,
-) -> torch.Tensor:
-    pred_mag = prediction.abs().clamp_min(1e-8)
-    target_mag = target.abs().clamp_min(1e-8)
-    pred = prediction / pred_mag * pred_mag.pow(compression)
-    true = target / target_mag * target_mag.pow(compression)
-    return F.l1_loss(torch.view_as_real(pred), torch.view_as_real(true))
-
-
 class SeparationLoss(nn.Module):
     def __init__(self, model_config: ModelConfig, loss_config: LossConfig):
         super().__init__()
@@ -1330,7 +1024,9 @@ class SeparationLoss(nn.Module):
         self.loss_config = loss_config
         self.mrstft = MultiResolutionSTFTLoss()
         self.register_buffer(
-            "window", torch.hann_window(model_config.win_length), persistent=False
+            "window",
+            torch.hann_window(model_config.win_length),
+            persistent=False,
         )
 
     def forward(
@@ -1338,11 +1034,10 @@ class SeparationLoss(nn.Module):
         model: BSRoFormerSeparator,
         mixture_spec: torch.Tensor,
         target_audio: torch.Tensor,
-        target_specs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        masks, stage1_masks = model.forward_stages(mixture_spec)
+        # target_audio: [B, S, C, samples]
+        masks = model(mixture_spec)
         estimates = masks * mixture_spec[:, None]
-        stage1_estimates = stage1_masks * mixture_spec[:, None]
         if self.model_config.mixture_consistency:
             residual = mixture_spec - estimates.sum(dim=1)
             power = estimates.abs().square().clamp_min(1e-8)
@@ -1357,14 +1052,14 @@ class SeparationLoss(nn.Module):
             win_length=self.model_config.win_length,
             window=self.window,
         )
-        if target_specs is None:
-            target_specs = make_stft(
-                target_audio,
-                n_fft=self.model_config.n_fft,
-                hop_length=self.model_config.hop_length,
-                win_length=self.model_config.win_length,
-                window=self.window,
-            )
+
+        target_specs = make_stft(
+            target_audio,
+            n_fft=self.model_config.n_fft,
+            hop_length=self.model_config.hop_length,
+            win_length=self.model_config.win_length,
+            window=self.window,
+        )
 
         wave_loss = normalized_l1(pred_audio, target_audio)
         mrstft_loss = self.mrstft(pred_audio, target_audio)
@@ -1372,15 +1067,11 @@ class SeparationLoss(nn.Module):
         target_mag = target_specs.abs()
         spec_normalizer = target_mag.mean().detach().clamp_min(1e-4)
         main_complex = (estimates - target_specs).abs().mean() / spec_normalizer
-        main_logmag = F.l1_loss(torch.log1p(estimates.abs()), torch.log1p(target_mag))
-        main_compressed = compressed_complex_loss(estimates, target_specs)
-        main_stft_loss = main_complex + main_logmag + 0.5 * main_compressed
-
-        stage1_complex = (stage1_estimates - target_specs).abs().mean() / spec_normalizer
-        stage1_logmag = F.l1_loss(
-            torch.log1p(stage1_estimates.abs()), torch.log1p(target_mag)
+        main_logmag = F.l1_loss(
+            torch.log1p(estimates.abs()),
+            torch.log1p(target_mag),
         )
-        stage1_loss = stage1_complex + stage1_logmag
+        main_stft_loss = main_complex + main_logmag
 
         mix_power = mixture_spec.abs().square()
         ideal_masks = (
@@ -1388,15 +1079,13 @@ class SeparationLoss(nn.Module):
             / (mix_power[:, None] + 1e-5)
         )
         ideal_mag = ideal_masks.abs().clamp_max(8.0)
-        ideal_masks = torch.polar(ideal_mag, torch.angle(ideal_masks))
+        ideal_phase = torch.angle(ideal_masks)
+        ideal_masks = torch.polar(ideal_mag, ideal_phase)
         tf_weight = mixture_spec.abs()
-        tf_weight = tf_weight / tf_weight.mean(
-            dim=(-2, -1), keepdim=True
-        ).clamp_min(1e-4)
+        tf_weight = tf_weight / tf_weight.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-4)
         tf_weight = tf_weight.clamp(max=10.0)
-        mask_loss = ((masks - ideal_masks).abs() * tf_weight[:, None]).mean()
-        mask_loss = mask_loss + 0.25 * (
-            (stage1_masks - ideal_masks).abs() * tf_weight[:, None]
+        mask_loss = (
+            (masks - ideal_masks).abs() * tf_weight[:, None]
         ).mean()
 
         sdr_loss = scale_dependent_sdr_loss(pred_audio, target_audio)
@@ -1407,17 +1096,6 @@ class SeparationLoss(nn.Module):
             + normalized_l1(pred_side, true_side)
         )
 
-        target_rms = target_audio.square().mean(dim=(-2, -1)).sqrt()
-        silent = target_rms < 1e-4
-        if silent.any():
-            mixture_rms = target_audio.sum(dim=1).square().mean(dim=(-2, -1)).sqrt()
-            leakage = pred_audio.square().mean(dim=(-2, -1)).sqrt()
-            silence_loss = (
-                leakage / mixture_rms[:, None].clamp_min(1e-4)
-            )[silent].mean()
-        else:
-            silence_loss = pred_audio.new_tensor(0.0)
-
         cfg = self.loss_config
         total = (
             cfg.waveform_weight * wave_loss
@@ -1426,8 +1104,6 @@ class SeparationLoss(nn.Module):
             + cfg.mask_weight * mask_loss
             + cfg.sdr_weight * sdr_loss
             + cfg.midside_weight * midside_loss
-            + cfg.stage1_weight * stage1_loss
-            + cfg.silence_weight * silence_loss
         )
         metrics = {
             "wave": wave_loss.detach(),
@@ -1436,10 +1112,9 @@ class SeparationLoss(nn.Module):
             "mask": mask_loss.detach(),
             "sdr_loss": sdr_loss.detach(),
             "midside": midside_loss.detach(),
-            "stage1": stage1_loss.detach(),
-            "silence": silence_loss.detach(),
         }
         return total, metrics
+
 
 # -----------------------------------------------------------------------------
 # Dataset and augmentation
@@ -1462,12 +1137,10 @@ class StemDataset(Dataset):
         self,
         root_dir: str,
         sample_rate: int = 44_100,
-        segment_samples: int = 352_800,
+        segment_samples: int = 529_200,
         virtual_size: int = 50_000,
         remix_probability: float = 0.5,
         min_activity_rms: float = 1e-4,
-        eq_probability: float = 0.25,
-        stem_dropout_probability: float = 0.05,
     ):
         self.root_dir = root_dir
         self.sample_rate = sample_rate
@@ -1476,8 +1149,6 @@ class StemDataset(Dataset):
         self.virtual_size = virtual_size
         self.remix_probability = remix_probability
         self.min_activity_rms = min_activity_rms
-        self.eq_probability = eq_probability
-        self.stem_dropout_probability = stem_dropout_probability
         self.tracks: list[dict[str, AudioInfo]] = []
 
         track_dirs = [
@@ -1559,61 +1230,35 @@ class StemDataset(Dataset):
                 targets.append(self._load_segment(track[stem], start))
         return torch.stack(targets)
 
-    def _random_eq(self, audio: torch.Tensor) -> torch.Tensor:
-        if random.random() >= self.eq_probability:
-            return audio
-        output = audio
-        for _ in range(random.randint(1, 2)):
-            low = math.log(60.0)
-            high = math.log(min(16_000.0, self.sample_rate * 0.45))
-            center = math.exp(random.uniform(low, high))
-            gain = random.uniform(-4.5, 4.5)
-            q = math.exp(random.uniform(math.log(0.45), math.log(2.0)))
-            output = torchaudio.functional.equalizer_biquad(
-                output,
-                self.sample_rate,
-                center_freq=center,
-                gain=gain,
-                Q=q,
-            )
-        return torch.nan_to_num(output)
-
-    def _augment(self, targets: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _augment(targets: torch.Tensor) -> torch.Tensor:
+        # Independent source loudness is the most useful augmentation for remix
+        # generalization. Targets and mixture remain perfectly consistent.
         gains_db = torch.empty(targets.shape[0]).uniform_(-8.0, 4.0)
         gains = torch.pow(10.0, gains_db / 20.0).view(-1, 1, 1)
         targets = targets * gains
 
         for stem_index in range(targets.shape[0]):
-            targets[stem_index] = self._random_eq(targets[stem_index])
             if random.random() < 0.5:
                 targets[stem_index] = -targets[stem_index]
-
-            width = random.uniform(0.65, 1.35)
+            width = random.uniform(0.75, 1.25)
             mid = (targets[stem_index, 0] + targets[stem_index, 1]) * 0.5
             side = (targets[stem_index, 0] - targets[stem_index, 1]) * 0.5 * width
             targets[stem_index, 0] = mid + side
             targets[stem_index, 1] = mid - side
-
-            balance_db = random.uniform(-2.0, 2.0)
-            targets[stem_index, 0] *= db_to_gain(balance_db)
-            targets[stem_index, 1] *= db_to_gain(-balance_db)
-
-        # Pure-vocal and pure-instrumental examples strongly reduce leakage in
-        # silent regions without changing the dataset's file contract.
-        if random.random() < self.stem_dropout_probability:
-            targets[random.randrange(targets.shape[0])].zero_()
 
         if random.random() < 0.5:
             targets = targets.flip(dims=(1,))
 
         global_gain = db_to_gain(random.uniform(-4.0, 3.0))
         targets = targets * global_gain
+
         peak = targets.sum(dim=0).abs().amax()
         if peak > 1.0:
             targets = targets * (0.98 / peak)
-        return targets.contiguous()
+        return targets
 
-    def __getitem__(self, _: int) -> torch.Tensor:
+    def __getitem__(self, _: int) -> tuple[torch.Tensor, torch.Tensor]:
         last_error: Exception | None = None
         for _attempt in range(20):
             try:
@@ -1621,17 +1266,14 @@ class StemDataset(Dataset):
                 mixture = targets.sum(dim=0)
                 if mixture.square().mean().sqrt() < self.min_activity_rms:
                     continue
-                # Training derives the mixture spectrum by summing the target
-                # spectra, so returning a duplicate mixture would only add CPU
-                # collation, pinned-memory, and host-to-device transfer work.
-                return targets
-            except Exception as error:
+                return mixture, targets
+            except Exception as error:  # corrupted files should not kill workers
                 last_error = error
         raise RuntimeError(f"Unable to load a valid training example: {last_error}")
 
 
 # -----------------------------------------------------------------------------
-# EMA, optimizer, checkpointing
+# EMA, optimizer, scheduler, checkpointing
 # -----------------------------------------------------------------------------
 
 
@@ -1722,9 +1364,9 @@ class _EMAStateView(nn.Module):
 
 def build_optimizer(
     model: nn.Module,
+    lr: float,
     weight_decay: float,
     optimizer_name: str,
-    fused: bool = False,
 ) -> torch.optim.Optimizer:
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
@@ -1746,17 +1388,28 @@ def build_optimizer(
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
     if optimizer_name == "atan2" and AdamAtan2 is not None:
-        return AdamAtan2(parameter_groups, lr=TRAINING_LR)
+        return AdamAtan2(parameter_groups, lr=lr)
     if optimizer_name == "atan2" and AdamAtan2 is None:
         print("adam_atan2_pytorch is unavailable; falling back to AdamW.")
-    if fused:
-        print("Optimizer: fused CUDA AdamW.")
     return torch.optim.AdamW(
         parameter_groups,
-        lr=TRAINING_LR,
+        lr=lr,
         betas=(0.9, 0.95),
-        fused=fused,
     )
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Warm up once, then hold the learning rate for an unbounded run."""
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return max(1e-8, (step + 1) / max(1, warmup_steps))
+        return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def find_latest_checkpoint(folder: str = "ckpts") -> str | None:
@@ -1806,6 +1459,7 @@ def save_checkpoint(
     model: BSRoFormerSeparator,
     ema: EMA,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
     step: int,
     best_sdr: float,
@@ -1817,6 +1471,7 @@ def save_checkpoint(
         "ema_state_dict": clean_state_dict(ema.state_dict()),
         "ema_updates": ema.updates,
         "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "best_sdr": best_sdr,
         "avg_loss": avg_loss,
@@ -2074,6 +1729,7 @@ def train(
     model: BSRoFormerSeparator,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     loss_module: SeparationLoss,
     device: torch.device,
     args: argparse.Namespace,
@@ -2112,7 +1768,7 @@ def train(
         if args.reset_optimizer:
             print(
                 "Loaded exact raw weights, but --reset_optimizer starts fresh "
-                "optimizer, EMA, and global-step timelines."
+                "optimizer, scheduler, EMA, and global-step timelines."
             )
         else:
             if "ema_state_dict" in checkpoint_data:
@@ -2134,35 +1790,25 @@ def train(
                 optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
             else:
                 raise RuntimeError("Continuation checkpoint has no optimizer state.")
-            # Optimizer checkpoints include their current learning rates. Override
-            # older scheduled values so resumed runs remain locked to TRAINING_LR.
-            for parameter_group in optimizer.param_groups:
-                parameter_group["lr"] = TRAINING_LR
-                parameter_group["initial_lr"] = TRAINING_LR
+            if "scheduler_state_dict" in checkpoint_data:
+                scheduler.load_state_dict(checkpoint_data["scheduler_state_dict"])
+            else:
+                raise RuntimeError("Continuation checkpoint has no scheduler state.")
             if "scaler_state_dict" in checkpoint_data:
                 scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
             print(f"Resuming at optimizer step {step}.")
     elif checkpoint_data is not None:
         print(
             "Checkpoint is not an exact continuation. Using shape-matched weights "
-            "as a transfer initialization with a fresh optimizer, EMA "
+            "as a transfer initialization with a fresh optimizer, scheduler, EMA "
             "timeline, and global step."
         )
 
-    print(f"Learning rate locked at {TRAINING_LR:.1e}.")
-
     if args.compile:
-        compiler_environment = configure_windows_compile_environment()
-        if compiler_environment is not None:
-            print(
-                "Initialized the Windows C++ build environment from "
-                f"{compiler_environment}."
-            )
-        configure_torchinductor_cache()
-        compiled_units = model.compile_layers(mode="default", recompile_limit=8)
+        model.encoder.compile_layers(mode="default")
         print(
-            f"Compiled local-convolution and feed-forward paths in {compiled_units} "
-            "axial transformer units; attention and checkpoint boundaries remain eager."
+            f"Compiled {len(model.encoder.time_layers) + len(model.encoder.freq_layers)} "
+            "transformer units; activation checkpoint boundaries remain eager."
         )
 
     train_model = model
@@ -2191,7 +1837,7 @@ def train(
 
     previous_sigint_handler = signal.signal(signal.SIGINT, request_stop)
 
-    while not stop_requested and (args.max_steps <= 0 or step < args.max_steps):
+    while not stop_requested:
         model.train()
         accumulated_loss_tensor = torch.zeros((), device=device)
         latest_metrics: dict[str, torch.Tensor] = {}
@@ -2199,30 +1845,26 @@ def train(
 
         for _micro_step in range(args.grad_accumulation):
             try:
-                target_audio = next(data_iterator)
+                mixture_audio, target_audio = next(data_iterator)
             except StopIteration:
                 data_iterator = iter(dataloader)
-                target_audio = next(data_iterator)
+                mixture_audio, target_audio = next(data_iterator)
 
+            mixture_audio = mixture_audio.to(device, non_blocking=True)
             target_audio = target_audio.to(device, non_blocking=True)
-            # STFT is linear, so transforming the stems once and summing their
-            # spectra avoids a separate mixture STFT and reuses the target STFT
-            # needed by the loss.
-            target_specs = make_stft(
-                target_audio,
+            mixture_spec = make_stft(
+                mixture_audio,
                 n_fft=model.config.n_fft,
                 hop_length=model.config.hop_length,
                 win_length=model.config.win_length,
                 window=stft_window,
             )
-            mixture_spec = target_specs.sum(dim=1)
 
             with autocast_context(device, args.precision):
                 loss, latest_metrics = loss_module(
                     train_model,  # type: ignore[arg-type]
                     mixture_spec,
                     target_audio,
-                    target_specs=target_specs,
                 )
                 scaled_loss = loss / args.grad_accumulation
 
@@ -2252,6 +1894,7 @@ def train(
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
         ema.update()
 
         step += 1
@@ -2287,16 +1930,13 @@ def train(
         progress.update(1)
 
         if step % args.checkpoint_steps == 0:
-            # Write the resumable checkpoint before validation, which can take a
-            # long time or be interrupted.  best_sdr is the most recently known
-            # validation score; a newly improved score is stored separately in
-            # best_ckpts after this validation finishes.
             regular_path = f"ckpts/checkpoint_step_{step}.pt"
             save_checkpoint(
                 regular_path,
                 model,
                 ema,
                 optimizer,
+                scheduler,
                 scaler,
                 step,
                 best_sdr,
@@ -2349,6 +1989,7 @@ def train(
                     model,
                     ema,
                     optimizer,
+                    scheduler,
                     scaler,
                     step,
                     best_sdr,
@@ -2370,14 +2011,14 @@ def train(
             model,
             ema,
             optimizer,
+            scheduler,
             scaler,
             step,
             best_sdr,
             avg_loss,
         )
         prune_old_checkpoints("ckpts", keep=3)
-        reason = "reached max_steps" if args.max_steps > 0 and step >= args.max_steps else "stopped cleanly"
-        print(f"Training {reason}; checkpoint saved to {stopped_path}.")
+        print(f"Training stopped cleanly; checkpoint saved to {stopped_path}.")
 
 
 # -----------------------------------------------------------------------------
@@ -2396,17 +2037,12 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         num_bands=args.num_bands,
         dim=args.model_dim,
         depth=args.depth,
-        refine_depth=args.refine_depth,
         heads=args.heads,
         ff_mult=args.ff_mult,
         dropout=args.dropout,
-        drop_path=args.drop_path,
-        local_kernel=args.local_kernel,
         layer_scale_init=args.layer_scale_init,
-        refine_mask_scale=args.refine_mask_scale,
         use_checkpoint=args.ckpt,
         mixture_consistency=not args.disable_mixture_consistency,
-        architecture="bs_roformer_124",
     )
 
 
@@ -2462,10 +2098,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "4090-tuned disjoint BS-RoFormer with local convolution and "
-            "two-stage complex-mask refinement"
-        )
+        description="124-band non-overlapping BS-RoFormer music source separator"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
@@ -2487,59 +2120,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_fft", type=int, default=4096)
     parser.add_argument("--hop_length", type=int, default=1024)
     parser.add_argument("--win_length", type=int, default=4096)
-    parser.add_argument("--segment_seconds", type=float, default=5.0)
+    parser.add_argument("--segment_seconds", type=float, default=8.0)
     parser.add_argument("--inference_overlap_seconds", type=float, default=2.0)
 
     parser.add_argument("--num_bands", type=int, default=124)
     parser.add_argument("--model_dim", type=int, default=384)
     parser.add_argument("--depth", type=int, default=12)
-    parser.add_argument("--refine_depth", type=int, default=2)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--ff_mult", type=float, default=8.0 / 3.0)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--drop_path", type=float, default=0.05)
-    parser.add_argument("--local_kernel", type=int, default=7)
     parser.add_argument("--layer_scale_init", type=float, default=0.1)
-    parser.add_argument("--refine_mask_scale", type=float, default=0.05)
-    parser.add_argument(
-        "--ckpt",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Checkpoint transformer activations to fit the default model in 24 GB.",
-    )
-    parser.add_argument(
-        "--compile",
-        action="store_true",
-        help="Compile convolution/FFN submodules (slower startup, faster steady state).",
-    )
+    parser.add_argument("--ckpt", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--compile", action="store_true")
     parser.add_argument(
         "--attention_backend",
         choices=("fused", "flash", "auto", "math"),
         default="fused",
         help=(
-            "CUDA attention backend. 'fused' tries external flash-attn, PyTorch "
-            "Flash, then memory-efficient attention with no math fallback."
+            "CUDA attention backend. 'fused' tries the external flash-attn package, "
+            "PyTorch Flash, cuDNN, then memory-efficient attention with no math "
+            "fallback; 'flash' requires external or PyTorch Flash Attention."
         ),
     )
     parser.add_argument("--disable_mixture_consistency", action="store_true")
 
-    # A five-second crop with batch 1 sustains >1.3 optimizer steps/s on the
-    # target RTX 4090 while retaining the full 93M-parameter architecture.
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accumulation", type=int, default=1)
+    parser.add_argument("--grad_accumulation", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--dataset_size", type=int, default=50_000)
     parser.add_argument("--remix_probability", type=float, default=0.5)
-    parser.add_argument("--eq_probability", type=float, default=0.25)
-    parser.add_argument("--stem_dropout_probability", type=float, default=0.05)
-    parser.add_argument("--checkpoint_steps", type=int, default=5_000)
-    parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=0,
-        help="Stop after this many optimizer steps; 0 trains until stopped.",
-    )
+    parser.add_argument("--checkpoint_steps", type=int, default=4_000)
+    parser.add_argument("--warmup_steps", type=int, default=4_000)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--optimizer", choices=("adamw", "atan2"), default="adamw")
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -2561,20 +2173,16 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{field} must be positive.")
     if args.num_workers < 0:
         raise ValueError("--num_workers cannot be negative.")
-    if args.prefetch_factor <= 0:
-        raise ValueError("--prefetch_factor must be positive.")
-    if args.max_steps < 0:
-        raise ValueError("--max_steps cannot be negative.")
+    if args.warmup_steps < 0:
+        raise ValueError("--warmup_steps cannot be negative.")
     if args.grad_clip <= 0.0:
         raise ValueError("--grad_clip must be positive.")
+    if args.lr <= 0.0:
+        raise ValueError("--lr must be positive.")
     if args.weight_decay < 0.0:
         raise ValueError("--weight_decay cannot be negative.")
     if not 0.0 <= args.remix_probability <= 1.0:
         raise ValueError("--remix_probability must be in [0, 1].")
-    if not 0.0 <= args.eq_probability <= 1.0:
-        raise ValueError("--eq_probability must be in [0, 1].")
-    if not 0.0 <= args.stem_dropout_probability <= 1.0:
-        raise ValueError("--stem_dropout_probability must be in [0, 1].")
     if not 0.0 <= args.ema_decay < 1.0:
         raise ValueError("--ema_decay must be in [0, 1).")
     if args.segment_seconds <= 0.0:
@@ -2598,7 +2206,6 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
 
     args.segment_samples = int(round(args.segment_seconds * args.sample_rate))
     args.inference_overlap = int(
@@ -2652,7 +2259,7 @@ def main() -> None:
         if isinstance(module, GatedRoPEAttention):
             module.attention_backend = args.attention_backend
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    print(f"BS-RoFormer Local+Refine parameters: {parameter_count / 1e6:.2f}M")
+    print(f"BS-RoFormer parameters: {parameter_count / 1e6:.2f}M")
     if device.type == "cuda":
         flash_available = getattr(
             torch.backends.cuda, "is_flash_attention_available", lambda: True
@@ -2676,17 +2283,17 @@ def main() -> None:
             if external_flash_attn_func is not None:
                 print(
                     "CUDA attention backend: external flash-attn package "
-                    "(memory-efficient fallback available)."
+                    "(cuDNN/memory-efficient fallback available)."
                 )
             elif flash_available:
                 print(
-                    "CUDA attention backend: fused (PyTorch Flash, then "
+                    "CUDA attention backend: fused (PyTorch Flash, cuDNN, then "
                     "memory-efficient; math disabled)."
                 )
             else:
                 print(
                     "Flash Attention is unavailable in this PyTorch build; using "
-                    "fused memory-efficient attention with math disabled."
+                    "fused cuDNN/memory-efficient attention with math disabled."
                 )
         else:
             print(f"CUDA attention backend: {args.attention_backend}.")
@@ -2694,22 +2301,12 @@ def main() -> None:
     if args.train:
         if checkpoint_path:
             print(f"Checkpoint selected: {checkpoint_path}")
-        print(
-            "Training throughput: "
-            f"batch {args.batch_size} x accumulation {args.grad_accumulation} "
-            f"= effective batch {args.batch_size * args.grad_accumulation}; "
-            f"{args.segment_seconds * args.batch_size * args.grad_accumulation:.1f} "
-            "audio-seconds/step; "
-            f"{args.num_workers} workers, prefetch {args.prefetch_factor}."
-        )
         dataset = StemDataset(
             root_dir=args.data_dir,
             sample_rate=config.sample_rate,
             segment_samples=args.segment_samples,
             virtual_size=args.dataset_size,
             remix_probability=args.remix_probability,
-            eq_probability=args.eq_probability,
-            stem_dropout_probability=args.stem_dropout_probability,
         )
         generator = torch.Generator()
         generator.manual_seed(args.seed)
@@ -2720,22 +2317,26 @@ def main() -> None:
             num_workers=args.num_workers,
             pin_memory=device.type == "cuda",
             persistent_workers=args.num_workers > 0,
-            prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
             worker_init_fn=seed_worker,
             generator=generator,
             drop_last=True,
         )
         optimizer = build_optimizer(
             model,
+            lr=args.lr,
             weight_decay=args.weight_decay,
             optimizer_name=args.optimizer,
-            fused=device.type == "cuda",
+        )
+        scheduler = build_scheduler(
+            optimizer,
+            warmup_steps=args.warmup_steps,
         )
         loss_module = SeparationLoss(config, LossConfig())
         train(
             model,
             dataloader,
             optimizer,
+            scheduler,
             loss_module,
             device,
             args,

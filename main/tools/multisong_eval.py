@@ -348,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="wav",
         help="WAV/FLOAT preserves model output; FLAC/PCM_24 is smaller but quantized.",
     )
-    parser.add_argument("--segment-seconds", type=float, default=5.0)
+    parser.add_argument("--segment-seconds", type=float, default=8.0)
     parser.add_argument("--overlap-seconds", type=float, default=2.0)
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--device", default=None, help="Torch device, for example cuda or cpu.")
