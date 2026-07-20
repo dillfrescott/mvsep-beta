@@ -8,7 +8,7 @@ non-vocal accompaniment).  For the MVSEP leaderboard the latter must be named
     multisong.zip
 
 The archive contains both stems as a flat list of files, such as
-``song_086_vocals.wav`` and ``song_086_instrum.wav``.  No parent directory is
+``song_086_vocals.flac`` and ``song_086_instrum.flac``.  No parent directory is
 stored in the ZIP.
 """
 
@@ -330,8 +330,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--format",
         choices=tuple(OUTPUT_FORMATS),
-        default="wav",
-        help="WAV/FLOAT preserves model output; FLAC/PCM_24 is smaller but quantized.",
+        default="flac",
+        help=(
+            "Output format inside the ZIP (default: flac). FLAC uses lossless "
+            "compression after quantizing to PCM_24; WAV/FLOAT preserves "
+            "unquantized model output."
+        ),
     )
     parser.add_argument("--segment-seconds", type=float, default=8.0)
     parser.add_argument("--overlap-seconds", type=float, default=2.0)
