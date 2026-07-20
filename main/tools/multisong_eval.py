@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """Run the MVSEP model over the official Multisong evaluation mixtures.
 
-MVSEP accepts either one 100-file archive for a single stem or one 500-file
-archive for all five stems.  This repository's model predicts two sources:
-``vocals`` and ``other`` (the non-vocal accompaniment).  For the MVSEP
-leaderboard the latter must be submitted as ``instrum``.  Consequently this
-tool processes every mixture once and creates two valid, separate archives:
+This repository's model predicts two sources: ``vocals`` and ``other`` (the
+non-vocal accompaniment).  For the MVSEP leaderboard the latter must be named
+``instrum``.  This tool processes every mixture once and creates one archive:
 
-    multisong_vocals.zip
-    multisong_instrum.zip
+    multisong.zip
 
-Each archive contains a flat list of files such as ``song_086_vocals.wav`` or
-``song_086_instrum.wav``.  No parent directory is stored in either ZIP.
+The archive contains both stems as a flat list of files, such as
+``song_086_vocals.wav`` and ``song_086_instrum.wav``.  No parent directory is
+stored in the ZIP.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 import re
 import sys
@@ -80,19 +77,23 @@ def discover_mixtures(dataset_dir: Path, expected_songs: int) -> list[Mixture]:
 
 
 def expected_archive_names(
-    mixtures: Sequence[Mixture], stem: str, extension: str
+    mixtures: Sequence[Mixture], stems: Sequence[str], extension: str
 ) -> set[str]:
-    return {f"{mixture.prefix}_{stem}.{extension}" for mixture in mixtures}
+    return {
+        f"{mixture.prefix}_{stem}.{extension}"
+        for mixture in mixtures
+        for stem in stems
+    }
 
 
 def validate_archive(
     archive_path: Path,
     mixtures: Sequence[Mixture],
-    stem: str,
+    stems: Sequence[str],
     extension: str,
 ) -> None:
     """Reject missing, extra, duplicate, or nested submission entries."""
-    expected = expected_archive_names(mixtures, stem, extension)
+    expected = expected_archive_names(mixtures, stems, extension)
     with zipfile.ZipFile(archive_path, "r") as archive:
         names = archive.namelist()
         bad_paths = [name for name in names if Path(name).name != name]
@@ -105,7 +106,7 @@ def validate_archive(
             missing = sorted(expected - actual)
             extra = sorted(actual - expected)
             raise RuntimeError(
-                f"Invalid {stem} archive; missing={missing[:3]}, extra={extra[:3]}"
+                f"Invalid archive; missing={missing[:3]}, extra={extra[:3]}"
             )
         bad_entry = archive.testzip()
         if bad_entry is not None:
@@ -173,10 +174,10 @@ def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any, Path]:
     return mvsep, model, device, checkpoint
 
 
-def temporary_archive_path(output_dir: Path, stem: str) -> Path:
+def temporary_archive_path(output_dir: Path) -> Path:
     handle = tempfile.NamedTemporaryFile(
         dir=output_dir,
-        prefix=f".{stem}_",
+        prefix=".multisong_",
         suffix=".zip.tmp",
         delete=False,
     )
@@ -219,15 +220,11 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    final_paths = {
-        stem: output_dir / f"{args.archive_prefix}_{stem}.zip" for stem in args.stems
-    }
-    existing = [path for path in final_paths.values() if path.exists()]
-    if existing and not args.overwrite:
+    final_path = output_dir / f"{args.archive_prefix}.zip"
+    if final_path.exists() and not args.overwrite:
         raise FileExistsError(
-            "Refusing to replace existing archive(s): "
-            + ", ".join(str(path) for path in existing)
-            + ". Pass --overwrite to replace them."
+            f"Refusing to replace existing archive: {final_path}. "
+            "Pass --overwrite to replace it."
         )
 
     mvsep, model, device, checkpoint = load_model(args)
@@ -243,24 +240,15 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
     print(f"Checkpoint: {checkpoint}")
     print(f"Output stems: {', '.join(args.stems)}")
 
-    temporary_archives = {
-        stem: temporary_archive_path(output_dir, stem) for stem in args.stems
-    }
+    temporary_archive = temporary_archive_path(output_dir)
     completed: list[Path] = []
     try:
-        with contextlib.ExitStack() as stack:
-            archives = {
-                stem: stack.enter_context(
-                    zipfile.ZipFile(
-                        temporary_archives[stem],
-                        mode="w",
-                        compression=zipfile.ZIP_STORED,
-                        allowZip64=True,
-                    )
-                )
-                for stem in args.stems
-            }
-
+        with zipfile.ZipFile(
+            temporary_archive,
+            mode="w",
+            compression=zipfile.ZIP_STORED,
+            allowZip64=True,
+        ) as archive:
             progress: Iterable[Mixture] = mvsep.tqdm(mixtures, desc="Multisong")
             for mixture in progress:
                 audio = mvsep.read_input_audio(str(mixture.path), config.sample_rate)
@@ -283,7 +271,7 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
                         )
                     entry_name = f"{mixture.prefix}_{mvsep_stem}.{args.format}"
                     write_prediction(
-                        archives[mvsep_stem],
+                        archive,
                         prediction,
                         config.sample_rate,
                         entry_name,
@@ -292,19 +280,16 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
                         mvsep.sf,
                     )
 
-        for stem, temporary_path in temporary_archives.items():
-            validate_archive(
-                temporary_path,
-                mixtures,
-                stem=stem,
-                extension=args.format,
-            )
-        for stem, temporary_path in temporary_archives.items():
-            os.replace(temporary_path, final_paths[stem])
-            completed.append(final_paths[stem])
+        validate_archive(
+            temporary_archive,
+            mixtures,
+            stems=args.stems,
+            extension=args.format,
+        )
+        os.replace(temporary_archive, final_path)
+        completed.append(final_path)
     except BaseException:
-        for temporary_path in temporary_archives.values():
-            temporary_path.unlink(missing_ok=True)
+        temporary_archive.unlink(missing_ok=True)
         raise
 
     return completed
@@ -313,8 +298,8 @@ def process_dataset(args: argparse.Namespace) -> list[Path]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Process the official MVSEP Multisong mixtures and create one valid "
-            "100-file ZIP per selected leaderboard stem."
+            "Process the official MVSEP Multisong mixtures and create one flat "
+            "ZIP containing all selected leaderboard stems."
         )
     )
     parser.add_argument(
@@ -333,14 +318,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use the latest ckpts/checkpoint_step_*.pt instead of best_ckpts.",
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("submissions"))
+    parser.add_argument("--output-dir", type=Path, default=Path("."))
     parser.add_argument("--archive-prefix", default="multisong")
     parser.add_argument(
         "--stems",
         nargs="+",
         choices=tuple(MVSEP_TO_MODEL_STEM),
         default=list(MVSEP_TO_MODEL_STEM),
-        help="Create separate archives for these stems (default: vocals instrum).",
+        help="Include these stems in the archive (default: vocals instrum).",
     )
     parser.add_argument(
         "--format",
