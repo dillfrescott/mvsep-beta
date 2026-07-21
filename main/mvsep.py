@@ -23,11 +23,6 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 try:
-    from adam_atan2_pytorch import AdamAtan2
-except ImportError:
-    AdamAtan2 = None
-
-try:
     from flash_attn import flash_attn_func as external_flash_attn_func
 except (ImportError, OSError) as error:
     external_flash_attn_func = None
@@ -48,12 +43,12 @@ AUDIO_EXTENSIONS = (".wav", ".flac")
 @dataclass
 class ModelConfig:
     sample_rate: int = 44_100
-    n_fft: int = 4096
-    hop_length: int = 1024
-    win_length: int = 4096
+    n_fft: int = 2048
+    hop_length: int = 512
+    win_length: int = 2048
     audio_channels: int = 2
     num_stems: int = len(STEMS)
-    num_bands: int = 124
+    num_bands: int = 62
     dim: int = 384
     depth: int = 12
     heads: int = 8
@@ -61,8 +56,7 @@ class ModelConfig:
     dropout: float = 0.0
     layer_scale_init: float = 0.1
     use_checkpoint: bool = True
-    mixture_consistency: bool = True
-    architecture: str = "bs_roformer_124"
+    architecture: str = "bs_roformer_62"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -79,8 +73,6 @@ class ModelConfig:
             raise ValueError(
                 f"num_stems must match STEMS ({len(STEMS)}), got {self.num_stems}."
             )
-        if self.num_bands <= 1:
-            raise ValueError("num_bands must be greater than one.")
         if self.dim <= 0 or self.depth <= 0 or self.heads <= 0:
             raise ValueError("dim, depth, and heads must be positive.")
         if self.dim % self.heads != 0:
@@ -93,9 +85,9 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.layer_scale_init < 0.0:
             raise ValueError("layer_scale_init must be non-negative.")
-        if self.architecture != "bs_roformer_124":
+        if self.architecture != "bs_roformer_62":
             raise ValueError(
-                f"Unsupported architecture {self.architecture!r}; expected bs_roformer_124."
+                f"Unsupported architecture {self.architecture!r}; expected bs_roformer_62."
             )
 
 
@@ -134,6 +126,25 @@ def clean_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Ten
         key = key.replace("_orig_mod.", "").replace("._orig_mod", "")
         cleaned[key] = value
     return cleaned
+
+
+RUNTIME_CONFIG_FIELDS = frozenset({"use_checkpoint"})
+
+
+def model_configs_compatible(
+    saved_config: dict | None,
+    current_config: ModelConfig,
+) -> bool:
+    """Compare checkpoint-sensitive model fields, excluding runtime switches."""
+    if not isinstance(saved_config, dict):
+        return False
+    current = asdict(current_config)
+    for key, current_value in current.items():
+        if key in RUNTIME_CONFIG_FIELDS:
+            continue
+        if saved_config.get(key) != current_value:
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -193,16 +204,11 @@ def build_bs_bands(
 ) -> list[tuple[int, int]]:
     """Build disjoint BS-RoFormer frequency bands.
 
-    The default 124-band / 4096-FFT preset is a high-resolution adaptation of
-    the commonly used handcrafted 62-band BS-RoFormer layout.  The original
-    layout covers 1025 bins with widths
+    The default 62-band / 2048-FFT preset uses the commonly used handcrafted
+    BS-RoFormer layout. It covers all 1025 bins of a real 2048-point STFT with
+    widths
 
         24x2, 12x4, 8x12, 8x24, 8x48, 128, 129.
-
-    At 4096 FFT resolution, each original frequency interval has twice as many
-    bins. Splitting each doubled interval in half yields 124 disjoint bands
-    while preserving the same piecewise frequency allocation. The final band
-    is shortened by one bin because a real 4096-point STFT has 2049 bins.
 
     For non-default settings, a deterministic power-law layout is used. It is
     still a strict band split: no overlap, no duplicated bins, and no mask
@@ -216,8 +222,8 @@ def build_bs_bands(
             f"Cannot create {num_bands} non-empty bands from {freq_bins} bins."
         )
 
-    if n_fft == 4096 and num_bands == 124:
-        base_62 = (
+    if n_fft == 2048 and num_bands == 62:
+        widths = (
             [2] * 24
             + [4] * 12
             + [12] * 8
@@ -225,9 +231,6 @@ def build_bs_bands(
             + [48] * 8
             + [128, 129]
         )
-        widths = [width for width in base_62 for _ in range(2)]
-        # Repeating the 1025-bin layout gives 2050 bins; real STFT has 2049.
-        widths[-1] -= 1
     else:
         # A handcrafted-style fallback with many narrow low-frequency bands
         # and progressively wider high-frequency bands. This is deliberately
@@ -522,8 +525,16 @@ class DualPathEncoder(nn.Module):
         checkpoint calls eager and compiling only the work they wrap preserves
         checkpoint recomputation and its expected peak-memory behavior.
         """
+        if mode != "default":
+            raise ValueError("compile_layers currently supports only the default mode.")
         for unit in (*self.time_layers, *self.freq_layers):
-            unit.compile(mode=mode)
+            # Inductor's comprehensive padding can give saved RMSNorm tensors a
+            # padded sequence stride (for example 1056 for 1034 frames). During
+            # non-reentrant checkpoint recomputation it may instead produce the
+            # ordinary contiguous stride, causing the compiled backward to reject
+            # an otherwise identical tensor. Keep compilation enabled, but avoid
+            # that checkpoint-incompatible internal layout optimization.
+            unit.compile(options={"comprehensive_padding": False})
 
     @staticmethod
     def _run_unit(
@@ -736,13 +747,26 @@ class BandMaskGroup(nn.Module):
         self.register_buffer("freq_indices", freq_indices, persistent=False)
         self.register_buffer("feature_valid", feature_valid, persistent=False)
 
+        # A band-specific nonlinear mask head is materially more expressive than
+        # projecting every band directly from the shared encoder representation.
+        # Keeping the hidden width at ``dim`` controls the parameter cost of the
+        # 62-band layout while still giving every band its own two-layer MLP.
+        hidden_width = config.dim
         output_width = config.num_stems * self.feature_width
+        self.hidden_weight = nn.Parameter(
+            torch.empty(self.num_group_bands, config.dim, hidden_width)
+        )
+        self.hidden_bias = nn.Parameter(
+            torch.zeros(self.num_group_bands, hidden_width)
+        )
         self.output_weight = nn.Parameter(
-            torch.empty(self.num_group_bands, config.dim, output_width)
+            torch.empty(self.num_group_bands, hidden_width, output_width * 2)
         )
         self.output_bias = nn.Parameter(
-            torch.zeros(self.num_group_bands, output_width)
+            torch.zeros(self.num_group_bands, output_width * 2)
         )
+        for band in range(self.num_group_bands):
+            nn.init.xavier_uniform_(self.hidden_weight[band])
         nn.init.normal_(self.output_weight, std=1e-3)
 
     def forward(
@@ -750,8 +774,10 @@ class BandMaskGroup(nn.Module):
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # x: [B, T, group_bands, D]
-        raw = torch.einsum("btnd,ndq->btnq", x, self.output_weight)
-        raw = raw + self.output_bias[None, None]
+        hidden = torch.einsum("btnd,ndh->btnh", x, self.hidden_weight)
+        hidden = torch.tanh(hidden + self.hidden_bias[None, None])
+        raw = torch.einsum("btnh,nhq->btnq", hidden, self.output_weight)
+        raw = F.glu(raw + self.output_bias[None, None], dim=-1)
         raw = raw.reshape(
             x.shape[0],
             x.shape[1],
@@ -887,21 +913,13 @@ class BSRoFormerSeparator(nn.Module):
     def estimate_specs(
         self,
         mixture_spec: torch.Tensor,
-        mixture_consistency: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         masks = self(mixture_spec)
         estimates = masks * mixture_spec[:, None]
-
-        use_consistency = (
-            self.config.mixture_consistency
-            if mixture_consistency is None
-            else mixture_consistency
-        )
-        if use_consistency:
-            residual = mixture_spec - estimates.sum(dim=1)
-            power = estimates.abs().square().clamp_min(1e-8)
-            weights = power / power.sum(dim=1, keepdim=True).clamp_min(1e-8)
-            estimates = estimates + weights * residual[:, None]
+        residual = mixture_spec - estimates.sum(dim=1)
+        power = estimates.abs().square().clamp_min(1e-8)
+        weights = power / power.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        estimates = estimates + weights * residual[:, None]
         return estimates, masks
 
 
@@ -914,11 +932,10 @@ class MultiResolutionSTFTLoss(nn.Module):
     def __init__(
         self,
         resolutions: Sequence[tuple[int, int, int]] = (
-            (4096, 1024, 4096),
-            (2048, 512, 2048),
-            (1024, 256, 1024),
-            (512, 128, 512),
-            (256, 64, 256),
+            (2048, 147, 2048),
+            (1024, 147, 1024),
+            (512, 147, 512),
+            (256, 147, 256),
         ),
         activity_threshold: float = 1e-4,
     ):
@@ -1038,11 +1055,10 @@ class SeparationLoss(nn.Module):
         # target_audio: [B, S, C, samples]
         masks = model(mixture_spec)
         estimates = masks * mixture_spec[:, None]
-        if self.model_config.mixture_consistency:
-            residual = mixture_spec - estimates.sum(dim=1)
-            power = estimates.abs().square().clamp_min(1e-8)
-            weights = power / power.sum(dim=1, keepdim=True).clamp_min(1e-8)
-            estimates = estimates + weights * residual[:, None]
+        residual = mixture_spec - estimates.sum(dim=1)
+        power = estimates.abs().square().clamp_min(1e-8)
+        weights = power / power.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        estimates = estimates + weights * residual[:, None]
 
         pred_audio = make_istft(
             estimates,
@@ -1132,12 +1148,55 @@ class AudioInfo:
         return self.frames / self.sample_rate
 
 
+def find_optional_audio_file(directory: str, stem: str) -> str | None:
+    by_lower_name = {name.lower(): name for name in os.listdir(directory)}
+    for extension in AUDIO_EXTENSIONS:
+        candidate = f"{stem}{extension}"
+        actual = by_lower_name.get(candidate.lower())
+        if actual is not None:
+            return os.path.join(directory, actual)
+    return None
+
+
+def resolve_target_paths(directory: str) -> dict[str, tuple[str, ...]] | None:
+    """Resolve a track to the logical two-stem training contract.
+
+    Native two-stem datasets may provide ``vocals`` plus ``other``,
+    ``instrumental``, or ``accompaniment``. Standard MUSDB tracks instead store
+    bass, drums, and other separately; those three files must be summed or the
+    training mixture would silently omit most of the accompaniment.
+    """
+    vocals = find_optional_audio_file(directory, "vocals")
+    if vocals is None:
+        return None
+
+    bass = find_optional_audio_file(directory, "bass")
+    drums = find_optional_audio_file(directory, "drums")
+    other = find_optional_audio_file(directory, "other")
+    if bass is not None and drums is not None and other is not None:
+        accompaniment = (bass, drums, other)
+    elif bass is not None or drums is not None:
+        # A partially populated MUSDB track is unsafe: falling back to other
+        # would create a mixture with missing accompaniment components.
+        return None
+    else:
+        accompaniment_path = (
+            find_optional_audio_file(directory, "instrumental")
+            or find_optional_audio_file(directory, "accompaniment")
+            or other
+        )
+        if accompaniment_path is None:
+            return None
+        accompaniment = (accompaniment_path,)
+    return {"vocals": (vocals,), "other": accompaniment}
+
+
 class StemDataset(Dataset):
     def __init__(
         self,
         root_dir: str,
         sample_rate: int = 44_100,
-        segment_samples: int = 529_200,
+        segment_samples: int = 352_800,
         virtual_size: int = 50_000,
         remix_probability: float = 0.5,
         min_activity_rms: float = 1e-4,
@@ -1149,7 +1208,7 @@ class StemDataset(Dataset):
         self.virtual_size = virtual_size
         self.remix_probability = remix_probability
         self.min_activity_rms = min_activity_rms
-        self.tracks: list[dict[str, AudioInfo]] = []
+        self.tracks: list[dict[str, tuple[AudioInfo, ...]]] = []
 
         track_dirs = [
             os.path.join(root_dir, name)
@@ -1157,30 +1216,26 @@ class StemDataset(Dataset):
             if os.path.isdir(os.path.join(root_dir, name))
         ]
         print("Scanning track metadata...")
+        musdb_tracks = 0
         for track_dir in tqdm(track_dirs, desc="Caching tracks"):
-            track: dict[str, AudioInfo] = {}
-            for stem in STEMS:
-                path = self._find_audio_file(track_dir, stem)
-                if path is None:
-                    break
-                info = sf.info(path)
-                track[stem] = AudioInfo(path, info.frames, info.samplerate)
-            if len(track) == len(STEMS):
-                self.tracks.append(track)
+            resolved = resolve_target_paths(track_dir)
+            if resolved is None:
+                continue
+            track: dict[str, tuple[AudioInfo, ...]] = {}
+            for stem, paths in resolved.items():
+                infos = tuple(sf.info(path) for path in paths)
+                track[stem] = tuple(
+                    AudioInfo(path, info.frames, info.samplerate)
+                    for path, info in zip(paths, infos)
+                )
+            self.tracks.append(track)
+            musdb_tracks += int(len(track["other"]) == 3)
 
         if not self.tracks:
             raise RuntimeError(f"No complete {STEMS} tracks found under {root_dir!r}.")
-        print(f"Cached {len(self.tracks)} complete tracks.")
-
-    @staticmethod
-    def _find_audio_file(directory: str, stem: str) -> str | None:
-        by_lower_name = {name.lower(): name for name in os.listdir(directory)}
-        for extension in AUDIO_EXTENSIONS:
-            candidate = f"{stem}{extension}"
-            actual = by_lower_name.get(candidate.lower())
-            if actual is not None:
-                return os.path.join(directory, actual)
-        return None
+        print(
+            f"Cached {len(self.tracks)} complete tracks"
+        )
 
     def __len__(self) -> int:
         return self.virtual_size
@@ -1212,22 +1267,37 @@ class StemDataset(Dataset):
             audio = audio[..., : self.segment_samples]
         return audio.contiguous()
 
-    def _random_start(self, info: AudioInfo) -> float:
-        return random.uniform(0.0, max(0.0, info.duration - self.segment_seconds))
+    def _load_target(
+        self,
+        infos: Sequence[AudioInfo],
+        start_seconds: float,
+    ) -> torch.Tensor:
+        components = [self._load_segment(info, start_seconds) for info in infos]
+        return torch.stack(components).sum(dim=0)
+
+    @staticmethod
+    def _target_duration(infos: Sequence[AudioInfo]) -> float:
+        return min(info.duration for info in infos)
+
+    def _random_start(self, infos: Sequence[AudioInfo]) -> float:
+        duration = self._target_duration(infos)
+        return random.uniform(0.0, max(0.0, duration - self.segment_seconds))
 
     def _sample_targets(self) -> torch.Tensor:
         targets: list[torch.Tensor] = []
         if random.random() < self.remix_probability:
             for stem in STEMS:
                 track = random.choice(self.tracks)
-                info = track[stem]
-                targets.append(self._load_segment(info, self._random_start(info)))
+                infos = track[stem]
+                targets.append(self._load_target(infos, self._random_start(infos)))
         else:
             track = random.choice(self.tracks)
-            common_duration = min(track[stem].duration for stem in STEMS)
+            common_duration = min(
+                self._target_duration(track[stem]) for stem in STEMS
+            )
             start = random.uniform(0.0, max(0.0, common_duration - self.segment_seconds))
             for stem in STEMS:
-                targets.append(self._load_segment(track[stem], start))
+                targets.append(self._load_target(track[stem], start))
         return torch.stack(targets)
 
     @staticmethod
@@ -1366,7 +1436,6 @@ def build_optimizer(
     model: nn.Module,
     lr: float,
     weight_decay: float,
-    optimizer_name: str,
 ) -> torch.optim.Optimizer:
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
@@ -1387,10 +1456,6 @@ def build_optimizer(
         {"params": decay_params, "weight_decay": weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
-    if optimizer_name == "atan2" and AdamAtan2 is not None:
-        return AdamAtan2(parameter_groups, lr=lr)
-    if optimizer_name == "atan2" and AdamAtan2 is None:
-        print("adam_atan2_pytorch is unavailable; falling back to AdamW.")
     return torch.optim.AdamW(
         parameter_groups,
         lr=lr,
@@ -1468,17 +1533,44 @@ def find_latest_compatible_checkpoint(
         except Exception as error:
             print(f"Ignoring unreadable checkpoint {path}: {error}")
             continue
-        if checkpoint_data.get("model_config") == asdict(config):
+        if (
+            checkpoint_data.get("checkpoint_format_version", 0) >= 3
+            and model_configs_compatible(checkpoint_data.get("model_config"), config)
+        ):
             return str(path)
     return None
 
 
-def find_best_checkpoint(folder: str = "best_ckpts") -> str | None:
+def checkpoint_sdr_from_path(path: str | Path) -> float | None:
+    match = re.search(r"sdr_(-?\d+(?:\.\d+)?)\.pt$", Path(path).name)
+    return float(match.group(1)) if match else None
+
+
+def find_best_checkpoint(
+    folder: str = "best_ckpts",
+    config: ModelConfig | None = None,
+) -> str | None:
     scored: list[tuple[float, Path]] = []
     for path in Path(folder).glob("*.pt"):
-        match = re.search(r"sdr_(-?\d+(?:\.\d+)?)\.pt$", path.name)
-        if match:
-            scored.append((float(match.group(1)), path))
+        score = checkpoint_sdr_from_path(path)
+        if score is None:
+            continue
+        if config is not None:
+            try:
+                checkpoint_data = torch.load(
+                    path, map_location="cpu", weights_only=False
+                )
+            except Exception as error:
+                print(f"Ignoring unreadable best checkpoint {path}: {error}")
+                continue
+            if (
+                checkpoint_data.get("checkpoint_format_version", 0) < 3
+                or not model_configs_compatible(
+                    checkpoint_data.get("model_config"), config
+                )
+            ):
+                continue
+        scored.append((score, path))
     return str(max(scored, key=lambda item: item[0])[1]) if scored else None
 
 
@@ -1499,13 +1591,14 @@ def save_checkpoint(
         "ema_state_dict": clean_state_dict(ema.state_dict()),
         "ema_updates": ema.updates,
         "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_class": optimizer.__class__.__name__,
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "best_sdr": best_sdr,
         "avg_loss": avg_loss,
         "stems": STEMS,
         "model_config": asdict(model.config),
-        "checkpoint_format_version": 2,
+        "checkpoint_format_version": 3,
     }
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1514,8 +1607,29 @@ def save_checkpoint(
     os.replace(temporary, destination)
 
 
-def prune_old_checkpoints(folder: str, keep: int = 3) -> None:
-    paths = sorted(Path(folder).glob("*.pt"), key=lambda path: path.stat().st_mtime)
+def prune_old_checkpoints(
+    folder: str,
+    keep: int = 3,
+    config: ModelConfig | None = None,
+) -> None:
+    paths: list[Path] = []
+    for path in Path(folder).glob("*.pt"):
+        if config is not None:
+            try:
+                checkpoint_data = torch.load(
+                    path, map_location="cpu", weights_only=False
+                )
+            except Exception:
+                continue
+            if (
+                checkpoint_data.get("checkpoint_format_version", 0) < 3
+                or not model_configs_compatible(
+                    checkpoint_data.get("model_config"), config
+                )
+            ):
+                continue
+        paths.append(path)
+    paths.sort(key=lambda path: path.stat().st_mtime)
     for path in paths[:-keep]:
         path.unlink(missing_ok=True)
 
@@ -1647,8 +1761,8 @@ def separate_tensor(
 
     output = output / weight_sum.clamp_min(1e-8)
 
-    # Enforce exact waveform mixture consistency after overlap-add. Do not clamp;
-    # clipping predictions changes SDR and should only happen at file export time.
+    # Enforce exact waveform mixture consistency after overlap-add. Do not
+    # clamp; clipping predictions changes SDR and belongs only at export.
     residual = mixture - output.sum(dim=0)
     power = output.abs().square().clamp_min(1e-8)
     weights = power / power.sum(dim=0, keepdim=True).clamp_min(1e-8)
@@ -1656,23 +1770,31 @@ def separate_tensor(
     return [output[index] for index in range(model.config.num_stems)]
 
 
-def calculate_sdr(prediction: torch.Tensor, target: torch.Tensor) -> float:
-    """Scale-dependent global SDR over all channels and samples."""
-    error = prediction - target
-    signal_power = target.double().square().sum()
-    error_power = error.double().square().sum()
-    sdr = 10.0 * torch.log10((signal_power + 1e-12) / (error_power + 1e-12))
-    return float(sdr)
-
-
-def find_stem_file(directory: str, stem: str) -> str:
-    by_lower_name = {name.lower(): name for name in os.listdir(directory)}
-    for extension in AUDIO_EXTENSIONS:
-        candidate = f"{stem}{extension}"
-        actual = by_lower_name.get(candidate.lower())
-        if actual is not None:
-            return os.path.join(directory, actual)
-    raise FileNotFoundError(f"Could not find an exact {stem} WAV/FLAC in {directory!r}.")
+def calculate_chunk_median_sdr(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    sample_rate: int,
+    chunk_seconds: float = 1.0,
+    activity_threshold: float = 1e-4,
+) -> float | None:
+    """Median scale-dependent SDR over active, non-overlapping chunks."""
+    chunk_samples = max(1, int(round(chunk_seconds * sample_rate)))
+    scores: list[torch.Tensor] = []
+    for start in range(0, target.shape[-1], chunk_samples):
+        end = min(start + chunk_samples, target.shape[-1])
+        target_chunk = target[..., start:end].double()
+        if target_chunk.square().mean().sqrt() < activity_threshold:
+            continue
+        prediction_chunk = prediction[..., start:end].double()
+        signal_power = target_chunk.square().sum()
+        error_power = (prediction_chunk - target_chunk).square().sum()
+        scores.append(
+            10.0
+            * torch.log10((signal_power + 1e-12) / (error_power + 1e-12))
+        )
+    if not scores:
+        return None
+    return float(torch.quantile(torch.stack(scores), 0.5))
 
 
 @torch.inference_mode()
@@ -1694,29 +1816,40 @@ def validate(
         print(f"No validation tracks found under {test_dir!r}.")
         return [0.0 for _ in STEMS], None
 
-    totals = [0.0 for _ in STEMS]
-    count = 0
+    per_stem_track_scores: list[list[float]] = [[] for _ in STEMS]
+    valid_tracks = 0
     progress = tqdm(track_dirs, desc="Validating", leave=False)
     for track_dir in progress:
         try:
+            resolved = resolve_target_paths(track_dir)
+            if resolved is None:
+                raise FileNotFoundError(
+                    "Track does not contain a complete two-stem or MUSDB target set."
+                )
             targets: list[torch.Tensor] = []
             for stem in STEMS:
-                path = find_stem_file(track_dir, stem)
-                audio_np, sample_rate = sf.read(
-                    path,
-                    dtype="float32",
-                    always_2d=True,
-                )
-                if sample_rate != model.config.sample_rate:
-                    raise ValueError(
-                        f"Validation file {path} is {sample_rate} Hz, expected "
-                        f"{model.config.sample_rate} Hz."
+                components: list[torch.Tensor] = []
+                for path in resolved[stem]:
+                    audio_np, sample_rate = sf.read(
+                        path,
+                        dtype="float32",
+                        always_2d=True,
                     )
-                audio = torch.from_numpy(audio_np.T)
-                audio = torch.nan_to_num(audio)
-                if audio.shape[0] == 1:
-                    audio = audio.repeat(2, 1)
-                targets.append(audio[:2])
+                    if sample_rate != model.config.sample_rate:
+                        raise ValueError(
+                            f"Validation file {path} is {sample_rate} Hz, expected "
+                            f"{model.config.sample_rate} Hz."
+                        )
+                    audio = torch.nan_to_num(torch.from_numpy(audio_np.T))
+                    if audio.shape[0] == 1:
+                        audio = audio.repeat(2, 1)
+                    components.append(audio[:2])
+                component_length = min(audio.shape[-1] for audio in components)
+                targets.append(
+                    torch.stack(
+                        [audio[..., :component_length] for audio in components]
+                    ).sum(dim=0)
+                )
 
             length = min(target.shape[-1] for target in targets)
             targets = [target[..., :length].to(device) for target in targets]
@@ -1730,22 +1863,40 @@ def validate(
                 precision=precision,
                 show_progress=False,
             )
-            scores = [calculate_sdr(pred, target) for pred, target in zip(predictions, targets)]
+            scores = [
+                calculate_chunk_median_sdr(
+                    pred,
+                    target,
+                    sample_rate=model.config.sample_rate,
+                )
+                for pred, target in zip(predictions, targets)
+            ]
             for index, score in enumerate(scores):
-                totals[index] += score
-            count += 1
+                if score is not None:
+                    per_stem_track_scores[index].append(score)
+            valid_tracks += 1
             progress.set_postfix_str(
                 " | ".join(
-                    f"{stem}: {score:.3f}" for stem, score in zip(STEMS, scores)
+                    f"{stem}: {score:.3f}" if score is not None else f"{stem}: inactive"
+                    for stem, score in zip(STEMS, scores)
                 )
             )
         except Exception as error:
             print(f"\nSkipping {track_dir}: {error}")
 
-    if count == 0:
+    if valid_tracks == 0 or not any(per_stem_track_scores):
         return [0.0 for _ in STEMS], None
-    averages = [total / count for total in totals]
-    return averages, sum(averages) / len(averages)
+    medians = [
+        float(torch.quantile(torch.tensor(scores, dtype=torch.float64), 0.5))
+        if scores
+        else float("nan")
+        for scores in per_stem_track_scores
+    ]
+    finite_medians = [score for score in medians if math.isfinite(score)]
+    combined = (
+        sum(finite_medians) / len(finite_medians) if finite_medians else None
+    )
+    return medians, combined
 
 
 # -----------------------------------------------------------------------------
@@ -1787,7 +1938,9 @@ def train(
             f"{len(report.missing)} missing)."
         )
         saved_config = checkpoint_data.get("model_config")
-        exact_continuation = saved_config == asdict(model.config) and report.is_exact
+        exact_continuation = (
+            model_configs_compatible(saved_config, model.config) and report.is_exact
+        )
 
     # Initialize after model loading so a transfer checkpoint also seeds EMA.
     ema = EMA(model, decay=args.ema_decay)
@@ -1815,7 +1968,25 @@ def train(
             best_sdr = float(checkpoint_data.get("best_sdr", best_sdr))
             avg_loss = float(checkpoint_data.get("avg_loss", 0.0))
             if "optimizer_state_dict" in checkpoint_data:
+                saved_optimizer_class = checkpoint_data.get("optimizer_class")
+                current_optimizer_class = optimizer.__class__.__name__
+                if (
+                    saved_optimizer_class is not None
+                    and saved_optimizer_class != current_optimizer_class
+                ):
+                    raise RuntimeError(
+                        f"Checkpoint optimizer is {saved_optimizer_class}, but the "
+                        f"requested optimizer is {current_optimizer_class}. Use "
+                        "--reset_optimizer when changing optimizer types."
+                    )
+                requested_weight_decays = [
+                    float(group["weight_decay"]) for group in optimizer.param_groups
+                ]
                 optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
+                for group, requested_weight_decay in zip(
+                    optimizer.param_groups, requested_weight_decays
+                ):
+                    group["weight_decay"] = requested_weight_decay
             else:
                 raise RuntimeError("Continuation checkpoint has no optimizer state.")
             if "scheduler_state_dict" in checkpoint_data:
@@ -1825,9 +1996,22 @@ def train(
             rebase_learning_rate(optimizer, scheduler, args.lr)
             if "scaler_state_dict" in checkpoint_data:
                 scaler.load_state_dict(checkpoint_data["scaler_state_dict"])
+            best_checkpoint = find_best_checkpoint("best_ckpts", model.config)
+            best_checkpoint_sdr = (
+                checkpoint_sdr_from_path(best_checkpoint)
+                if best_checkpoint is not None
+                else None
+            )
+            if best_checkpoint_sdr is not None and best_checkpoint_sdr > best_sdr:
+                best_sdr = best_checkpoint_sdr
+                print(
+                    f"Recovered newer best SDR {best_sdr:.4f} dB from "
+                    f"{best_checkpoint}."
+                )
             print(
                 f"Resuming at optimizer step {step} with --lr={args.lr:.2e} "
-                f"(scheduled LR {optimizer.param_groups[0]['lr']:.2e})."
+                f"(scheduled LR {optimizer.param_groups[0]['lr']:.2e}) and "
+                f"--weight_decay={args.weight_decay:.2e}."
             )
     elif checkpoint_data is not None:
         print(
@@ -1974,7 +2158,7 @@ def train(
                 best_sdr,
                 avg_loss,
             )
-            prune_old_checkpoints("ckpts", keep=3)
+            prune_old_checkpoints("ckpts", keep=3, config=model.config)
 
             with ema.average_parameters():
                 # The transformer units are compiled for training with gradients
@@ -2006,7 +2190,8 @@ def train(
                     for stem, score in zip(STEMS, stem_scores)
                 )
                 print(
-                    f"\nValidation step {step} (EMA, track-mean global SDR): "
+                    f"\nValidation step {step} "
+                    "(EMA, median of per-track 1-second median SDR): "
                     f"{score_text}, combined: {combined_sdr:.4f} dB"
                 )
                 if improved:
@@ -2027,9 +2212,9 @@ def train(
                     best_sdr,
                     avg_loss,
                 )
-                for old_path in Path("best_ckpts").glob("*.pt"):
-                    if old_path != Path(best_path):
-                        old_path.unlink(missing_ok=True)
+                prune_old_checkpoints(
+                    "best_ckpts", keep=1, config=model.config
+                )
                 print(f"New best checkpoint: {best_path}\n")
             elif combined_sdr is not None:
                 print(f"Best combined SDR remains {best_sdr:.4f} dB.\n")
@@ -2049,7 +2234,7 @@ def train(
             best_sdr,
             avg_loss,
         )
-        prune_old_checkpoints("ckpts", keep=3)
+        prune_old_checkpoints("ckpts", keep=3, config=model.config)
         print(f"Training stopped cleanly; checkpoint saved to {stopped_path}.")
 
 
@@ -2066,7 +2251,7 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         win_length=args.win_length,
         audio_channels=2,
         num_stems=len(STEMS),
-        num_bands=args.num_bands,
+        num_bands=62,
         dim=args.model_dim,
         depth=args.depth,
         heads=args.heads,
@@ -2074,7 +2259,6 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         dropout=args.dropout,
         layer_scale_init=args.layer_scale_init,
         use_checkpoint=args.ckpt,
-        mixture_consistency=not args.disable_mixture_consistency,
     )
 
 
@@ -2130,7 +2314,10 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="124-band non-overlapping BS-RoFormer music source separator"
+        description=(
+            "62-band, 2048-point STFT, non-overlapping BS-RoFormer "
+            "vocals/accompaniment separator"
+        )
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
@@ -2149,13 +2336,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--sample_rate", type=int, default=44_100)
-    parser.add_argument("--n_fft", type=int, default=4096)
-    parser.add_argument("--hop_length", type=int, default=1024)
-    parser.add_argument("--win_length", type=int, default=4096)
+    parser.add_argument("--n_fft", type=int, default=2048)
+    parser.add_argument("--hop_length", type=int, default=512)
+    parser.add_argument("--win_length", type=int, default=2048)
     parser.add_argument("--segment_seconds", type=float, default=8.0)
     parser.add_argument("--inference_overlap_seconds", type=float, default=2.0)
 
-    parser.add_argument("--num_bands", type=int, default=124)
     parser.add_argument("--model_dim", type=int, default=384)
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--heads", type=int, default=8)
@@ -2174,8 +2360,6 @@ def build_parser() -> argparse.ArgumentParser:
             "fallback; 'flash' requires external or PyTorch Flash Attention."
         ),
     )
-    parser.add_argument("--disable_mixture_consistency", action="store_true")
-
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accumulation", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=8)
@@ -2185,7 +2369,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup_steps", type=int, default=4_000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--optimizer", choices=("adamw", "atan2"), default="adamw")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
@@ -2262,9 +2445,9 @@ def main() -> None:
                 )
         elif args.infer:
             checkpoint_path = (
-                find_latest_checkpoint("ckpts")
+                find_latest_compatible_checkpoint(config, "ckpts")
                 if args.latest
-                else find_best_checkpoint("best_ckpts")
+                else find_best_checkpoint("best_ckpts", config)
             )
 
     if args.infer and checkpoint_path:
@@ -2357,7 +2540,6 @@ def main() -> None:
             model,
             lr=args.lr,
             weight_decay=args.weight_decay,
-            optimizer_name=args.optimizer,
         )
         scheduler = build_scheduler(
             optimizer,
