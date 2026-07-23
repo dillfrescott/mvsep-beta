@@ -2343,10 +2343,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_fft", type=int, default=2048)
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--win_length", type=int, default=2048)
-    parser.add_argument("--segment_seconds", type=float, default=8.0)
+    parser.add_argument("--segment_seconds", type=float, default=6.0)
     parser.add_argument("--inference_overlap_seconds", type=float, default=2.0)
 
-    parser.add_argument("--model_dim", type=int, default=384)
+    parser.add_argument("--model_dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--ff_mult", type=float, default=8.0 / 3.0)
