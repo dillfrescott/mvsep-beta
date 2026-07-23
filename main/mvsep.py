@@ -48,7 +48,7 @@ class ModelConfig:
     win_length: int = 2048
     audio_channels: int = 2
     num_stems: int = len(STEMS)
-    num_bands: int = 62
+    num_bands: int = 124
     dim: int = 384
     depth: int = 12
     heads: int = 8
@@ -56,7 +56,7 @@ class ModelConfig:
     dropout: float = 0.0
     layer_scale_init: float = 0.1
     use_checkpoint: bool = True
-    architecture: str = "bs_roformer_62"
+    architecture: str = "bs_roformer_124"
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -85,9 +85,9 @@ class ModelConfig:
             raise ValueError("dropout must be in [0, 1).")
         if self.layer_scale_init < 0.0:
             raise ValueError("layer_scale_init must be non-negative.")
-        if self.architecture != "bs_roformer_62":
+        if self.architecture != "bs_roformer_124":
             raise ValueError(
-                f"Unsupported architecture {self.architecture!r}; expected bs_roformer_62."
+                f"Unsupported architecture {self.architecture!r}; expected bs_roformer_124."
             )
 
 
@@ -204,11 +204,11 @@ def build_bs_bands(
 ) -> list[tuple[int, int]]:
     """Build disjoint BS-RoFormer frequency bands.
 
-    The default 62-band / 2048-FFT preset uses the commonly used handcrafted
-    BS-RoFormer layout. It covers all 1025 bins of a real 2048-point STFT with
-    widths
+    The default 124-band / 2048-FFT preset refines the commonly used handcrafted
+    62-band BS-RoFormer layout by splitting each band in two. It covers all 1025
+    bins of a real 2048-point STFT with widths
 
-        24x2, 12x4, 8x12, 8x24, 8x48, 128, 129.
+        48x1, 24x2, 16x6, 16x12, 16x24, 3x64, 65.
 
     For non-default settings, a deterministic power-law layout is used. It is
     still a strict band split: no overlap, no duplicated bins, and no mask
@@ -222,8 +222,8 @@ def build_bs_bands(
             f"Cannot create {num_bands} non-empty bands from {freq_bins} bins."
         )
 
-    if n_fft == 2048 and num_bands == 62:
-        widths = (
+    if n_fft == 2048 and num_bands in (62, 124):
+        base_widths = (
             [2] * 24
             + [4] * 12
             + [12] * 8
@@ -231,6 +231,10 @@ def build_bs_bands(
             + [48] * 8
             + [128, 129]
         )
+        if num_bands == 124:
+            widths = [part for width in base_widths for part in (width // 2, width - width // 2)]
+        else:
+            widths = base_widths
     else:
         # A handcrafted-style fallback with many narrow low-frequency bands
         # and progressively wider high-frequency bands. This is deliberately
@@ -750,7 +754,7 @@ class BandMaskGroup(nn.Module):
         # A band-specific nonlinear mask head is materially more expressive than
         # projecting every band directly from the shared encoder representation.
         # Keeping the hidden width at ``dim`` controls the parameter cost of the
-        # 62-band layout while still giving every band its own two-layer MLP.
+        # 124-band layout while still giving every band its own two-layer MLP.
         hidden_width = config.dim
         output_width = config.num_stems * self.feature_width
         self.hidden_weight = nn.Parameter(
@@ -2251,7 +2255,7 @@ def model_config_from_args(args: argparse.Namespace) -> ModelConfig:
         win_length=args.win_length,
         audio_channels=2,
         num_stems=len(STEMS),
-        num_bands=62,
+        num_bands=124,
         dim=args.model_dim,
         depth=args.depth,
         heads=args.heads,
@@ -2315,7 +2319,7 @@ def read_input_audio(path: str, sample_rate: int) -> torch.Tensor:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "62-band, 2048-point STFT, non-overlapping BS-RoFormer "
+            "124-band, 2048-point STFT, non-overlapping BS-RoFormer "
             "vocals/accompaniment separator"
         )
     )
